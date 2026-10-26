@@ -1,0 +1,32 @@
+# Env / secrets
+.env
+.env.local
+.env.*.local
+backend/.env
+
+# Python
+__pycache__/
+*.py[cod]
+backend/.venv/
+backend/staticfiles/
+.pytest_cache/
+.coverage
+
+# Node / Next
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.vercel/
+frontend/.env*.local
+frontend/npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Runtime
+*.log
+logs/
+data/
