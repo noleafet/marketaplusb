@@ -81,14 +81,20 @@ If the repository is private, connect GitHub to Northflank and grant access to t
    - Region: the same region as the services
 5. Create the add-on. Northflank provisions a persistent database with backups.
 6. Link the database to a secret group:
-   - Create a secret group named `grid-secrets` in the project.
-   - Under **Linked add-ons**, select `grid-db`.
-   - Services that inherit `grid-secrets` receive the connection variables, including
-     `DATABASE_URL`.
+   - In the project, **Create secret group** → name it `grid-secrets`.
+   - In the secret group, under **Linked add-ons**, click **Configure**, select `grid-db`, and
+     enable its connection variables.
+   - Northflank injects them as `NF_GRID-DB_*` (e.g. `NF_GRID-DB_URI`), which Django does not
+     read. Add an **alias** mapping the add-on's `..._URI` variable to `DATABASE_URL`.
 
-The settings also accept `POSTGRES_URI` as a fallback, so either injected name works. If you
-prefer not to use secret groups, copy the add-on connection string and set `DATABASE_URL`
-manually.
+There is no "inherit" button: a resource sees a secret group automatically once the group's
+access rules allow it (default is the whole project). If the group is restricted, add the `api`
+and `worker` services under the group's **Access** settings, or on each service's
+**Environment** tab use **Manage secret groups** to select `grid-secrets`.
+
+The settings also accept `POSTGRES_URI` as a fallback (`backend/config/settings.py`), so the
+alias may target either name. If you prefer not to use secret groups, copy the add-on
+connection string and set `DATABASE_URL` manually.
 
 No local migration step is required: the API service will run migrations inside Northflank in
 section 4.
@@ -108,12 +114,12 @@ section 4.
    - Instance: `nf-compute-20` (0.2 vCPU / 512 MB)
    - Port: **8000**, public HTTP
    - Health check: HTTP `GET /api/health/` on port 8000
-   - Command: leave empty to use the Dockerfile's gunicorn command
-5. Environment variables. Inherit `grid-secrets`, then add:
+   - CMD override: leave empty to use the Dockerfile's gunicorn command
+5. Environment variables. `grid-secrets` is inherited automatically (see section 2); add:
 
    ```dotenv
    DEBUG=false
-   SECRET_KEY=GENERATE_A_LONG_RANDOM_VALUE
+   SECRET_KEY=GENERATE_A_LONG_RANDOM_VALUE_1
    DJANGO_ALLOWED_HOSTS=.code.run,localhost,127.0.0.1
    CORS_ALLOWED_ORIGINS=https://YOUR_APP.vercel.app
    TIME_ZONE=UTC
@@ -121,7 +127,7 @@ section 4.
    TIMESCALE_ENABLED=false
    DB_CONN_MAX_AGE=60
 
-   ENGINE_API_TOKEN=GENERATE_A_LONG_RANDOM_VALUE
+   ENGINE_API_TOKEN=GENERATE_A_LONG_RANDOM_VALUE_2
    ENGINE_ALLOW_PUBLIC_READS=false
    ENGINE_SYMBOL_LIMIT=40
    ENGINE_LOOKBACK_DAYS=365
@@ -179,14 +185,15 @@ runs the scheduler loop in a thread alongside the worker loop.
    - Service type: **Worker**
    - Instance: `nf-compute-20` (0.2 vCPU / 512 MB). Use `nf-compute-50` (0.5 vCPU / 1 GB) if you
      want the daily analysis to finish faster, but watch the $20 credit.
-   - Command:
+   - CMD override (Build → Advanced → CMD override):
 
      ```bash
      python manage.py runengine --worker-poll 2 --scheduler-poll 30
      ```
 
    - No port and no HTTP health check; the process must keep running.
-4. Inherit `grid-secrets` and add the same application environment variables as the API.
+4. Add the same application environment variables as the API; `grid-secrets` is inherited the
+   same way.
 5. Deploy and check the logs. On first start it creates the default schedules; within a few
    minutes it enqueues paper ticks, and at 00:10 UTC it enqueues the daily analysis.
 
@@ -221,6 +228,23 @@ curl -s -X POST $BASE/api/jobs/runs/run/ \
 Both calls only enqueue work. Watch the worker logs for execution. The full analysis will take
 substantially longer on 0.2 vCPU; raise or remove `ENGINE_SYMBOL_LIMIT` only after checking the
 first run's duration and Northflank's resource usage.
+
+On Windows PowerShell, `curl` is an alias for `Invoke-WebRequest`; use `Invoke-RestMethod`
+instead, or run the commands above in Git Bash:
+
+```powershell
+$base  = "https://YOUR_API.code.run"
+$token = "YOUR_ENGINE_API_TOKEN"
+$h     = @{ "X-Engine-Token" = $token }
+
+Invoke-RestMethod -Method Post -Uri "$base/api/jobs/runs/run/" `
+  -Headers $h -ContentType "application/json" `
+  -Body '{"job_type":"coins_refresh"}'
+
+Invoke-RestMethod -Method Post -Uri "$base/api/jobs/runs/run/" `
+  -Headers $h -ContentType "application/json" `
+  -Body '{"job_type":"daily_analysis","params":{"limit":10,"force":true}}'
+```
 
 ---
 
