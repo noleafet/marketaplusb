@@ -55,13 +55,13 @@ with an SLA, move to Northflank's pay-as-you-go plan.
 Northflank builds from a Git repository. The workspace is not currently initialized as one:
 
 ```bash
-cd /path/to/maketaplusb
+cd /path/to/marketaplusb
 git init
 git add .
 git status          # confirm .env, .venv, and node_modules are not staged
 git commit -m "Initial commit"
 git branch -M main
-git remote add origin https://github.com/YOUR_USER/maketaplusb.git
+git remote add origin https://github.com/YOUR_USER/marketaplusb.git
 git push -u origin main
 ```
 
@@ -72,7 +72,7 @@ If the repository is private, connect GitHub to Northflank and grant access to t
 ## 2. Create the Northflank project and database
 
 1. Sign in at <https://app.northflank.com>. The free Sandbox requires no card.
-2. **Create project** → name it `maketaplusb` → choose the region closest to you.
+2. **Create project** → name it `marketaplusb` → choose the region closest to you.
 3. Open the project → **Add-ons** → **Create add-on** → **PostgreSQL**.
 4. Configure:
    - Name: `grid-db`
@@ -236,7 +236,7 @@ first run's duration and Northflank's resource usage.
 
    | Variable | Value |
    | --- | --- |
-   | `ENGINE_BACKEND_URL` | the Northflank API URL, e.g. `https://api-maketaplusb.code.run` (no trailing slash) |
+   | `ENGINE_BACKEND_URL` | the Northflank API URL, e.g. `https://api-marketaplusb.code.run` (no trailing slash) |
    | `ENGINE_API_TOKEN` | the same token as the Northflank services |
    | `NEXT_PUBLIC_APP_URL` | `https://YOUR_APP.vercel.app` |
    | `NEXT_PUBLIC_SENTRY_DISABLED` | `true` |
