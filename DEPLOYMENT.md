@@ -72,7 +72,10 @@ If the repository is private, connect GitHub to Northflank and grant access to t
 ## 2. Create the Northflank project and database
 
 1. Sign in at <https://app.northflank.com>. The free Sandbox requires no card.
-2. **Create project** → name it `marketaplusb` → choose the region closest to you.
+2. **Create project** → name it `marketaplusb` → choose a **European** region (e.g. Europe -
+   West). Do not pick a US region: Binance's API rejects US IPs with HTTP 451 ("Service
+   unavailable from a restricted location"), so market data would fail. A project's region
+   cannot be changed later.
 3. Open the project → **Add-ons** → **Create add-on** → **PostgreSQL**.
 4. Configure:
    - Name: `grid-db`
@@ -137,6 +140,9 @@ section 4.
    ```
 
    `DATABASE_URL` comes from `grid-secrets`; do not hard-code the database password.
+
+   `ENGINE_ALLOW_PUBLIC_READS=false` blocks bare GETs, but reads carrying a valid
+   `X-Engine-Token` still succeed — that is how the Vercel proxy loads the dashboard.
 
    `.code.run` as an `ALLOWED_HOSTS` entry matches every Northflank public domain. After the
    service is live, you can replace it with the exact URL from the service page.

@@ -53,6 +53,11 @@ class JobApiTests(TestCase):
             blocked = self.client.get("/api/jobs/runs/")
         self.assertEqual(blocked.status_code, 403)
 
+    def test_token_authorizes_reads_when_public_reads_disabled(self):
+        with override_settings(ENGINE_ALLOW_PUBLIC_READS=False):
+            response = self.client.get("/api/jobs/runs/", HTTP_X_ENGINE_TOKEN=TOKEN)
+        self.assertEqual(response.status_code, 200)
+
     def test_only_queued_jobs_can_be_cancelled(self):
         queued = enqueue_job("coins_refresh")
         response = self.client.post(

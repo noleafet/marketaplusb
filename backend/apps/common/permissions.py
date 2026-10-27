@@ -5,19 +5,22 @@ from rest_framework.permissions import BasePermission, SAFE_METHODS
 
 
 class IsEngineTokenOrReadOnly(BasePermission):
-    """Token gate for mutating API calls.
+    """Token gate for the API.
 
-    Reads can be opened for local dashboards with ENGINE_ALLOW_PUBLIC_READS.
-    Mutations always require the engine token to be configured and supplied.
+    Reads are public only when ENGINE_ALLOW_PUBLIC_READS is true; otherwise they require the
+    same token as mutations. Mutations always require the token.
     """
 
     message = "A valid X-Engine-Token header is required."
 
     def has_permission(self, request, view) -> bool:
-        if request.method in SAFE_METHODS:
-            return bool(settings.ENGINE_ALLOW_PUBLIC_READS)
         expected = settings.ENGINE_API_TOKEN
         supplied = request.headers.get("X-Engine-Token", "")
-        if not expected or not supplied:
-            return False
-        return secrets.compare_digest(expected, supplied)
+        token_ok = (
+            bool(expected)
+            and bool(supplied)
+            and secrets.compare_digest(expected, supplied)
+        )
+        if request.method in SAFE_METHODS:
+            return token_ok or bool(settings.ENGINE_ALLOW_PUBLIC_READS)
+        return token_ok
