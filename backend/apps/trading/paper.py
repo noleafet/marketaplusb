@@ -11,7 +11,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.common.binance import INTERVAL_MS, BinanceError, BinanceFuturesClient, floor_to_interval
-from apps.engine.grid import GridParams, SimulationConfig
+from apps.engine.grid import GridParams, SimulationConfig, funding_zscore
 from apps.engine.models import AnalysisRun, DecisionLog, log_decision
 from apps.engine.timescale import insert_equity_points
 from apps.trading import risk
@@ -32,7 +32,7 @@ def paper_config_snapshot() -> dict[str, Any]:
         "maker_fee_rate": float(cfg["MAKER_FEE_RATE"]),
         "taker_fee_rate": float(cfg["TAKER_FEE_RATE"]),
         "slippage_bps": float(cfg["SLIPPAGE_BPS"]),
-        "interval": str(cfg["INTERVAL"]),
+        "interval": str(settings.PAPER.get("SIGNAL_INTERVAL", cfg["INTERVAL"])),
     }
 
 
@@ -93,12 +93,42 @@ def ensure_paper_sessions(
 
 
 def _fetch_hist(
-    client: BinanceFuturesClient, symbol: str, now: datetime, params: GridParams
+    client: BinanceFuturesClient,
+    symbol: str,
+    now: datetime,
+    params: GridParams,
+    interval: str,
 ) -> list[dict[str, Any]]:
-    lookback_days = max(45, params.range_lookback_days + 21)
+    # 120 days covers the 50-day trend EMA, the 30-day range/support windows
+    # and the ATR warmup with room to spare. Only completed candles are used.
+    lookback_days = max(120, params.range_lookback_days + 30, params.support_lookback_days + 90)
     start = now - timedelta(days=lookback_days)
-    end = floor_to_interval(now, "4h") - timedelta(milliseconds=1)
-    return client.klines_range(symbol, "4h", start, end, max_requests=10)
+    end = floor_to_interval(now, interval) - timedelta(milliseconds=1)
+    return client.klines_range(symbol, interval, start, end, max_requests=10)
+
+
+def _funding_context(
+    client: BinanceFuturesClient, symbol: str, now: datetime, params: GridParams
+) -> float | None:
+    """Latest funding z-score from ~30 days of 8h funding prints."""
+
+    lookback_days = max(10, params.funding_z_lookback // 3 + 5)
+    try:
+        events = client.funding_rates(
+            symbol,
+            now - timedelta(days=lookback_days),
+            now,
+            max_requests=6,
+        )
+    except BinanceError as exc:
+        logger.warning("Funding context failed for %s: %s", symbol, exc)
+        return None
+    if not isinstance(events, list):
+        return None
+    try:
+        return funding_zscore(events, params.funding_z_lookback)
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _fetch_price(client: BinanceFuturesClient, symbol: str) -> float:
@@ -107,6 +137,24 @@ def _fetch_price(client: BinanceFuturesClient, symbol: str) -> float:
         return float(payload["price"])
     except (KeyError, TypeError, ValueError) as exc:
         raise BinanceError(f"Invalid price response for {symbol}") from exc
+
+
+def _grid_log_payload(
+    session: PaperSession, strategy: IncrementalGridStrategy, price: float
+) -> dict[str, Any]:
+    """Audit snapshot: every level with its price, side, size, and skip reason."""
+
+    plan = strategy.level_plan
+    return {
+        "session_id": str(session.id),
+        "price": round(price, 10),
+        "range_low": round(strategy.range_low, 10),
+        "range_high": round(strategy.range_high, 10),
+        "allow_buys": strategy.allow_buys,
+        "reason": strategy.last_rebalance_reason,
+        "active_levels": sum(1 for item in plan if item.get("reason") == "active"),
+        "level_plan": plan,
+    }
 
 
 def _apply_funding_events(
@@ -224,28 +272,51 @@ def _tick_session(
     funding_fetched = True
     last_price = 0.0
 
+    # Completed signal candles drive the adaptive overlays (ATR, support, 30d
+    # range, trend) even between grid rebalances.
+    hist: list[dict[str, Any]] = []
+    try:
+        hist = _fetch_hist(client, symbol, now, params, config.interval)
+    except BinanceError as exc:
+        logger.warning("Grid history sync failed for %s: %s", symbol, exc)
+
+    if not locked:
+        strategy.set_funding_context(_funding_context(client, symbol, now, params))
+
     # First tick: build the grid around the live price and wait for future bars.
     if not strategy.initialized:
         price = _fetch_price(client, symbol)
         last_price = price
-        hist = _fetch_hist(client, symbol, now, params)
         strategy.initialize(hist, price, now)
         if locked:
             strategy.orders.clear()
         adapter.mark(price)
         session.last_funding_at = now
         funding_fetched = True
+        log_decision(
+            "paper",
+            f"{session.coin.symbol} grid initialized with "
+            f"{len(strategy.level_plan)} levels "
+            f"({sum(1 for item in strategy.level_plan if item['reason'] == 'active')} armed) "
+            f"over {strategy.range_low:.6g}-{strategy.range_high:.6g}.",
+            coin=session.coin,
+            payload={**_grid_log_payload(session, strategy, price), "locked": locked},
+        )
     else:
         # Bring the adapter up to the session's current position.
         adapter.mark(session.mark_price or 0.0)
+        if hist:
+            strategy.refresh_context(hist, session.mark_price or None)
         start = strategy.last_bar_time or session.last_tick_at or session.started_at
-        end = floor_to_interval(now, "1m") - timedelta(milliseconds=1)
+        end = floor_to_interval(now, config.interval) - timedelta(milliseconds=1)
         bars: list[dict[str, Any]] = []
         if start < end:
-            gap_minutes = (end - start).total_seconds() / 60.0
-            bar_interval = "1m" if gap_minutes <= 2 * 24 * 60 else "15m"
             bars = client.klines_range(
-                symbol, bar_interval, start + timedelta(seconds=1), end, max_requests=12
+                symbol,
+                config.interval,
+                start + timedelta(seconds=1),
+                end,
+                max_requests=12,
             )
 
         funding_events: list[dict[str, Any]] = []
@@ -292,18 +363,21 @@ def _tick_session(
             session.promotion_ready = False
 
         # Re-center after processing bars so new orders only apply to future data.
-        if session.status == PaperSession.Status.ACTIVE and not locked:
-            due = strategy.last_rebalance_at is None or now >= (
-                strategy.last_rebalance_at + timedelta(days=params.rebalance_days)
-            )
-            if due:
-                try:
-                    hist = _fetch_hist(client, symbol, now, params)
-                    if last_price > 0:
-                        strategy.maybe_rebalance(now, last_price, hist)
-                        adapter.mark(last_price)
-                except BinanceError as exc:
-                    logger.warning("Grid rebalance data failed for %s: %s", symbol, exc)
+        if (
+            session.status == PaperSession.Status.ACTIVE
+            and not locked
+            and hist
+            and last_price > 0
+        ):
+            if strategy.maybe_rebalance(now, last_price, hist):
+                adapter.mark(last_price)
+                log_decision(
+                    "paper",
+                    f"{session.coin.symbol} grid rebalanced "
+                    f"({strategy.last_rebalance_reason}).",
+                    coin=session.coin,
+                    payload=_grid_log_payload(session, strategy, last_price),
+                )
 
         if funding_fetched and funding_events:
             funding_until = funding_events[-1]["time"]

@@ -4,19 +4,24 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Any
 
 import numpy as np
 
 from apps.engine.grid import GridParams, SimulationConfig, simulate_grid
+from apps.engine.robustness import classify_regime, regime_summary
 
 MAX_FOLDS = 3
 TRAIN_FRACTION = 0.45
 TEST_FRACTION = 0.18
 MIN_TRAIN_DAYS = 90
 MIN_TEST_DAYS = 30
+STOP_ATR_MULTIPLES = (1.5, 2.5)
+TP_ATR_MULTIPLES = (1.5, 3.0)
+REBALANCE_MODES = ("fixed", "adaptive")
+ADAPTIVE_KEYS = ("stop_atr_multiple", "tp_atr_multiple")
 
 
 @dataclass
@@ -30,29 +35,48 @@ class WalkForwardResult:
     data_start: datetime | None
     data_end: datetime | None
     error: str = ""
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 def parameter_grid(base: GridParams) -> list[GridParams]:
+    """Core grid shapes crossed with adaptive stop / take-profit distances.
+
+    The stop distance and trailing take-profit multiple are treated as search
+    dimensions, not fixed assumptions, so each fold selects them on its own
+    training window and the untouched test window validates the choice. Fixed
+    and event-driven rebalancing are searched the same way; the selected mode
+    is then carried into the paper session.
+    """
+
     candidates: list[GridParams] = []
     for levels in (10, 20, 30):
         for lookback in (14, 30):
             for rebalance in (7, 14):
-                candidates.append(
-                    GridParams(
-                        grid_levels=levels,
-                        range_lookback_days=lookback,
-                        rebalance_days=rebalance,
-                        spacing_mode=base.spacing_mode,
-                        atr_multiplier=base.atr_multiplier,
-                        initial_inventory_pct=base.initial_inventory_pct,
-                        stop_loss_pct=base.stop_loss_pct,
-                        max_utilization=base.max_utilization,
-                    )
-                )
+                for stop_multiple in STOP_ATR_MULTIPLES:
+                    for tp_multiple in TP_ATR_MULTIPLES:
+                        for mode in REBALANCE_MODES:
+                            candidates.append(
+                                replace(
+                                    base,
+                                    grid_levels=levels,
+                                    range_lookback_days=lookback,
+                                    rebalance_days=rebalance,
+                                    stop_atr_multiple=stop_multiple,
+                                    tp_atr_multiple=tp_multiple,
+                                    rebalance_mode=mode,
+                                )
+                            )
     return candidates
 
 
 def _train_objective(metrics: dict[str, Any], min_trades: int) -> float:
+    """Rank candidates on the training window.
+
+    A stop-out is a hard risk failure, so it outweighs any return advantage.
+    The stop and take-profit multiples are selected by this same objective on
+    train-only data; the untouched test window then scores the selection.
+    """
+
     if not metrics:
         return -100.0
     trades = int(metrics.get("trades", 0))
@@ -62,12 +86,60 @@ def _train_objective(metrics: dict[str, Any], min_trades: int) -> float:
     dd = float(metrics.get("max_drawdown", 1.0))
     pf = min(3.0, float(metrics.get("profit_factor", 0.0)))
     activity = min(1.0, trades / max(1, min_trades))
-    stop_penalty = -0.5 if metrics.get("stopped") else 0.0
+    stop_penalty = -1.0 if metrics.get("stopped") else 0.0
     return ret - 1.5 * dd + 0.05 * pf + 0.05 * activity + stop_penalty
 
 
 def _slice_until(rows: list[dict[str, Any]], end: datetime) -> list[dict[str, Any]]:
     return [row for row in rows if row["time"] <= end]
+
+
+def _stressed_config(config: SimulationConfig, multiplier: float) -> SimulationConfig:
+    """Double fees and adverse slippage for the cost-stress validation run."""
+
+    multiplier = max(1.0, float(multiplier))
+    return replace(
+        config,
+        maker_fee_rate=config.maker_fee_rate * multiplier,
+        taker_fee_rate=config.taker_fee_rate * multiplier,
+        slippage_bps=config.slippage_bps * multiplier,
+    )
+
+
+def _sensitivity_variants(params: GridParams) -> list[tuple[str, GridParams]]:
+    """Small perturbations around the selected parameters.
+
+    A strategy that only works at one exact ladder shape is overfit even if the
+    untouched test fold looks profitable.
+    """
+
+    variants: list[tuple[str, GridParams]] = []
+    if params.grid_levels > 8:
+        variants.append(
+            ("fewer_levels", replace(params, grid_levels=max(3, params.grid_levels - 5)))
+        )
+    variants.append(("more_levels", replace(params, grid_levels=params.grid_levels + 5)))
+    variants.append(
+        (
+            "shorter_range",
+            replace(
+                params,
+                range_lookback_days=max(7, params.range_lookback_days - 7),
+            ),
+        )
+    )
+    variants.append(
+        (
+            "alternate_spacing",
+            replace(
+                params,
+                spacing_mode=(
+                    "arithmetic" if params.spacing_mode != "arithmetic" else "geometric"
+                ),
+            ),
+        )
+    )
+    return variants
 
 
 def _fold_metrics_subset(metrics: dict[str, Any]) -> dict[str, Any]:
@@ -82,11 +154,34 @@ def _fold_metrics_subset(metrics: dict[str, Any]) -> dict[str, Any]:
         "closed_lots",
         "fees_paid",
         "funding_paid",
+        "slippage_paid",
         "exposure",
+        "avg_utilization",
+        "avg_exposure_ratio",
+        "max_exposure_ratio",
+        "max_unrealized_loss",
+        "max_unrealized_loss_pct",
+        "max_position_pct",
+        "buy_fills",
+        "sell_fills",
+        "cycle_completion_ratio",
+        "top_trade_share",
+        "top5_trade_share",
+        "recovery_days",
+        "max_drawdown_duration_days",
+        "recovered",
         "time_in_range",
+        "time_outside_range",
         "stopped",
         "liquidated",
         "stop_reason",
+        "trail_up_shifts",
+        "trailing_tp_exits",
+        "funding_trims",
+        "funding_z_max",
+        "buy_blocks",
+        "rebalances",
+        "adaptive_rebalances",
     ]
     return {key: metrics.get(key) for key in keys}
 
@@ -141,6 +236,8 @@ def run_walk_forward(
     base_params: GridParams,
     lookback_days: int,
     min_trades: int,
+    cost_stress_multiplier: float = 2.0,
+    sensitivity: bool = True,
 ) -> WalkForwardResult:
     if len(rows) < 200:
         return WalkForwardResult(
@@ -208,6 +305,47 @@ def run_walk_forward(
         if test_result.error:
             continue
 
+        test_window = [
+            row for row in rows if test_start <= row["time"] <= test_end
+        ]
+        regime = classify_regime(test_window, interval=config.interval)
+        stress_result = simulate_grid(
+            test_rows,
+            funding_rows,
+            test_start,
+            best_params,
+            _stressed_config(config, cost_stress_multiplier),
+        )
+        stress = (
+            {
+                "net_return": stress_result.metrics.get("net_return"),
+                "max_drawdown": stress_result.metrics.get("max_drawdown"),
+                "profit_factor": stress_result.metrics.get("profit_factor"),
+                "trades": stress_result.metrics.get("trades"),
+            }
+            if not stress_result.error
+            else {}
+        )
+        sensitivity_runs: list[dict[str, Any]] = []
+        if sensitivity:
+            for label, variant in _sensitivity_variants(best_params):
+                variant_result = simulate_grid(
+                    test_rows, funding_rows, test_start, variant, config
+                )
+                if variant_result.error:
+                    continue
+                sensitivity_runs.append(
+                    {
+                        "variant": label,
+                        "net_return": round(
+                            float(variant_result.metrics.get("net_return") or 0.0), 6
+                        ),
+                        "max_drawdown": round(
+                            float(variant_result.metrics.get("max_drawdown") or 0.0), 6
+                        ),
+                    }
+                )
+
         completed.append(
             (
                 {"fold": fold_no + 1},
@@ -233,6 +371,9 @@ def run_walk_forward(
                 "train_objective": round(best_objective, 6),
                 "train_metrics": _fold_metrics_subset(best_train_metrics),
                 "test_metrics": _fold_metrics_subset(test_result.metrics),
+                "regime": regime,
+                "stress": stress,
+                "sensitivity": sensitivity_runs,
             }
         )
 
@@ -255,6 +396,92 @@ def run_walk_forward(
     stopped = any(bool(f["test_metrics"].get("stopped")) for f in folds_out)
     liquidated = any(bool(f["test_metrics"].get("liquidated")) for f in folds_out)
     consistency = sum(1 for r in net_returns if r > 0) / len(net_returns)
+    fold_drawdowns = [
+        float(f["test_metrics"].get("max_drawdown") or 0.0) for f in folds_out
+    ]
+    fold_return_std = (
+        float(np.std(net_returns, ddof=1)) if len(net_returns) > 1 else 0.0
+    )
+    fold_drawdown_std = (
+        float(np.std(fold_drawdowns, ddof=1)) if len(fold_drawdowns) > 1 else 0.0
+    )
+    worst_fold_drawdown = max(fold_drawdowns) if fold_drawdowns else 0.0
+
+    stress_returns = [
+        float(f["stress"].get("net_return") or 0.0)
+        for f in folds_out
+        if f.get("stress")
+    ]
+    stress_combined = (
+        float(np.prod([1.0 + value for value in stress_returns]) - 1.0)
+        if stress_returns
+        else 0.0
+    )
+    stress_profitable = bool(stress_returns) and stress_combined > 0
+    stress_drawdown = (
+        max(
+            float(f["stress"].get("max_drawdown") or 0.0)
+            for f in folds_out
+            if f.get("stress")
+        )
+        if stress_returns
+        else 0.0
+    )
+    stress_ratio = (
+        stress_combined / combined_return if combined_return > 0.0 else None
+    )
+
+    sensitivity_runs = [
+        run for fold in folds_out for run in (fold.get("sensitivity") or [])
+    ]
+    neighbor_returns = [float(run.get("net_return") or 0.0) for run in sensitivity_runs]
+    sensitivity_mean = (
+        round(float(np.mean(neighbor_returns)), 6) if neighbor_returns else None
+    )
+    sensitivity_worst = (
+        round(min(neighbor_returns), 6) if neighbor_returns else None
+    )
+    per_fold_degradation: list[float] = []
+    for fold in folds_out:
+        base = float(fold["test_metrics"].get("net_return") or 0.0)
+        values = [
+            float(run.get("net_return") or 0.0)
+            for run in (fold.get("sensitivity") or [])
+        ]
+        if values:
+            degradation = (base - float(np.mean(values))) / max(abs(base), 0.02)
+            per_fold_degradation.append(max(0.0, min(2.0, degradation)))
+    parameter_sensitivity = (
+        round(float(np.mean(per_fold_degradation)), 6)
+        if per_fold_degradation
+        else None
+    )
+
+    def _max_metric(key: str) -> float:
+        return max(
+            float(f["test_metrics"].get(key) or 0.0) for f in folds_out
+        )
+
+    def _mean_metric(key: str) -> float:
+        return float(
+            np.mean([float(f["test_metrics"].get(key) or 0.0) for f in folds_out])
+        )
+
+    max_exposure_ratio = _max_metric("max_exposure_ratio")
+    avg_exposure_ratio = _mean_metric("avg_exposure_ratio")
+    max_unrealized_loss = _max_metric("max_unrealized_loss")
+    max_unrealized_loss_pct = _max_metric("max_unrealized_loss_pct")
+    max_recovery_days = _max_metric("recovery_days")
+    max_drawdown_duration_days = _max_metric("max_drawdown_duration_days")
+    top_trade_share = _max_metric("top_trade_share")
+    top5_trade_share = _max_metric("top5_trade_share")
+    buy_fills = sum(int(f["test_metrics"].get("buy_fills") or 0) for f in folds_out)
+    sell_fills = sum(int(f["test_metrics"].get("sell_fills") or 0) for f in folds_out)
+    slippage_paid = sum(
+        float(f["test_metrics"].get("slippage_paid") or 0.0) for f in folds_out
+    )
+    cycle_completion_ratio = closed_lots / max(1, buy_fills)
+    regime_analysis = regime_summary(folds_out)
 
     eq = np.array([point["equity"] for point in curve], dtype=float)
     if eq.size > 2:
@@ -280,6 +507,29 @@ def run_walk_forward(
     mode_key, mode_count = param_counter.most_common(1)[0]
     recommended = dict(mode_key)
     parameter_stability = mode_count / len(selected_param_dicts)
+
+    # Explicit record of how the adaptive stop / take-profit distances were
+    # chosen per fold, so the out-of-sample result can be audited against the
+    # train-only selection that produced it.
+    adaptive_selection = [
+        {
+            "fold": fold["fold"],
+            "stop_atr_multiple": fold["params"].get("stop_atr_multiple"),
+            "tp_atr_multiple": fold["params"].get("tp_atr_multiple"),
+            "rebalance_mode": fold["params"].get("rebalance_mode"),
+            "test_stop": fold["test_metrics"].get("stopped"),
+            "test_tp_exits": fold["test_metrics"].get("trailing_tp_exits"),
+        }
+        for fold in folds_out
+    ]
+    adaptive_counter = Counter(
+        (
+            item["stop_atr_multiple"],
+            item["tp_atr_multiple"],
+        )
+        for item in adaptive_selection
+    )
+    (mode_stop, mode_tp), mode_adaptive_count = adaptive_counter.most_common(1)[0]
 
     oos_metrics = {
         "net_return": round(combined_return, 6),
@@ -309,11 +559,67 @@ def run_walk_forward(
             float(np.mean([f["test_metrics"].get("time_in_range") or 0.0 for f in folds_out])),
             6,
         ),
+        "time_outside_range": round(
+            float(
+                np.mean(
+                    [f["test_metrics"].get("time_outside_range") or 0.0 for f in folds_out]
+                )
+            ),
+            6,
+        ),
+        "rebalances": sum(int(f["test_metrics"].get("rebalances") or 0) for f in folds_out),
+        "adaptive_rebalances": sum(
+            int(f["test_metrics"].get("adaptive_rebalances") or 0) for f in folds_out
+        ),
+        "trail_up_shifts": sum(
+            int(f["test_metrics"].get("trail_up_shifts") or 0) for f in folds_out
+        ),
+        "trailing_tp_exits": sum(
+            int(f["test_metrics"].get("trailing_tp_exits") or 0) for f in folds_out
+        ),
+        "funding_trims": sum(
+            int(f["test_metrics"].get("funding_trims") or 0) for f in folds_out
+        ),
+        "buy_blocks": sum(int(f["test_metrics"].get("buy_blocks") or 0) for f in folds_out),
+        "funding_z_max": round(
+            max(float(f["test_metrics"].get("funding_z_max") or 0.0) for f in folds_out),
+            4,
+        ),
         "fold_consistency": round(consistency, 4),
         "fold_returns": [round(r, 6) for r in net_returns],
         "worst_fold_return": round(min(net_returns), 6),
         "best_fold_return": round(max(net_returns), 6),
         "parameter_stability": round(parameter_stability, 4),
+        "return_to_drawdown": round(combined_return / max(max_dd, 1e-6), 4),
+        "fold_return_std": round(fold_return_std, 6),
+        "fold_drawdown_mean": round(float(np.mean(fold_drawdowns)), 6),
+        "fold_drawdown_std": round(fold_drawdown_std, 6),
+        "worst_fold_drawdown": round(worst_fold_drawdown, 6),
+        "cost_stress_return": round(stress_combined, 6),
+        "cost_stress_max_drawdown": round(stress_drawdown, 6),
+        "cost_stress_profitable": stress_profitable,
+        "cost_stress_delta": round(stress_combined - combined_return, 6),
+        "cost_stress_ratio": round(stress_ratio, 4) if stress_ratio is not None else None,
+        "parameter_sensitivity": parameter_sensitivity,
+        "sensitivity_mean_return": sensitivity_mean,
+        "sensitivity_worst_return": sensitivity_worst,
+        "regime_robustness": regime_analysis["robustness_score"],
+        "regimes_covered": regime_analysis["regimes_covered"],
+        "dominant_regime": regime_analysis["dominant_regime"],
+        "dominant_regime_share": regime_analysis["dominant_share"],
+        "single_regime": regime_analysis["single_regime"],
+        "max_exposure_ratio": round(max_exposure_ratio, 6),
+        "avg_exposure_ratio": round(avg_exposure_ratio, 6),
+        "max_unrealized_loss": round(max_unrealized_loss, 4),
+        "max_unrealized_loss_pct": round(max_unrealized_loss_pct, 6),
+        "recovery_days": round(max_recovery_days, 2),
+        "max_drawdown_duration_days": round(max_drawdown_duration_days, 2),
+        "top_trade_share": round(top_trade_share, 6),
+        "top5_trade_share": round(top5_trade_share, 6),
+        "slippage_paid": round(slippage_paid, 4),
+        "buy_fills": buy_fills,
+        "sell_fills": sell_fills,
+        "cycle_completion_ratio": round(cycle_completion_ratio, 6),
         "folds": len(folds_out),
         "stopped": stopped,
         "liquidated": liquidated,
@@ -322,14 +628,20 @@ def run_walk_forward(
             "",
         ),
         "test_days": round((test_end_last - test_start_first).total_seconds() / 86400, 1),
+        "adaptive_selection": adaptive_selection,
+        "recommended_stop_atr_multiple": mode_stop,
+        "recommended_tp_atr_multiple": mode_tp,
+        "recommended_rebalance_mode": recommended.get("rebalance_mode", "fixed"),
+        "adaptive_stability": round(mode_adaptive_count / len(adaptive_selection), 4),
     }
     in_sample_metrics = {
         "avg_return": round(float(np.mean(is_returns)), 6) if is_returns else 0.0,
         "avg_max_drawdown": round(float(np.mean(is_drawdowns)), 6) if is_drawdowns else 0.0,
         "folds": len(is_returns),
         "selection_note": (
-            "Parameters are optimized only on each fold's training window. "
-            "Test windows are never used for parameter selection."
+            "Grid shape, stop distance, trailing take-profit multiple, and "
+            "fixed/adaptive rebalancing are optimized only on each fold's "
+            "training window. Test windows are never used for parameter selection."
         ),
     }
 
@@ -349,10 +661,52 @@ def run_walk_forward(
                 "test_end": f["test_end"],
                 "params": f["params"],
                 "test_metrics": f["test_metrics"],
+                "regime": f.get("regime") or {},
+                "stress": f.get("stress") or {},
+                "sensitivity": f.get("sensitivity") or [],
             }
             for f in folds_out
         ],
         "recommended_params": recommended,
+        "adaptive_selection": adaptive_selection,
+        "regime_analysis": regime_analysis,
+    }
+    diagnostics = {
+        "regime": regime_analysis,
+        "cost_stress": {
+            "multiplier": cost_stress_multiplier,
+            "stress_return": round(stress_combined, 6),
+            "stress_max_drawdown": round(stress_drawdown, 6),
+            "stress_delta": round(stress_combined - combined_return, 6),
+            "profitable": stress_profitable,
+        },
+        "sensitivity": {
+            "parameter_sensitivity": parameter_sensitivity,
+            "mean_neighbor_return": sensitivity_mean,
+            "worst_neighbor_return": sensitivity_worst,
+            "runs": sensitivity_runs,
+        },
+        "fold_returns": [round(r, 6) for r in net_returns],
+        "fold_drawdowns": [round(value, 6) for value in fold_drawdowns],
+        "recovery_days": round(max_recovery_days, 2),
+        "max_drawdown_duration_days": round(max_drawdown_duration_days, 2),
+        "exposure": {
+            "max_exposure_ratio": round(max_exposure_ratio, 6),
+            "avg_exposure_ratio": round(avg_exposure_ratio, 6),
+            "max_unrealized_loss": round(max_unrealized_loss, 4),
+            "max_unrealized_loss_pct": round(max_unrealized_loss_pct, 6),
+        },
+        "execution": {
+            "slippage_paid": round(slippage_paid, 4),
+            "buy_fills": buy_fills,
+            "sell_fills": sell_fills,
+            "cycle_completion_ratio": round(cycle_completion_ratio, 6),
+        },
+        "return_stability": {
+            "top_trade_share": round(top_trade_share, 6),
+            "top5_trade_share": round(top5_trade_share, 6),
+            "fold_return_std": round(fold_return_std, 6),
+        },
     }
     return WalkForwardResult(
         oos_metrics=oos_metrics,
@@ -363,4 +717,5 @@ def run_walk_forward(
         trade_sample=trade_sample,
         data_start=data_start,
         data_end=data_end,
+        diagnostics=diagnostics,
     )

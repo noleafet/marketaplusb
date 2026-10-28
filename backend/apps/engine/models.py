@@ -69,6 +69,7 @@ class CoinAnalysis(models.Model):
     folds = models.JSONField(default=list, blank=True)
     chart = models.JSONField(default=dict, blank=True)
     trade_sample = models.JSONField(default=list, blank=True)
+    diagnostics = models.JSONField(default=dict, blank=True)
     data_start = models.DateTimeField(null=True, blank=True)
     data_end = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(default=timezone.now)

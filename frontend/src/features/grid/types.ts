@@ -60,6 +60,124 @@ export interface Trade {
   level?: number | null;
 }
 
+export interface GateStatus {
+  name: string;
+  label: string;
+  passed: boolean;
+  value: number | string | boolean | null;
+  threshold: number | string | boolean | Record<string, unknown> | null;
+  reason: string;
+}
+
+export interface ReviewFlag {
+  code: string;
+  severity: 'info' | 'warning' | 'critical';
+  message: string;
+}
+
+export interface ScoreFactor {
+  score: number;
+  weight: number;
+  contribution: number;
+  status: 'strong' | 'ok' | 'watch' | 'weak';
+  inputs: Record<string, number | null>;
+}
+
+export interface ScorePenalty {
+  code: string;
+  points: number;
+  reason: string;
+}
+
+export interface ScoreBreakdown {
+  factors: Record<string, ScoreFactor>;
+  penalties: ScorePenalty[];
+  base_score: number;
+  final_score: number;
+}
+
+export interface RegimeBucket {
+  folds: number;
+  returns: number[];
+  drawdowns: number[];
+  mean_return: number;
+  mean_drawdown: number;
+  profitable: number;
+}
+
+export interface Diagnostics {
+  methodology_version?: number;
+  hard_gates?: GateStatus[];
+  flags?: ReviewFlag[];
+  score_breakdown?: ScoreBreakdown;
+  baseline_score?: number;
+  score_delta?: number;
+  eligibility_reasons?: string[];
+  pf_validation?: {
+    review_required: boolean;
+    validation_required: boolean;
+    validation_passed: boolean;
+    enough_trades: boolean;
+    stress_checked: boolean;
+    stress_profitable: boolean | null;
+    no_stop: boolean;
+    review_threshold: number;
+    validation_threshold: number;
+  };
+  correlation?: {
+    avg_correlation?: number | null;
+    max_correlation?: number | null;
+    peers?: Array<{ symbol: string; correlation: number }>;
+    exceeds_limit?: boolean;
+  };
+  liquidity?: Record<string, number | null>;
+  regime?: {
+    regimes?: Record<string, RegimeBucket>;
+    regimes_covered?: number;
+    labels?: string[];
+    profitable_share?: number;
+    dominant_regime?: string;
+    dominant_share?: number;
+    dependence_penalty?: number;
+    robustness_score?: number;
+    single_regime?: boolean;
+  };
+  cost_stress?: {
+    multiplier?: number;
+    stress_return?: number;
+    stress_max_drawdown?: number;
+    stress_delta?: number;
+    profitable?: boolean;
+  };
+  sensitivity?: {
+    parameter_sensitivity?: number | null;
+    mean_neighbor_return?: number | null;
+    worst_neighbor_return?: number | null;
+    runs?: Array<{ variant: string; net_return: number; max_drawdown: number }>;
+  };
+  exposure?: {
+    max_exposure_ratio?: number;
+    avg_exposure_ratio?: number;
+    max_unrealized_loss?: number;
+    max_unrealized_loss_pct?: number;
+  };
+  execution?: {
+    slippage_paid?: number;
+    buy_fills?: number;
+    sell_fills?: number;
+    cycle_completion_ratio?: number;
+  };
+  return_stability?: {
+    top_trade_share?: number;
+    top5_trade_share?: number;
+    fold_return_std?: number;
+  };
+  fold_returns?: number[];
+  fold_drawdowns?: number[];
+  recovery_days?: number;
+  max_drawdown_duration_days?: number;
+}
+
 export interface CoinResult {
   id: number;
   analysis: string;
@@ -73,6 +191,7 @@ export interface CoinResult {
   in_sample_metrics?: Record<string, number | string | boolean | null>;
   features?: Record<string, number | string | boolean | null>;
   component_scores: Record<string, number | null>;
+  diagnostics?: Diagnostics | null;
   params: Record<string, number | string>;
   folds?: Array<Record<string, unknown>>;
   chart?: ChartPayload;

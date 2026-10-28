@@ -132,23 +132,140 @@ liquidation check using each bar's worst print. Intrabar ordering is conservativ
 extreme → farther extreme → close); gap-crossed orders fill at the open; orders created by a fill
 cannot recycle within the same bar.
 
+Three range constructions are available through `range_mode`:
+
+- `percentile` (default) — 5th/95th percentile of highs/lows over the lookback, padded by
+  `atr_multiplier` ATRs.
+- `price_centered` — symmetric band of `3 × atr_multiplier` ATRs around the live price.
+- `atr_support` — floor at 30-day structural support plus an ATR buffer, ceiling at the recent
+  swing high plus an ATR pad, so breakdowns do not buy into the floor and breakouts still have
+  sell rungs. Only the top is clipped by `max_range_atr`.
+
+The width cap scales with the ATR multiplier (`max(max_range_atr, 6 × atr_multiplier)` ATRs), so
+comparing 2x/3x/4x pads changes the ladder instead of collapsing every variant onto the same band.
+
+**Adaptive overlays.** Five risk rules sit on top of the grid and can only reduce exposure,
+never increase it. Every threshold is a `GridParams` field, so it is fitted alongside the grid
+shape instead of being hard-coded:
+
+- **Structural stop.** The grid floor is kept above 30-day structural support. The stop sits
+  `stop_atr_multiple` ATRs below the epoch floor and only ratchets upward while inventory is
+  open. A trigger cancels the book and market-closes to USDT (`stop_loss` or `liquidation`).
+- **Trailing up.** A close above the structural range high by `trail_up_atr_multiple` ATR with a
+  confirmed uptrend shifts the ladder upward and raises the epoch stop. Ladder width is capped at
+  `max(max_range_atr, 6 × atr_multiplier)` ATRs so a trend cannot stretch the range indefinitely.
+- **Trailing take-profit.** Arms once equity reaches
+  `capital × (1 + tp_activate_net_return)`; the exit trails the peak by `tp_atr_multiple` ATR and
+  a triggered exit buys nothing for `TP_COOLDOWN_DAYS`.
+- **Range position.** `pos = (price − low_30d) / (high_30d − low_30d)`. `pos ≥ 0.9` combined with
+  a weakening trend blocks new buys; `pos < 0.1` is recorded as a lower-range signal.
+- **Funding z-score.** `z = (funding − mean) / std` over the prior 90 prints (zero std → 0).
+  `z ≥ 2` with weakening momentum cuts open exposure to `funding_cut_scale` of its allowance and
+  blocks new buys until the crowd unwinds.
+
+**Risk caps.** `max_inventory_pct` (default 1.0) bounds total position notional to a multiple of
+equity and is always at least as tight as `leverage × max_utilization`, so one rung can never
+exceed capital. `max_total_drawdown` (default 0 = off) stops and closes the book on a
+peak-to-trough equity drawdown before the liquidation price is reached; the stop reason is
+`drawdown_stop`.
+
+**Adaptive rebalancing.** `rebalance_mode="fixed"` keeps the scheduled rebuild. `"adaptive"`
+reviews the range once per `range_review_hours` (default 24) and rebuilds only when ATR has moved
+`volatility_shift_ratio` (default 50%) from the baseline, price has closed
+`breakout_atr_multiple` ATRs outside the active band, or the EMA20/50 trend regime flipped. Every
+rebuild respects `rebalance_cooldown_hours` (default 12), and a weekly rebuild remains the
+fallback for quiet markets. Rebuild reasons are counted (`rebalances`, `adaptive_rebalances`) and
+persisted per session.
+
 **Walk-forward validation.** Up to three folds use a 45% training window and an 18% test window.
-Parameters are selected only on training data from a 12-combination grid (levels 10/20/30 ×
-lookback 14/30 days × rebalance 7/14 days). Test windows are untouched and stitched into a
-compounded out-of-sample equity curve. The most frequently selected parameter set is reported
-alongside parameter stability.
+Parameters are selected only on training data from a 96-combination grid (levels 10/20/30 ×
+lookback 14/30 days × rebalance 7/14 days × stop 1.5/2.5 ATR × take-profit 1.5/3.0 ATR ×
+fixed/adaptive rebalancing), so stop distance, trailing-profit retrace, and the rebalance mode
+are validated rather than assumed. Test windows are untouched and stitched into a compounded
+out-of-sample equity curve. The most frequently selected parameter set is reported alongside
+parameter stability, plus the per-fold adaptive selections; paper sessions inherit the selected
+mode.
 
-**Ranking.** Component scores are cross-sectional percentiles:
+Each untouched test window is also classified as `trending`, `ranging`, `high_volatility`, or
+`mixed` from its own ADX, trend fit, realized volatility, and range containment. Per-regime
+returns drive a regime-robustness score and a dependence penalty when nearly all profit comes
+from one regime. Two further diagnostics rerun the same test windows without touching parameter
+selection: a cost-stress run doubles maker/taker fees and slippage, and a sensitivity run varies
+grid levels (±25%), range lookback, and spacing. These produce `cost_stress_*`,
+`parameter_sensitivity`, and `regimes_covered` metrics, all persisted with the analysis.
 
-- Profitability 35% — net return, Calmar, profit factor, win rate
-- Survivability 30% — drawdown, fold consistency, worst fold, no stop-out, funding cost
-- Stability 20% — mean reversion, range stability, parameter stability, time in range
-- Execution 15% — ADV, cost-to-edge, funding, volume variability
+**Risk and execution metrics.** Open inventory is marked to market on every equity record, so
+unrealized PnL is inside equity and drawdown. Each fold reports peak and average exposure,
+maximum unrealized loss, max drawdown duration, recovery time, buy/sell fill counts, completed
+buy-sell-cycle ratio, realized slippage, and the share of gross profit from the best trade and
+best five trades. The analysis also snapshots the live order book (25 bps band by default) to
+measure spread and whether visible depth covers one grid slot.
 
-Hard gates require positive OOS return, sufficient trades, drawdown below the configured limit,
-at least half the folds profitable, adequate history, no stop-out, and minimum liquidity.
+**Comparison sweep.** `apps.engine.compare` re-runs a fixed holdout window (default 90 days,
+32-day warmup) across 24 variants: levels 10/15/20 × ATR 2/3/4 × fixed/adaptive, the three range
+modes, and drawdown limits 5/10/15%. Each row reports net return, max drawdown, Calmar, profit
+factor, trades, fees, funding, time in/out of range, rebalances, and stop/liquidation. Run it
+against stored candles with:
+
+```bash
+python manage.py compare_grid BTCUSDT --holdout-days 90
+python manage.py compare_grid BTC --output results.json
+```
+
+If the holdout never draws down as far as the tightest limit (5%), the three drawdown rows are
+identical — the report still records the realized drawdown and any `drawdown_stop` trigger.
+
+**Eligibility gates (run before ranking).** Every gate is a boolean with its observed value and
+configured threshold. Defaults live in `ENGINE_*` and can be tuned per deployment:
+
+- 120 days of candle history (`ENGINE_MIN_DATA_DAYS`)
+- at least one completed walk-forward fold
+- median 24h liquidity ≥ `ENGINE_MIN_ADV_USD`
+- ≥ `ENGINE_MIN_OOS_TRADES` OOS fills
+- positive OOS net return
+- OOS max drawdown ≤ `ENGINE_MAX_DRAWDOWN`
+- at least half the folds profitable
+- no stop-out or liquidation
+- ATR inside `ENGINE_MIN_ATR_PCT`–`ENGINE_MAX_ATR_PCT`
+- spread ≤ `ENGINE_MAX_SPREAD_BPS` and depth cover ≥ `ENGINE_MIN_DEPTH_COVER` (when an
+  order-book snapshot exists)
+- the cost-stressed return stays above `ENGINE_MIN_STRESSED_RETURN`
+- profit factor > `ENGINE_PF_VALIDATE` requires ≥ 24 fills, no stop-out, and a profitable stress
+  run; profit factor > `ENGINE_PF_REVIEW` is flagged for manual review either way
+
+Only eligible coins are ranked. Ineligible coins keep their score for comparison and carry the
+full list of rejection reasons.
+
+**Ranking.** Eligible scores blend eight cross-sectional percentile factors so correlated
+measurements are grouped rather than double-counted:
+
+- Profitability 18% — profit factor, win rate
+- Risk-adjusted return 18% — net return, return-to-drawdown
+- Drawdown control 15% — max DD, recovery time, stop-out, unrealized loss, 1% tail loss
+- Fold consistency 14% — profitable-fold share, worst fold, return dispersion, parameter stability
+- Regime robustness 10% — regime coverage/profitability, time in range
+- Structural stability 10% — mean reversion, range stability, parameter sensitivity/stability
+- Execution quality 10% — ADV, cost-to-edge, spread, depth cover, funding, stressed return
+- Diversification 5% — daily-return correlation with eligible peers
+
+Penalties then subtract points for stop-outs, unprofitable folds, thin samples, failed cost
+stress, single-regime dependence, sharp parameter sensitivity, trade concentration, high
+correlation, slow recovery, and excessive inventory exposure. The legacy four-component formula
+is still computed as `baseline_score`, so `score_delta` shows what the enhanced ranking changed
+for each coin.
+
+**Correlation.** Daily closes aligned on common dates give pairwise correlations over
+`ENGINE_CORR_LOOKBACK_DAYS`. Coins above `ENGINE_MAX_CORRELATION` with an eligible peer are
+flagged, penalized, and skipped when paper sessions are created, so the paper book is not a
+stack of the same trade. The greedy selector always keeps the first candidate.
+
 Suitability bands: `prime` ≥ 75, `viable` ≥ 60, `watch` ≥ 45, otherwise `avoid`; failed gates
 become `ineligible`. Reports are written for rankings, performance, risk, and methodology.
+
+The dashboard exposes the hard gates, review flags, factor scores/weights/contributions,
+baseline-vs-enhanced delta, regime, cost-stress, sensitivity, exposure, recovery, correlation,
+and return-concentration diagnostics. The original OOS return, max drawdown, profit factor,
+trades, ADV, ATR%, and funding columns remain on the rankings table.
 
 The test suite includes a truncation test: truncating future bars does not change any trade or
 equity point before the cutoff, guarding against look-ahead bias.
@@ -158,7 +275,11 @@ equity point before the cutoff, guarding against look-ahead bias.
 1. **Historical backtest** — daily analysis over the eligible top-100 universe.
 2. **Paper trading** — the same `IncrementalGridStrategy` state machine as the future live path,
    driven by live public data with simulated orders, fees, slippage, funding, and position
-   tracking. State is persisted in `PaperSession.grid_state`, so workers can restart safely.
+   tracking. The tick job runs every 5 minutes but signals only on completed candles at
+   `PAPER_SIGNAL_INTERVAL` (default `1h`), so a forming bar can never trigger a fill. Every
+   initialize/rebalance persists a per-level plan (price, side, qty, and why a rung was skipped:
+   `risk_gate`, `no_capacity`, `no_inventory`, or `at_price`) into `PaperSession.grid_state` and
+   the decision log, and state survives worker restarts.
 3. **Evaluation** — promotion requires at least 7 days, +1% net return, max 12% drawdown, and
    20 fills (configurable). A 20% hard drawdown stop stops the session independently.
 4. **Live approval** — only a promotion-ready session can request approval; an operator must
@@ -239,8 +360,16 @@ Copy `.env.example` to `.env`. Key settings:
 | `ENGINE_MIN_ADV_USD` | `5,000,000` | Liquidity gate |
 | `ENGINE_MIN_OOS_TRADES` | `12` | Minimum out-of-sample fills |
 | `ENGINE_MAX_DRAWDOWN` | `0.35` | OOS drawdown gate |
+| `ENGINE_MIN_DATA_DAYS` | `120` | Minimum candle history |
+| `ENGINE_MIN_ATR_PCT`, `ENGINE_MAX_ATR_PCT` | `0.0`, `0.12` | 14-day ATR band; `0` disables a side |
+| `ENGINE_PF_REVIEW`, `ENGINE_PF_VALIDATE` | `10`, `30` | Profit-factor review / validation thresholds |
+| `ENGINE_COST_STRESS_MULTIPLIER` | `2.0` | Fee/slippage multiplier for stress run |
+| `ENGINE_ENFORCE_COST_STRESS` | `true` | Reject strategies that fail the stress run |
+| `ENGINE_MAX_SPREAD_BPS`, `ENGINE_MIN_DEPTH_COVER` | `10`, `1.0` | Order-book gates |
+| `ENGINE_MAX_CORRELATION` | `0.85` | Correlation penalty and paper diversification |
+| `ENGINE_MAX_TOP_TRADE_SHARE` | `0.60` | Return-concentration flag |
 | `ENGINE_TOP_N_PAPER` | `8` | Paper sessions created per analysis |
-| `PAPER_*` | see file | Tick cadence, evaluation thresholds, hard stop |
+| `PAPER_*` | see file | Tick cadence, 1h signal interval (`PAPER_SIGNAL_INTERVAL`), evaluation thresholds, hard stop |
 | `LIVE_TRADING_ENABLED` | `false` | Must stay false until explicitly approved |
 | `BINANCE_FUTURES_TESTNET` | `true` | Live adapter target |
 | `LIVE_MAX_NOTIONAL_USD`, `LIVE_MAX_LEVERAGE` | `250`, `2` | Live limits |
@@ -270,7 +399,10 @@ npm run build
 Backend tests cover non-destructive ingestion, contract-multiplier mapping, eligibility
 exclusions, grid determinism and look-ahead resistance, walk-forward fold integrity, scoring
 gates/ranking, live-gate denial + audit, paper session transitions, first-tick grid persistence,
-job token enforcement, scheduling cadence, and worker success/failure handling.
+per-level plan auditing, rung replenishment and gate re-arming, adaptive/fixed rebalancing with
+cooldown, 1h completed-candle signals on 5-minute ticks, range modes, inventory/drawdown caps,
+the 24-variant comparison sweep, job token enforcement, scheduling cadence, and worker
+success/failure handling.
 
 ## Limitations
 

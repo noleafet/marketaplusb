@@ -18,6 +18,7 @@ from apps.engine.features import compute_features
 from apps.engine.grid import GridParams, SimulationConfig
 from apps.engine.models import AnalysisRun, CoinAnalysis, log_decision
 from apps.engine.reports import build_reports
+from apps.engine.robustness import daily_returns, select_diversified
 from apps.engine.scoring import ranking_summary, score_results
 from apps.engine.timescale import load_candles, load_funding
 from apps.engine.walkforward import run_walk_forward
@@ -53,6 +54,57 @@ def base_grid_params(overrides: dict[str, Any] | None = None) -> GridParams:
         if key in values and value is not None:
             values[key] = value
     return GridParams(**values)
+
+
+def _order_book_features(
+    client: BinanceFuturesClient,
+    symbol: str,
+    *,
+    capital: float,
+    leverage: float,
+    max_utilization: float,
+    grid_levels: int,
+    band_bps: float,
+) -> dict[str, Any]:
+    """Live depth/spread snapshot relative to one grid slot's notional."""
+
+    if not symbol:
+        return {}
+    try:
+        payload = client.depth(symbol, limit=100)
+        bids = [(float(price), float(qty)) for price, qty in payload.get("bids") or []]
+        asks = [(float(price), float(qty)) for price, qty in payload.get("asks") or []]
+    except Exception as exc:  # noqa: BLE001 - a snapshot failure must not stop analysis
+        logger.warning("Order-book snapshot failed for %s: %s", symbol, exc)
+        return {}
+    if not bids or not asks:
+        return {}
+    best_bid = bids[0][0]
+    best_ask = asks[0][0]
+    if best_bid <= 0 or best_ask <= 0 or best_ask < best_bid:
+        return {}
+    mid = (best_bid + best_ask) / 2.0
+    spread_bps = (best_ask - best_bid) / mid * 10_000.0
+    band = max(0.0, band_bps) / 10_000.0
+    bid_depth = sum(price * qty for price, qty in bids if price >= mid * (1.0 - band))
+    ask_depth = sum(price * qty for price, qty in asks if price <= mid * (1.0 + band))
+    slot_notional = (
+        capital * leverage * max_utilization / max(1, grid_levels)
+    )
+    depth_cover = (
+        min(bid_depth, ask_depth) / slot_notional if slot_notional > 0 else None
+    )
+    return {
+        "best_bid": round(best_bid, 10),
+        "best_ask": round(best_ask, 10),
+        "mid_price": round(mid, 10),
+        "spread_bps": round(spread_bps, 4),
+        "depth_bid_usd": round(bid_depth, 2),
+        "depth_ask_usd": round(ask_depth, 2),
+        "depth_band_bps": band_bps,
+        "depth_cover_ratio": round(depth_cover, 4) if depth_cover is not None else None,
+        "order_book_sampled_at": timezone.now().isoformat(),
+    }
 
 
 def _analysis_params(params: dict[str, Any] | None) -> dict[str, Any]:
@@ -108,6 +160,15 @@ def run_daily_analysis(
                 "min_adv_usd": cfg["MIN_ADV_USD"],
                 "min_oos_trades": cfg["MIN_OOS_TRADES"],
                 "max_drawdown": cfg["MAX_DRAWDOWN"],
+                "min_data_days": cfg["MIN_DATA_DAYS"],
+                "min_atr_pct": cfg["MIN_ATR_PCT"],
+                "max_atr_pct": cfg["MAX_ATR_PCT"],
+                "pf_review": cfg["PF_REVIEW"],
+                "pf_validate": cfg["PF_VALIDATE"],
+                "cost_stress_multiplier": cfg["COST_STRESS_MULTIPLIER"],
+                "max_spread_bps": cfg["MAX_SPREAD_BPS"],
+                "min_depth_cover": cfg["MIN_DEPTH_COVER"],
+                "max_correlation": cfg["MAX_CORRELATION"],
             },
         },
     )
@@ -192,6 +253,8 @@ def run_daily_analysis(
             "folds": [],
             "chart": {},
             "trade_sample": [],
+            "diagnostics": {},
+            "_daily_returns": daily_returns(rows),
             "data_start": rows[0]["time"] if rows else None,
             "data_end": rows[-1]["time"] if rows else None,
         }
@@ -211,6 +274,8 @@ def run_daily_analysis(
                     base_params=base_params,
                     lookback_days=lookback_days,
                     min_trades=int(cfg["MIN_OOS_TRADES"]),
+                    cost_stress_multiplier=float(cfg["COST_STRESS_MULTIPLIER"]),
+                    sensitivity=bool(cfg["WALKFORWARD_SENSITIVITY"]),
                 )
             except Exception as exc:  # noqa: BLE001 - protect the rest of the universe
                 logger.exception("Backtest failed for %s", coin.symbol)
@@ -238,8 +303,22 @@ def run_daily_analysis(
                             "trade_sample": wf.trade_sample,
                             "data_start": wf.data_start,
                             "data_end": wf.data_end,
+                            "_wf_diagnostics": wf.diagnostics,
                         }
                     )
+                    if cfg["ORDER_BOOK_ENABLED"]:
+                        recommended = GridParams.from_dict(wf.params or {})
+                        book = _order_book_features(
+                            client,
+                            coin.binance_symbol,
+                            capital=config.capital,
+                            leverage=config.leverage,
+                            max_utilization=recommended.max_utilization,
+                            grid_levels=recommended.grid_levels,
+                            band_bps=float(cfg["DEPTH_BAND_BPS"]),
+                        )
+                        if book:
+                            item["features"] = {**features, **book}
         results.append(item)
 
         if index % 10 == 0 or index == len(coin_list):
@@ -251,11 +330,28 @@ def run_daily_analysis(
                 time.monotonic() - started_monotonic,
             )
 
+    # Scoring runs the hard gates first, then correlates only the coins that
+    # passed them, so an ineligible coin cannot change the diversification of
+    # the ranked universe.
+    correlation_info: dict[str, Any] = {}
     ranked = score_results(
         results,
         min_adv_usd=float(cfg["MIN_ADV_USD"]),
         min_trades=int(cfg["MIN_OOS_TRADES"]),
         max_drawdown=float(cfg["MAX_DRAWDOWN"]),
+        min_atr_pct=float(cfg["MIN_ATR_PCT"]),
+        max_atr_pct=float(cfg["MAX_ATR_PCT"]),
+        pf_review=float(cfg["PF_REVIEW"]),
+        pf_validate=float(cfg["PF_VALIDATE"]),
+        max_spread_bps=float(cfg["MAX_SPREAD_BPS"]),
+        min_depth_cover=float(cfg["MIN_DEPTH_COVER"]),
+        enforce_cost_stress=bool(cfg["ENFORCE_COST_STRESS"]),
+        min_stressed_return=float(cfg["MIN_STRESSED_RETURN"]),
+        max_correlation=float(cfg["MAX_CORRELATION"]),
+        max_top_trade_share=float(cfg["MAX_TOP_TRADE_SHARE"]),
+        min_data_days=int(cfg["MIN_DATA_DAYS"]),
+        corr_lookback_days=int(cfg["CORR_LOOKBACK_DAYS"]),
+        correlation_out=correlation_info,
     )
 
     saved: list[CoinAnalysis] = []
@@ -278,6 +374,7 @@ def run_daily_analysis(
                     folds=item.get("folds") or [],
                     chart=item.get("chart") or {},
                     trade_sample=item.get("trade_sample") or [],
+                    diagnostics=item.get("diagnostics") or {},
                     data_start=item.get("data_start"),
                     data_end=item.get("data_end"),
                 )
@@ -293,6 +390,22 @@ def run_daily_analysis(
             "lookback_days": lookback_days,
             "interval": interval,
             "runtime_seconds": round(time.monotonic() - started_monotonic, 1),
+            "correlation": correlation_info,
+            "thresholds": {
+                "min_adv_usd": cfg["MIN_ADV_USD"],
+                "min_oos_trades": cfg["MIN_OOS_TRADES"],
+                "max_drawdown": cfg["MAX_DRAWDOWN"],
+                "min_data_days": cfg["MIN_DATA_DAYS"],
+                "min_atr_pct": cfg["MIN_ATR_PCT"],
+                "max_atr_pct": cfg["MAX_ATR_PCT"],
+                "pf_review": cfg["PF_REVIEW"],
+                "pf_validate": cfg["PF_VALIDATE"],
+                "cost_stress_multiplier": cfg["COST_STRESS_MULTIPLIER"],
+                "max_spread_bps": cfg["MAX_SPREAD_BPS"],
+                "min_depth_cover": cfg["MIN_DEPTH_COVER"],
+                "max_correlation": cfg["MAX_CORRELATION"],
+                "max_top_trade_share": cfg["MAX_TOP_TRADE_SHARE"],
+            },
         }
     )
     analysis.save(update_fields=["data_cutoff", "summary"])
@@ -301,6 +414,16 @@ def run_daily_analysis(
         "min_adv_usd": cfg["MIN_ADV_USD"],
         "min_oos_trades": cfg["MIN_OOS_TRADES"],
         "max_drawdown": cfg["MAX_DRAWDOWN"],
+        "min_data_days": cfg["MIN_DATA_DAYS"],
+        "min_atr_pct": cfg["MIN_ATR_PCT"],
+        "max_atr_pct": cfg["MAX_ATR_PCT"],
+        "pf_review": cfg["PF_REVIEW"],
+        "pf_validate": cfg["PF_VALIDATE"],
+        "cost_stress_multiplier": cfg["COST_STRESS_MULTIPLIER"],
+        "max_spread_bps": cfg["MAX_SPREAD_BPS"],
+        "min_depth_cover": cfg["MIN_DEPTH_COVER"],
+        "max_correlation": cfg["MAX_CORRELATION"],
+        "max_top_trade_share": cfg["MAX_TOP_TRADE_SHARE"],
     }
     # Solo runs must not displace the universe ranking/performance reports.
     if analysis.scope == AnalysisRun.Scope.UNIVERSE:
@@ -314,18 +437,52 @@ def run_daily_analysis(
     try:
         from apps.trading.paper import ensure_paper_sessions
 
-        selected = [
+        candidates = [
             item
             for item in ranked
             if item.get("eligible")
             and item.get("suitability") in {"prime", "viable"}
-        ][: int(cfg["TOP_N_PAPER"])]
+        ]
+        selected, skipped = select_diversified(
+            candidates,
+            max_corr=float(cfg["MAX_CORRELATION"]),
+            limit=int(cfg["TOP_N_PAPER"]),
+        )
         sessions = ensure_paper_sessions(analysis, selected)
         analysis.summary["paper_sessions_created"] = len(sessions)
         analysis.summary["paper_symbols"] = [s.coin.symbol for s in sessions]
+        analysis.summary["paper_skipped_correlation"] = skipped
+        if skipped:
+            log_decision(
+                "paper",
+                "Correlation filter skipped duplicate paper candidates: "
+                + ", ".join(
+                    f"{row['symbol']} ({row['correlation']:.2f} with {row['correlated_with']})"
+                    for row in skipped
+                ),
+                severity="warning",
+                analysis=analysis,
+                job_run_id=job_run_id,
+                payload={"skipped": skipped},
+            )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Paper session bootstrap failed")
         analysis.summary["paper_session_error"] = str(exc)
+
+    flagged = [item for item in ranked if item.get("flags")]
+    if flagged:
+        log_decision(
+            "analysis",
+            f"{len(flagged)} coin(s) carry review flags; see the ranking report "
+            "for profit-factor, concentration, regime, and cost-stress warnings.",
+            severity="warning",
+            analysis=analysis,
+            job_run_id=job_run_id,
+            payload={
+                "flags": analysis.summary.get("flag_counts"),
+                "symbols": [item["coin"].symbol for item in flagged][:30],
+            },
+        )
 
     top_symbols = [item["coin"].symbol for item in ranked if item.get("eligible")][:10]
     analysis.status = AnalysisRun.Status.SUCCEEDED

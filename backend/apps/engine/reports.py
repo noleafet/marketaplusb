@@ -49,10 +49,13 @@ def build_reports(
             r["coin"].symbol,
             r["coin"].name,
             str(r["score"]),
+            str(r.get("baseline_score", "n/a")),
             _fmt_pct(r["oos_metrics"].get("net_return")),
             _fmt_pct(r["oos_metrics"].get("max_drawdown")),
             str(r["oos_metrics"].get("trades", 0)),
             _fmt_num(r["oos_metrics"].get("fold_consistency"), 2),
+            _fmt_pct(r["oos_metrics"].get("cost_stress_return")),
+            ", ".join(flag["code"] for flag in r.get("flags") or []) or "—",
             str(r.get("suitability", "")),
             _params_label(r.get("params", {})),
         ]
@@ -66,7 +69,9 @@ def build_reports(
             "",
             "Ranking uses out-of-sample walk-forward results only. Fees (maker/taker), "
             "adverse slippage, perpetual funding, margin limits, and stop-outs are included. "
-            "The grid starts flat so returns measure grid cycling rather than buy-and-hold beta.",
+            "The grid starts flat so returns measure grid cycling rather than buy-and-hold beta. "
+            "Hard eligibility gates are applied before ranking; review flags do not hide a "
+            "profitable result but mark it for manual validation.",
             "",
             _table(
                 [
@@ -74,10 +79,13 @@ def build_reports(
                     "Coin",
                     "Name",
                     "Score",
+                    "Baseline",
                     "OOS net",
                     "OOS max DD",
                     "Fills",
                     "Fold consistency",
+                    "2x-cost net",
+                    "Review flags",
                     "Class",
                     "Params",
                 ],
@@ -109,7 +117,9 @@ def build_reports(
                         "rank": r["rank"],
                         "symbol": r["coin"].symbol,
                         "score": r["score"],
+                        "baseline_score": r.get("baseline_score"),
                         "suitability": r["suitability"],
+                        "flags": r.get("flags") or [],
                         "oos_metrics": r["oos_metrics"],
                         "params": r["params"],
                     }
@@ -187,7 +197,12 @@ def build_reports(
             _fmt_num(r["features"].get("adx"), 1),
             _fmt_pct(r["features"].get("funding_long_annual_cost")),
             _fmt_num(r["features"].get("cost_to_edge"), 2),
-            _fmt_num((r["features"].get("adv_usd_median") or 0) / 1_000_000, 1) + "M",
+            _fmt_num(r["features"].get("adv_usd_median"), 0),
+            _fmt_num(r["features"].get("spread_bps"), 2),
+            _fmt_num(r["features"].get("depth_cover_ratio"), 2),
+            _fmt_pct(r["oos_metrics"].get("cost_stress_return")),
+            str(r["oos_metrics"].get("dominant_regime") or "—"),
+            _fmt_num(r["oos_metrics"].get("recovery_days"), 0),
             "yes" if r["oos_metrics"].get("stopped") else "no",
         ]
         for r in top
@@ -212,6 +227,11 @@ def build_reports(
                     "Funding cost (ann.)",
                     "Cost/edge",
                     "ADV",
+                    "Spread (bps)",
+                    "Depth cover",
+                    "2x-cost net",
+                    "Dominant regime",
+                    "Recovery (d)",
                     "Stopped",
                 ],
                 risk_rows,
@@ -224,8 +244,17 @@ def build_reports(
             f"- Minimum median 24h quote volume: ${config.get('min_adv_usd', 0):,.0f}",
             f"- Minimum OOS fills: {config.get('min_oos_trades')}",
             f"- Maximum OOS drawdown: {_fmt_pct(config.get('max_drawdown'))}",
+            f"- ATR% band: {_fmt_pct(config.get('min_atr_pct'), 2)} – "
+            f"{_fmt_pct(config.get('max_atr_pct'), 2)}",
+            f"- Maximum bid-ask spread: {_fmt_num(config.get('max_spread_bps'), 1)} bps",
+            f"- Minimum order-book depth cover: "
+            f"{_fmt_num(config.get('min_depth_cover'), 1)}x a grid slot",
+            f"- Must stay profitable with fees/slippage multiplied by "
+            f"{_fmt_num(config.get('cost_stress_multiplier'), 1)}x",
+            f"- Profit factor above {_fmt_num(config.get('pf_review'), 0)} is flagged; "
+            f"above {_fmt_num(config.get('pf_validate'), 0)} requires extra validation",
             "- Positive OOS net return, at least half of folds profitable, no stop-out/liquidation",
-            "- At least 120 days of history",
+            f"- At least {config.get('min_data_days', 120)} days of history",
             "",
             "## Exclusions",
             "",
@@ -290,10 +319,21 @@ def build_reports(
             "",
             "## Scoring",
             "",
-            "Score = 35% profitability + 30% survivability + 20% regime stability + 15% execution "
-            "quality. Component inputs are cross-sectional percentile ranks. Hard gates (liquidity, "
-            "trades, positive OOS return, drawdown, fold consistency, no stop-out, history length) "
-            "determine eligibility; ineligible coins are ranked last and labelled accordingly.",
+            "Hard gates (history, folds, liquidity, fills, positive OOS return, drawdown, fold "
+            "consistency, no stop-out, ATR band, spread, order-book depth, cost stress, and "
+            "profit-factor validation) decide eligibility before any rank is assigned. "
+            "Ineligible coins keep a diagnostic score but no rank.",
+            "",
+            "Eligible coins are ranked on eight de-correlated factors: profitability (18%), "
+            "risk-adjusted return (18%), drawdown control (15%), walk-forward consistency (14%), "
+            "regime robustness (10%), structural stability (10%), execution (10%), and "
+            "diversification (5%). Inputs are cross-sectional percentiles. Correlated measures "
+            "are grouped rather than counted twice (for example, raw return and return/drawdown "
+            "share one risk-adjusted factor), and penalties are itemised in the dashboard.",
+            "",
+            "Each test fold is also labelled by market regime, rerun with 2x fees and slippage, "
+            "and rerun with small parameter perturbations. The previous baseline formula is "
+            "reported alongside the enhanced score so ranking changes can be audited.",
             "",
             "## Promotion path",
             "",
@@ -311,7 +351,7 @@ def build_reports(
             kind=Report.Kind.METHODOLOGY,
             title="Engine methodology",
             body_markdown=methodology_body,
-            payload={"version": 1},
+            payload={"version": 2},
         )
     )
     return reports

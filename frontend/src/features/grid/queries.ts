@@ -7,6 +7,7 @@ export const gridKeys = {
   all: ['grid'] as const,
   dashboard: ['grid', 'dashboard'] as const,
   results: (params: Record<string, unknown> = {}) => ['grid', 'results', params] as const,
+  resultDetail: (id: number) => ['grid', 'result', id] as const,
   coins: ['grid', 'coins'] as const,
   coinHistory: (symbol: string) => ['grid', 'coin-history', symbol] as const,
   reports: ['grid', 'reports'] as const,
@@ -33,6 +34,14 @@ export function useResults(params: { limit?: number; search?: string } = {}) {
   return useQuery({
     queryKey: gridKeys.results(params),
     queryFn: () => engineApi.results(params)
+  });
+}
+
+export function useCoinResultDetail(id: number | null) {
+  return useQuery({
+    queryKey: gridKeys.resultDetail(id ?? 0),
+    queryFn: () => engineApi.result(id as number),
+    enabled: typeof id === 'number' && id > 0
   });
 }
 

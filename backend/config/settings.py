@@ -116,6 +116,30 @@ ENGINE = {
     "MIN_ADV_USD": env.float("ENGINE_MIN_ADV_USD", default=5_000_000.0),
     "MIN_OOS_TRADES": env.int("ENGINE_MIN_OOS_TRADES", default=12),
     "MAX_DRAWDOWN": env.float("ENGINE_MAX_DRAWDOWN", default=0.35),
+    "MIN_DATA_DAYS": env.int("ENGINE_MIN_DATA_DAYS", default=120),
+    # Volatility band. A ceiling rejects coins whose 14-day ATR is too large for
+    # the ladder; zero disables either side.
+    "MIN_ATR_PCT": env.float("ENGINE_MIN_ATR_PCT", default=0.0),
+    "MAX_ATR_PCT": env.float("ENGINE_MAX_ATR_PCT", default=0.12),
+    # Profit factor review flags. Values above the review threshold are marked;
+    # values above the validation threshold also require extra checks.
+    "PF_REVIEW": env.float("ENGINE_PF_REVIEW", default=10.0),
+    "PF_VALIDATE": env.float("ENGINE_PF_VALIDATE", default=30.0),
+    # Cost-stress validation: rerun each untouched test fold with fees and
+    # slippage multiplied by this factor.
+    "COST_STRESS_MULTIPLIER": env.float("ENGINE_COST_STRESS_MULTIPLIER", default=2.0),
+    "MIN_STRESSED_RETURN": env.float("ENGINE_MIN_STRESSED_RETURN", default=0.0),
+    "ENFORCE_COST_STRESS": env.bool("ENGINE_ENFORCE_COST_STRESS", default=True),
+    # Execution quality from a live order-book snapshot taken during analysis.
+    "ORDER_BOOK_ENABLED": env.bool("ENGINE_ORDER_BOOK_ENABLED", default=True),
+    "DEPTH_BAND_BPS": env.float("ENGINE_DEPTH_BAND_BPS", default=25.0),
+    "MAX_SPREAD_BPS": env.float("ENGINE_MAX_SPREAD_BPS", default=10.0),
+    "MIN_DEPTH_COVER": env.float("ENGINE_MIN_DEPTH_COVER", default=1.0),
+    # Diversification and return-stability diagnostics.
+    "MAX_CORRELATION": env.float("ENGINE_MAX_CORRELATION", default=0.85),
+    "CORR_LOOKBACK_DAYS": env.int("ENGINE_CORR_LOOKBACK_DAYS", default=60),
+    "MAX_TOP_TRADE_SHARE": env.float("ENGINE_MAX_TOP_TRADE_SHARE", default=0.60),
+    "WALKFORWARD_SENSITIVITY": env.bool("ENGINE_WALKFORWARD_SENSITIVITY", default=True),
     "RANGE_LOOKBACK_DAYS": env.int("ENGINE_RANGE_LOOKBACK_DAYS", default=14),
     "GRID_LEVELS": env.int("ENGINE_GRID_LEVELS", default=20),
     "ATR_MULTIPLIER": env.float("ENGINE_ATR_MULTIPLIER", default=1.0),
@@ -127,6 +151,9 @@ ENGINE = {
 
 PAPER = {
     "TICK_MINUTES": env.int("PAPER_TICK_MINUTES", default=5),
+    # Monitoring runs every TICK_MINUTES, but the strategy only acts on
+    # completed candles at this interval.
+    "SIGNAL_INTERVAL": env("PAPER_SIGNAL_INTERVAL", default="1h"),
     "MIN_DAYS": env.float("PAPER_EVAL_MIN_DAYS", default=7),
     "MIN_NET_RETURN": env.float("PAPER_MIN_NET_RETURN", default=0.01),
     "MAX_DRAWDOWN": env.float("PAPER_MAX_DRAWDOWN", default=0.12),

@@ -16,7 +16,7 @@ from django.conf import settings
 from django.utils import timezone
 
 from apps.common.binance import BinanceFuturesClient
-from apps.engine.grid import GridParams, SimulationConfig
+from apps.engine.grid import GridParams, SimulationConfig, max_position_notional
 from apps.trading.models import LiveOrderAudit, LiveTradingState
 
 logger = logging.getLogger("engine")
@@ -80,7 +80,7 @@ class PaperExecutionAdapter:
         notional = self.position_qty * price
         used_margin = notional / self.config.leverage
         free_margin = max(0.0, eq - used_margin)
-        max_notional = max(0.0, eq * self.config.leverage * self.params.max_utilization)
+        max_notional = max_position_notional(eq, self.config, self.params)
         budget = min(
             max_notional - notional,
             free_margin * self.config.leverage * 0.98,

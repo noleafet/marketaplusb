@@ -19,6 +19,11 @@ import EmptyPanel from '@/features/grid/components/empty-panel';
 import EquityChart from '@/features/grid/components/equity-chart';
 import MetricCard from '@/features/grid/components/metric-card';
 import StatusBadge from '@/features/grid/components/status-badge';
+import {
+  FACTOR_LABELS,
+  factorStatusClass,
+  formatGateValue
+} from '@/features/grid/diagnostics';
 import { useCoinHistory } from '@/features/grid/queries';
 import type { CoinResult } from '@/features/grid/types';
 
@@ -102,6 +107,12 @@ export default function CoinDetailPage() {
   const chart = latest?.chart;
   const folds = latest?.folds ?? [];
   const trades = latest?.trade_sample ?? [];
+  const diagnostics = latest?.diagnostics;
+  const breakdown = diagnostics?.score_breakdown;
+  const formatMaybePercent = (value: unknown) =>
+    typeof value === 'number' && Number.isFinite(value) ? formatPercent(value) : '—';
+  const formatMaybeNumber = (value: unknown, digits = 2) =>
+    typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '—';
 
   return (
     <PageContainer
@@ -183,6 +194,354 @@ export default function CoinDetailPage() {
               icon={<Icons.adjustments />}
             />
           </div>
+
+          {diagnostics ? (
+            <>
+              <div className='grid gap-4 xl:grid-cols-2'>
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Risk review</CardTitle>
+                    <CardDescription>
+                      Hard gates decide eligibility before any ranking. Flags mark risks that pass
+                      the gates but still deserve review.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className='space-y-4'>
+                    <div>
+                      <p className='text-muted-foreground mb-2 text-xs uppercase'>Review flags</p>
+                      {diagnostics.flags?.length ? (
+                        <ul className='space-y-1.5 text-sm'>
+                          {diagnostics.flags.map((flag) => (
+                            <li key={flag.code} className='flex gap-2'>
+                              <Icons.warning
+                                className={`mt-0.5 size-3.5 shrink-0 ${
+                                  flag.severity === 'critical'
+                                    ? 'text-rose-500'
+                                    : flag.severity === 'warning'
+                                      ? 'text-amber-500'
+                                      : 'text-muted-foreground'
+                                }`}
+                              />
+                              <span>{flag.message}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className='text-muted-foreground text-sm'>No review flags.</p>
+                      )}
+                    </div>
+                    <div>
+                      <p className='text-muted-foreground mb-2 text-xs uppercase'>
+                        Hard eligibility gates
+                      </p>
+                      <div className='space-y-1.5 text-sm'>
+                        {(diagnostics.hard_gates ?? []).map((gate) => (
+                          <div
+                            key={gate.name}
+                            className='flex items-start justify-between gap-3'
+                          >
+                            <span className='text-muted-foreground'>
+                              {gate.label}
+                              {gate.reason ? (
+                                <span className='block text-xs text-rose-500'>{gate.reason}</span>
+                              ) : null}
+                            </span>
+                            <span
+                              className={`shrink-0 tabular-nums ${
+                                gate.passed
+                                  ? 'text-emerald-600 dark:text-emerald-400'
+                                  : 'text-rose-600 dark:text-rose-400'
+                              }`}
+                            >
+                              {gate.passed ? 'pass' : 'fail'} · {formatGateValue(gate.value)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    {diagnostics.eligibility_reasons?.length ? (
+                      <div>
+                        <p className='text-muted-foreground mb-2 text-xs uppercase'>
+                          Rejection reasons
+                        </p>
+                        <ul className='list-disc space-y-1 pl-5 text-sm text-rose-600 dark:text-rose-400'>
+                          {diagnostics.eligibility_reasons.map((reason) => (
+                            <li key={reason}>{reason}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+                  </CardContent>
+                </Card>
+
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Score contributions</CardTitle>
+                    <CardDescription>
+                      Enhanced score {latest.score.toFixed(1)} · baseline{' '}
+                      {formatMaybeNumber(diagnostics.baseline_score, 1)} · change{' '}
+                      {diagnostics.score_delta !== undefined
+                        ? `${diagnostics.score_delta >= 0 ? '+' : ''}${diagnostics.score_delta.toFixed(1)}`
+                        : '—'}
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className='space-y-3'>
+                    {breakdown ? (
+                      <>
+                        {Object.entries(breakdown.factors ?? {}).map(([key, factor]) => (
+                          <div key={key} className='space-y-1'>
+                            <div className='flex items-center justify-between text-sm'>
+                              <span>{FACTOR_LABELS[key] ?? key.replace(/_/g, ' ')}</span>
+                              <span className='text-muted-foreground tabular-nums'>
+                                {factor.score.toFixed(1)} · {factor.contribution.toFixed(1)} pts
+                              </span>
+                            </div>
+                            <div className='bg-muted h-1.5 overflow-hidden rounded-full'>
+                              <div
+                                className={`h-full rounded-full ${factorStatusClass(factor.status)}`}
+                                style={{
+                                  width: `${Math.min(100, Math.max(0, factor.score))}%`
+                                }}
+                              />
+                            </div>
+                          </div>
+                        ))}
+                        {breakdown.penalties?.length ? (
+                          <ul className='text-muted-foreground space-y-1 pt-1 text-xs'>
+                            {breakdown.penalties.map((penalty) => (
+                              <li key={penalty.code}>
+                                −{penalty.points.toFixed(1)} pts · {penalty.reason}
+                              </li>
+                            ))}
+                          </ul>
+                        ) : null}
+                      </>
+                    ) : (
+                      <p className='text-muted-foreground text-sm'>
+                        No factor breakdown stored for this analysis.
+                      </p>
+                    )}
+                  </CardContent>
+                </Card>
+              </div>
+
+              <div className='grid gap-4 md:grid-cols-2 xl:grid-cols-3'>
+                <Card>
+                  <CardHeader>
+                    <CardTitle className='text-base'>Regime robustness</CardTitle>
+                    <CardDescription>
+                      {formatMaybeNumber(diagnostics.regime?.robustness_score, 1)} / 100 ·{' '}
+                      {diagnostics.regime?.regimes_covered ?? 0} regimes · dominant{' '}
+                      {diagnostics.regime?.dominant_regime ?? '—'}
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className='space-y-2 text-sm'>
+                    {Object.entries(diagnostics.regime?.regimes ?? {}).map(([label, bucket]) => (
+                      <div key={label} className='flex items-center justify-between gap-2'>
+                        <span className='text-muted-foreground capitalize'>
+                          {label.replace(/_/g, ' ')}
+                        </span>
+                        <span className='tabular-nums'>
+                          {bucket.folds} folds · {formatPercent(bucket.mean_return)}
+                        </span>
+                      </div>
+                    ))}
+                    {diagnostics.regime?.single_regime ? (
+                      <p className='text-xs text-amber-600 dark:text-amber-400'>
+                        All test folds share one regime; robustness is unproven.
+                      </p>
+                    ) : null}
+                  </CardContent>
+                </Card>
+
+                <Card>
+                  <CardHeader>
+                    <CardTitle className='text-base'>Cost stress & sensitivity</CardTitle>
+                    <CardDescription>
+                      {diagnostics.cost_stress?.multiplier ?? 2}× fees and slippage
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className='space-y-2 text-sm'>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Stressed net</span>
+                      <span className='tabular-nums'>
+                        {formatMaybePercent(diagnostics.cost_stress?.stress_return)} ·{' '}
+                        {diagnostics.cost_stress?.profitable ? 'profitable' : 'fails'}
+                      </span>
+                    </div>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Stressed max DD</span>
+                      <span className='tabular-nums'>
+                        {formatMaybePercent(diagnostics.cost_stress?.stress_max_drawdown)}
+                      </span>
+                    </div>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Parameter sensitivity</span>
+                      <span className='tabular-nums'>
+                        {formatMaybeNumber(diagnostics.sensitivity?.parameter_sensitivity, 2)}
+                      </span>
+                    </div>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Worst neighbour</span>
+                      <span className='tabular-nums'>
+                        {formatMaybePercent(diagnostics.sensitivity?.worst_neighbor_return)}
+                      </span>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card>
+                  <CardHeader>
+                    <CardTitle className='text-base'>Inventory & recovery</CardTitle>
+                    <CardDescription>Open positions are marked into equity and drawdown.</CardDescription>
+                  </CardHeader>
+                  <CardContent className='space-y-2 text-sm'>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Peak exposure</span>
+                      <span className='tabular-nums'>
+                        {formatMaybeNumber(diagnostics.exposure?.max_exposure_ratio, 2)}×
+                      </span>
+                    </div>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Avg exposure</span>
+                      <span className='tabular-nums'>
+                        {formatMaybeNumber(diagnostics.exposure?.avg_exposure_ratio, 2)}×
+                      </span>
+                    </div>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Max unrealized loss</span>
+                      <span className='tabular-nums'>
+                        {formatMaybePercent(diagnostics.exposure?.max_unrealized_loss_pct)}
+                      </span>
+                    </div>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Recovery time</span>
+                      <span className='tabular-nums'>
+                        {formatMaybeNumber(diagnostics.recovery_days, 0)} d
+                      </span>
+                    </div>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Longest drawdown</span>
+                      <span className='tabular-nums'>
+                        {formatMaybeNumber(diagnostics.max_drawdown_duration_days, 0)} d
+                      </span>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card>
+                  <CardHeader>
+                    <CardTitle className='text-base'>Execution quality</CardTitle>
+                    <CardDescription>Fees, slippage, and completed grid cycles.</CardDescription>
+                  </CardHeader>
+                  <CardContent className='space-y-2 text-sm'>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Slippage paid</span>
+                      <span className='tabular-nums'>
+                        {formatUsd(metricsNumber(metrics, 'slippage_paid'), 2)}
+                      </span>
+                    </div>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Buy / sell fills</span>
+                      <span className='tabular-nums'>
+                        {metricsNumber(metrics, 'buy_fills')} /{' '}
+                        {metricsNumber(metrics, 'sell_fills')}
+                      </span>
+                    </div>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Cycle completion</span>
+                      <span className='tabular-nums'>
+                        {formatMaybePercent(diagnostics.execution?.cycle_completion_ratio)}
+                      </span>
+                    </div>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Spread</span>
+                      <span className='tabular-nums'>
+                        {typeof features.spread_bps === 'number'
+                          ? `${features.spread_bps.toFixed(2)} bps`
+                          : '—'}
+                      </span>
+                    </div>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Depth cover</span>
+                      <span className='tabular-nums'>
+                        {formatMaybeNumber(
+                          typeof features.depth_cover_ratio === 'number'
+                            ? features.depth_cover_ratio
+                            : undefined,
+                          2
+                        )}
+                        ×
+                      </span>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card>
+                  <CardHeader>
+                    <CardTitle className='text-base'>Correlation</CardTitle>
+                    <CardDescription>Daily-return correlation with eligible peers.</CardDescription>
+                  </CardHeader>
+                  <CardContent className='space-y-2 text-sm'>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Average</span>
+                      <span className='tabular-nums'>
+                        {formatMaybeNumber(diagnostics.correlation?.avg_correlation, 2)}
+                      </span>
+                    </div>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Peak</span>
+                      <span className='tabular-nums'>
+                        {formatMaybeNumber(diagnostics.correlation?.max_correlation, 2)}
+                      </span>
+                    </div>
+                    {diagnostics.correlation?.peers?.length ? (
+                      <div className='text-muted-foreground flex flex-wrap gap-1 pt-1 text-xs'>
+                        {diagnostics.correlation.peers.map((peer) => (
+                          <span key={peer.symbol} className='bg-muted rounded px-1.5 py-0.5'>
+                            {peer.symbol} {peer.correlation.toFixed(2)}
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
+                  </CardContent>
+                </Card>
+
+                <Card>
+                  <CardHeader>
+                    <CardTitle className='text-base'>Return stability</CardTitle>
+                    <CardDescription>Concentration and fold-to-fold dispersion.</CardDescription>
+                  </CardHeader>
+                  <CardContent className='space-y-2 text-sm'>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Top trade share</span>
+                      <span className='tabular-nums'>
+                        {formatMaybePercent(diagnostics.return_stability?.top_trade_share)}
+                      </span>
+                    </div>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Top 5 trade share</span>
+                      <span className='tabular-nums'>
+                        {formatMaybePercent(diagnostics.return_stability?.top5_trade_share)}
+                      </span>
+                    </div>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Fold return std</span>
+                      <span className='tabular-nums'>
+                        {formatMaybePercent(diagnostics.return_stability?.fold_return_std)}
+                      </span>
+                    </div>
+                    <div className='flex items-center justify-between gap-2'>
+                      <span className='text-muted-foreground'>Worst fold DD</span>
+                      <span className='tabular-nums'>
+                        {formatMaybePercent(metricsNumber(metrics, 'worst_fold_drawdown'))}
+                      </span>
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+            </>
+          ) : null}
 
           <Card>
             <CardHeader>
@@ -293,7 +652,9 @@ export default function CoinDetailPage() {
                       <TableRow>
                         <TableHead>Fold</TableHead>
                         <TableHead>Test window</TableHead>
+                        <TableHead>Regime</TableHead>
                         <TableHead className='text-right'>Return</TableHead>
+                        <TableHead className='text-right'>2× cost</TableHead>
                         <TableHead className='text-right'>Max DD</TableHead>
                         <TableHead className='text-right'>Trades</TableHead>
                       </TableRow>
@@ -310,8 +671,18 @@ export default function CoinDetailPage() {
                               {formatDate(String(fold.test_start ?? ''))} —{' '}
                               {formatDate(String(fold.test_end ?? ''))}
                             </TableCell>
+                            <TableCell className='text-muted-foreground text-xs capitalize'>
+                              {String(
+                                (fold.regime as { label?: string } | undefined)?.label ?? '—'
+                              ).replace(/_/g, ' ')}
+                            </TableCell>
                             <TableCell className='text-right tabular-nums'>
                               {formatPercent(metricsNumber(testMetrics, 'net_return'))}
+                            </TableCell>
+                            <TableCell className='text-right tabular-nums'>
+                              {formatMaybePercent(
+                                (fold.stress as Record<string, unknown> | undefined)?.net_return
+                              )}
                             </TableCell>
                             <TableCell className='text-right tabular-nums'>
                               {formatPercent(metricsNumber(testMetrics, 'max_drawdown'))}

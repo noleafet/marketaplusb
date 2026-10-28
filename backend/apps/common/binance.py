@@ -260,6 +260,16 @@ class BinanceFuturesClient:
     def premium_index(self, symbol: str | None = None) -> Any:
         return self._request("GET", "/fapi/v1/premiumIndex", {"symbol": symbol} if symbol else None)
 
+    def depth(self, symbol: str, limit: int = 100) -> dict[str, Any]:
+        payload = self._request(
+            "GET",
+            "/fapi/v1/depth",
+            {"symbol": symbol, "limit": min(max(5, limit), 1000)},
+        )
+        if not isinstance(payload, dict):
+            raise BinanceError("Unexpected depth response")
+        return payload
+
     def open_interest_hist(
         self,
         symbol: str,
