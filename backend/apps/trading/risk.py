@@ -8,7 +8,7 @@ State machine evaluated on every 5-minute paper tick:
            * price falls RISK_TRAILING_STOP_PCT from the peak (fast drop)
            * MACD histogram shrinks N bars AND the 15m close loses VWAP
            * 1h open interest drops sharply while price is near the peak
-        -> flatten to USDT, pause the session, fire the webhook
+        -> flatten to USDT and pause the session
 
     While paused:
         * 1h OI turns back up (or OI data is unavailable past the failsafe)

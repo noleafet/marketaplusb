@@ -154,8 +154,6 @@ RISK = {
     "OI_FAILSAFE_MINUTES": env.int("RISK_OI_FAILSAFE_MINUTES", default=60),
     "ARM_TIMEOUT_HOURS": env.int("RISK_ARM_TIMEOUT_HOURS", default=24),
     "RECOVERY_COOLDOWN_MINUTES": env.int("RISK_RECOVERY_COOLDOWN_MINUTES", default=30),
-    "WEBHOOK_URL": env("RISK_WEBHOOK_URL", default=""),
-    "WEBHOOK_TIMEOUT": env.int("RISK_WEBHOOK_TIMEOUT", default=10),
 }
 
 # ---------------------------------------------------------- live trading

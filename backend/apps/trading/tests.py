@@ -338,9 +338,8 @@ class OverboughtStateMachineTests(TestCase):
 
 
 class OverboughtGuardExecutionTests(TestCase):
-    @patch("apps.trading.paper.send_webhook", return_value=True)
     @patch("apps.trading.paper.risk.fetch_snapshot")
-    def test_pause_flattens_inventory_and_freezes_orders(self, fetch, _webhook):
+    def test_pause_flattens_inventory_and_freezes_orders(self, fetch):
         now = datetime.now(dt_timezone.utc)
         session = make_session(
             make_coin(),
@@ -365,7 +364,6 @@ class OverboughtGuardExecutionTests(TestCase):
         self.assertEqual(session.status, PaperSession.Status.PAUSED)
         self.assertEqual(adapter.position_qty, 0.0)
         self.assertEqual(strategy.orders, {})
-        self.assertTrue(session.risk_state["webhook_ok"])
         self.assertEqual(len(adapter.fills), 1)
         self.assertEqual(adapter.fills[0].reason, "overbought_trailing_drawdown")
 

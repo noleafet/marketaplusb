@@ -318,7 +318,7 @@ minutes, paper evaluation every 6 hours.
 - **Overbought guard.** The paper tick evaluates 15m RSI/MACD/VWAP and 1h open interest for every
   active session. RSI above `RISK_RSI_OVERBOUGHT` arms a peak trail; a 6% drop from the peak, a
   shrinking MACD histogram with the 15m close below VWAP, or a 5% open-interest flush near the
-  peak flattens inventory, pauses the session, and fires `RISK_WEBHOOK_URL` (if set). A separate
+  peak flattens inventory (sells to USDT) and pauses the session. A separate
   `paper-risk` job (`RISK_INTERVAL_SECONDS`, default 300) resumes paused sessions once RSI is
   back above 35 and rising, the 15m close is above VWAP, and 1h open interest turns up. If OI
   data stays unavailable for `RISK_OI_FAILSAFE_MINUTES`, recovery falls back to RSI + VWAP only.

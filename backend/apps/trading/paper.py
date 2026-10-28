@@ -11,7 +11,6 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.common.binance import INTERVAL_MS, BinanceError, BinanceFuturesClient, floor_to_interval
-from apps.common.webhook import send_webhook
 from apps.engine.grid import GridParams, SimulationConfig
 from apps.engine.models import AnalysisRun, DecisionLog, log_decision
 from apps.engine.timescale import insert_equity_points
@@ -165,7 +164,6 @@ def _pause_for_overbought(
             )
         },
     }
-    session.risk_state["webhook_ok"] = send_webhook(payload)
     log_decision(
         "risk",
         f"{session.coin.symbol} paused by overbought guard ({decision.reason}); "
