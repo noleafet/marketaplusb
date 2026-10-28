@@ -1,7 +1,10 @@
+export type CatalogTone = 'good' | 'bad' | 'warn' | 'info' | 'violet' | 'neutral';
+
 export type CatalogRow = {
   name: string;
   detail: string;
   value?: string;
+  tone?: CatalogTone;
 };
 
 export type CatalogBlock =
@@ -21,12 +24,37 @@ export type CatalogBlock =
       rows: string[][];
     };
 
+export type CatalogStat = {
+  label: string;
+  value: string;
+  tone?: CatalogTone;
+};
+
 export type CatalogSection = {
-  id: string;
+  id: 'coin-analysis' | 'grid-strategy' | 'backtesting-validation';
   title: string;
   description: string;
+  accent: CatalogTone;
+  icon: 'activity' | 'grid' | 'chart';
+  stats: CatalogStat[];
   blocks: CatalogBlock[];
 };
+
+export const COIN_SETTINGS_PATH = '/admin/strategies/coin-settings';
+
+export const SECTION_PATHS: Record<CatalogSection['id'], string> = {
+  'coin-analysis': '/admin/strategies/coin-analysis',
+  'grid-strategy': '/admin/strategies/grid-strategy',
+  'backtesting-validation': '/admin/strategies/backtesting'
+};
+
+export function getSection(id: CatalogSection['id']): CatalogSection {
+  const section = STRATEGY_SECTIONS.find((candidate) => candidate.id === id);
+  if (!section) {
+    throw new Error(`Unknown strategy section: ${id}`);
+  }
+  return section;
+}
 
 export const STRATEGY_SECTIONS: CatalogSection[] = [
   {
@@ -34,6 +62,14 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
     title: 'Coin Analysis',
     description:
       'How raw Binance USDⓈ-M futures data becomes an eligibility decision and a ranked score. Hard gates run before any ranking; the eight factors only order coins that survived them.',
+    accent: 'violet',
+    icon: 'activity',
+    stats: [
+      { label: 'Hard gates', value: '13', tone: 'info' },
+      { label: 'Ranking factors', value: '8', tone: 'violet' },
+      { label: 'Review flags', value: '11', tone: 'warn' },
+      { label: 'Score penalties', value: '12', tone: 'bad' }
+    ],
     blocks: [
       {
         kind: 'list',
@@ -178,16 +214,19 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           },
           {
             name: 'Robustness score',
+            tone: 'good',
             detail:
               '45 × profitable-regime share + 35 × coverage + 20 × (1 − dominant share) − 15 dependence penalty, clamped 0–100.'
           },
           {
             name: 'Dependence penalty',
+            tone: 'bad',
             detail:
               'Applied when one regime supplies 90% or more of all positive fold return. Also penalises the score by 4 points and raises a review flag.'
           },
           {
             name: 'Coverage',
+            tone: 'good',
             detail:
               'Share of the three target regimes seen in the test folds: trending, high volatility, ranging. A single-regime result is flagged and penalised.'
           }
@@ -213,6 +252,7 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           {
             name: 'Consistency',
             value: '≥ 50%',
+            tone: 'good',
             detail:
               'Share of test folds with positive return. Fewer than half is a gate failure and an 8-point penalty.'
           },
@@ -237,6 +277,7 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           {
             name: 'Stress gate',
             value: '> 0%',
+            tone: 'good',
             detail:
               'Compounded stressed return must stay positive when ENGINE_ENFORCE_COST_STRESS is enabled. A failure raises a critical flag.'
           },
@@ -249,6 +290,7 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           {
             name: 'Sensitivity score',
             value: 'flag > 0.5',
+            tone: 'warn',
             detail:
               'Mean degradation of neighbour returns versus the selected parameters, capped at 2.0. Above 0.5 costs up to 8 score points.'
           },
@@ -267,6 +309,7 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           {
             name: 'Top trade share',
             value: 'flag > 60%',
+            tone: 'warn',
             detail:
               'Share of gross profit produced by the single best trade (ENGINE_MAX_TOP_TRADE_SHARE).'
           },
@@ -282,6 +325,7 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           {
             name: 'Recovery days',
             value: 'flag > 30d',
+            tone: 'warn',
             detail:
               'Days from the worst drawdown trough back to the prior equity peak.'
           },
@@ -316,12 +360,14 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           {
             name: 'Correlation ceiling',
             value: '0.85',
+            tone: 'warn',
             detail:
               'Peak pairwise correlation above ENGINE_MAX_CORRELATION raises a flag and removes 2–14 score points.'
           },
           {
             name: 'Paper selection',
             value: 'greedy',
+            tone: 'info',
             detail:
               'Top paper candidates are selected in rank order and skipped when their peak correlation with an already selected coin exceeds the same limit.'
           }
@@ -377,6 +423,14 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
     title: 'Grid Strategy',
     description:
       'The live and simulated grid engine: how the ladder is built, how it adapts to volatility and funding, and which caps override every other rule.',
+    accent: 'good',
+    icon: 'grid',
+    stats: [
+      { label: 'Default levels', value: '20', tone: 'good' },
+      { label: 'Range modes', value: '3', tone: 'info' },
+      { label: 'Rebalance modes', value: '2', tone: 'violet' },
+      { label: 'Stress scenario', value: '2×', tone: 'warn' }
+    ],
     blocks: [
       {
         kind: 'list',
@@ -442,12 +496,14 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           {
             name: 'Structural stop',
             value: '1.5 / 2.5 ATR',
+            tone: 'warn',
             detail:
               'Close all inventory when price falls the selected ATR distance or invalidates the structural floor below the ladder. A stop-out is a hard risk failure in scoring.'
           },
           {
             name: 'Trailing up',
             value: '1.0 ATR',
+            tone: 'good',
             detail:
               'When price closes above the active range high by one ATR, the ladder shifts up and re-arms rungs so the grid keeps making markets.'
           },
@@ -460,18 +516,21 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           {
             name: 'Range-position gate',
             value: 'top 10%',
+            tone: 'info',
             detail:
               'New buys pause when price is in the top 10% of its 30-day range, avoiding the worst entries just below resistance.'
           },
           {
             name: 'Funding gate',
             value: 'z ≥ 2.0',
+            tone: 'info',
             detail:
               'Buys are blocked when the 90-settlement funding z-score reaches 2.0; inventory can be scaled down by 50% instead of adding.'
           },
           {
             name: 'Overbought guard',
             value: 'RSI 75 / 35',
+            tone: 'warn',
             detail:
               'RSI ≥ 75 with fading MACD or a 5% open-interest drop arms a pause. RSI ≤ 35 clears it. Uses a 6% trailing stop, 24-hour arm timeout, and 30-minute recovery cooldown.'
           },
@@ -519,23 +578,27 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           {
             name: 'Max utilization',
             value: '90%',
+            tone: 'warn',
             detail: 'Share of available margin the ladder may use.'
           },
           {
             name: 'Inventory cap',
             value: '1.0× equity',
+            tone: 'good',
             detail:
               'Peak base-asset exposure. The tighter of this cap and leverage × utilization applies to every order.'
           },
           {
             name: 'Per-position stop',
             value: '30%',
+            tone: 'warn',
             detail:
               'Capital stop in addition to the ATR structural stop (ENGINE_STOP_LOSS_PCT).'
           },
           {
             name: 'Portfolio drawdown stop',
             value: 'disabled',
+            tone: 'bad',
             detail:
               'Optional peak-to-trough stop for the whole session. Off by default so walk-forward results stay comparable.'
           },
@@ -546,6 +609,7 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           },
           {
             name: 'Kill switch',
+            tone: 'info',
             detail:
               'A global live-trading disable that overrides approvals and scheduled jobs.'
           }
@@ -604,6 +668,14 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
     title: 'Backtesting & Validation',
     description:
       'The research pipeline, the search space it explores, and the paper-to-live ladder a strategy must clear before real capital is considered.',
+    accent: 'warn',
+    icon: 'chart',
+    stats: [
+      { label: 'Walk-forward folds', value: '3', tone: 'info' },
+      { label: 'Ladder candidates', value: '96', tone: 'violet' },
+      { label: 'Paper minimum', value: '7d', tone: 'good' },
+      { label: 'Validation stages', value: '4', tone: 'warn' }
+    ],
     blocks: [
       {
         kind: 'table',
@@ -685,17 +757,20 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           {
             name: '3 · Paper trading',
             value: '≥ 7 days',
+            tone: 'info',
             detail:
               'Minimum 7 days, ≥ 1% net return, ≤ 12% max drawdown, ≥ 20 fills, no stopped session. Hard stop at 20% drawdown.'
           },
           {
             name: '4 · Approval',
+            tone: 'warn',
             detail:
               'A live approval record, explicit risk acknowledgement, and a released kill switch are all required. Live trading is disabled by default.'
           },
           {
             name: 'Live guardrails',
             value: '$250 / $50',
+            tone: 'good',
             detail:
               'Max notional $250, max daily loss $50, max leverage 2×, symbol allowlist, testnet by default, every order audited.'
           }
@@ -776,20 +851,36 @@ export const THRESHOLD_ROWS: Array<{
   key: string;
   label: string;
   format: 'usd' | 'percent' | 'number' | 'multiplier';
+  kind: 'gate' | 'review' | 'stress';
 }> = [
-  { key: 'min_adv_usd', label: 'Median 24h liquidity', format: 'usd' },
-  { key: 'min_oos_trades', label: 'Minimum OOS fills', format: 'number' },
-  { key: 'max_drawdown', label: 'Max OOS drawdown', format: 'percent' },
-  { key: 'min_data_days', label: 'Minimum history', format: 'number' },
-  { key: 'min_atr_pct', label: 'ATR% floor', format: 'percent' },
-  { key: 'max_atr_pct', label: 'ATR% ceiling', format: 'percent' },
-  { key: 'pf_review', label: 'Profit-factor review', format: 'multiplier' },
-  { key: 'pf_validate', label: 'Profit-factor validation', format: 'multiplier' },
-  { key: 'cost_stress_multiplier', label: 'Cost-stress multiplier', format: 'multiplier' },
-  { key: 'max_spread_bps', label: 'Max bid-ask spread', format: 'number' },
-  { key: 'min_depth_cover', label: 'Min order-book depth cover', format: 'multiplier' },
-  { key: 'max_correlation', label: 'Max peer correlation', format: 'number' },
-  { key: 'max_top_trade_share', label: 'Max top-trade share', format: 'percent' }
+  { key: 'min_adv_usd', label: 'Median 24h liquidity', format: 'usd', kind: 'gate' },
+  { key: 'min_oos_trades', label: 'Minimum OOS fills', format: 'number', kind: 'gate' },
+  { key: 'max_drawdown', label: 'Max OOS drawdown', format: 'percent', kind: 'gate' },
+  { key: 'min_data_days', label: 'Minimum history', format: 'number', kind: 'gate' },
+  { key: 'min_atr_pct', label: 'ATR% floor', format: 'percent', kind: 'gate' },
+  { key: 'max_atr_pct', label: 'ATR% ceiling', format: 'percent', kind: 'gate' },
+  { key: 'pf_review', label: 'Profit-factor review', format: 'number', kind: 'review' },
+  { key: 'pf_validate', label: 'Profit-factor validation', format: 'number', kind: 'review' },
+  {
+    key: 'cost_stress_multiplier',
+    label: 'Cost-stress multiplier',
+    format: 'multiplier',
+    kind: 'stress'
+  },
+  { key: 'max_spread_bps', label: 'Max bid-ask spread', format: 'number', kind: 'gate' },
+  {
+    key: 'min_depth_cover',
+    label: 'Min order-book depth cover',
+    format: 'multiplier',
+    kind: 'gate'
+  },
+  { key: 'max_correlation', label: 'Max peer correlation', format: 'number', kind: 'review' },
+  {
+    key: 'max_top_trade_share',
+    label: 'Max top-trade share',
+    format: 'percent',
+    kind: 'review'
+  }
 ];
 
 export const PARAM_LABELS: Record<string, string> = {
