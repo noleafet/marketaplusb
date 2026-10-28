@@ -27,6 +27,8 @@ from typing import Any
 
 import numpy as np
 
+from apps.engine.hybrid_gate import Gate
+
 BARS_PER_DAY = {
     "1m": 1440,
     "5m": 288,
@@ -230,6 +232,8 @@ class _State:
     funding_trims: int = 0
     funding_z_max: float = 0.0
     buy_blocks: int = 0
+    hybrid_blocked_bars: int = 0
+    hybrid_exits: int = 0
     rebalances: int = 0
     adaptive_rebalances: int = 0
     trades: list[dict[str, Any]] = field(default_factory=list)
@@ -583,8 +587,15 @@ def simulate_grid(
     trade_start: datetime,
     params: GridParams,
     config: SimulationConfig,
+    *,
+    gate: Gate | None = None,
 ) -> SimulationResult:
-    """Run a single grid path from ``trade_start`` through the end of ``rows``."""
+    """Run a single grid path from ``trade_start`` through the end of ``rows``.
+
+    ``gate`` optionally applies the hybrid trend filter: new buys are disarmed
+    on blocked bars and inventory is flattened at the open of a bar that
+    follows a confirmed exit.
+    """
 
     if len(rows) < 10:
         return SimulationResult({}, [], [], [], False, False, error="insufficient candles")
@@ -924,9 +935,12 @@ def simulate_grid(
             return "regime_shift"
         return "scheduled" if bar_index - last_rebalance_i >= rebalance_bars else ""
 
-    # Initial inventory (disabled by default in the ranking engine).
+    # Initial inventory (disabled by default in the ranking engine). It also
+    # waits for the first bar the hybrid gate allows, so a gated backtest never
+    # starts long against a disarmed entry.
     first = start_idx
-    if params.initial_inventory_pct > 0:
+    first_allowed = gate is None or gate.allow.get(times[first], True)
+    if params.initial_inventory_pct > 0 and first_allowed:
         price = o[first] * (1.0 + slip)
         eq = config.capital
         budget = eq * config.leverage * params.max_utilization * params.initial_inventory_pct
@@ -955,6 +969,7 @@ def simulate_grid(
             )
 
     stop_equity = config.capital * (1.0 - params.stop_loss_pct)
+    hybrid_blocked = False
 
     for i in range(start_idx, len(rows)):
         if state.stopped:
@@ -1003,13 +1018,33 @@ def simulate_grid(
             and range_pos >= params.range_pos_high
             and (not trend_up or momentum < 0)
         )
+        gate_allow = gate.allow.get(timestamp) if gate is not None else None
         allow_buys = not (
             i < buy_blocked_until or crowded or below_support or upper_risk
-        )
+        ) and gate_allow is not False
+        if gate_allow is False:
+            state.hybrid_blocked_bars += 1
         if not allow_buys:
             for idx in [key for key, order in orders.items() if order["side"] == "buy"]:
                 orders.pop(idx, None)
             state.buy_blocks += 1
+
+        # Hybrid exit: a confirmed 15m close below the 1h EMA flattens at the
+        # bar open, and buys stay disarmed until the gate re-arms.
+        if gate is not None and gate.exit.get(timestamp):
+            close_all(bar_open, timestamp, "hybrid_exit")
+            state.hybrid_exits += 1
+            orders.clear()
+            rebuild_orders(timestamp, bar_open)
+
+        if gate_allow is not None:
+            if gate_allow:
+                if hybrid_blocked:
+                    # Re-arm the ladder on the first gate-allowed bar.
+                    hybrid_blocked = False
+                    rebuild_orders(timestamp, bar_open)
+            else:
+                hybrid_blocked = True
 
         reason = rebalance_trigger(i, atr_now, trend_up, prev_close)
         if (
@@ -1371,6 +1406,8 @@ def simulate_grid(
         "funding_trims": state.funding_trims,
         "funding_z_max": round(state.funding_z_max, 4),
         "buy_blocks": state.buy_blocks,
+        "hybrid_blocked_bars": state.hybrid_blocked_bars,
+        "hybrid_exits": state.hybrid_exits,
     }
 
     curve = _sampled_curve(

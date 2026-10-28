@@ -19,6 +19,7 @@ from apps.engine.grid import (
     range_width_cap,
 )
 from apps.trading.execution import ExecutionAdapter
+from apps.trading.hybrid import TrendSignal
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -102,6 +103,13 @@ class IncrementalGridStrategy:
         self.last_rebalance_reason = str(state.get("last_rebalance_reason") or "")
         self.rebalances = int(state.get("rebalances") or 0)
         self.adaptive_rebalances = int(state.get("adaptive_rebalances") or 0)
+        # Hybrid trend filter state. Only consulted while the engine is in
+        # hybrid mode; normal mode clears it on every tick.
+        self.hybrid_halted = bool(state.get("hybrid_halted"))
+        self.trend_blocked = bool(state.get("trend_blocked"))
+        self.trend_reason = str(state.get("trend_reason") or "")
+        self.ema_100 = float(state.get("ema_100") or 0.0)
+        self.adx_14 = float(state["adx_14"]) if state.get("adx_14") is not None else None
 
     @property
     def initialized(self) -> bool:
@@ -154,6 +162,11 @@ class IncrementalGridStrategy:
             "last_rebalance_reason": self.last_rebalance_reason,
             "rebalances": self.rebalances,
             "adaptive_rebalances": self.adaptive_rebalances,
+            "hybrid_halted": self.hybrid_halted,
+            "trend_blocked": self.trend_blocked,
+            "trend_reason": self.trend_reason,
+            "ema_100": self.ema_100,
+            "adx_14": self.adx_14,
         }
 
     # ------------------------------------------------------- adaptive inputs
@@ -214,11 +227,46 @@ class IncrementalGridStrategy:
             and (not self.trend_up or self.momentum < 0)
         )
         cooldown = self.buy_blocked_until is not None and now < self.buy_blocked_until
-        self.allow_buys = not (cooldown or self.crowded or below_support or upper_risk)
+        self.allow_buys = not (
+            cooldown or self.crowded or below_support or upper_risk or self.trend_blocked
+        )
 
     def _reset_trailing(self) -> None:
         self.tp_active = False
         self.peak_price = 0.0
+
+    def apply_trend_signal(
+        self, signal: TrendSignal, price: float, now: datetime
+    ) -> str:
+        """Apply the hybrid gate from closed candles.
+
+        Returns ``halted`` when a confirmed 15m close below the 1h EMA(100)
+        forced a flatten, ``resumed`` when the halt cleared, or ``""``.
+        """
+
+        was_halted = self.hybrid_halted
+        was_blocked = self.trend_blocked
+        self.hybrid_halted = signal.halted
+        self.trend_blocked = not signal.allow_buys
+        self.trend_reason = signal.reason
+        self.ema_100 = signal.ema_100
+        self.adx_14 = signal.adx
+        event = ""
+        if signal.halted and not was_halted:
+            if self.initialized and price > 0:
+                self.flatten(price, now, "hybrid_trend_exit")
+            event = "halted"
+        elif was_halted and not signal.halted and signal.allow_buys:
+            event = "resumed"
+        if self.initialized and (event or was_blocked != self.trend_blocked):
+            self._refresh_gates(price, now)
+            self._rebuild_orders(price)
+        return event
+
+    def clear_trend_filter(self) -> None:
+        self.hybrid_halted = False
+        self.trend_blocked = False
+        self.trend_reason = ""
 
     # ------------------------------------------------------------ lifecycle
     def initialize(

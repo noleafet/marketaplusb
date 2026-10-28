@@ -14,7 +14,9 @@ import type {
   PaperEvaluation,
   PaperFill,
   PaperSession,
-  Report
+  Report,
+  TradingMode,
+  TradingModeResponse
 } from './types';
 
 const BASE = '/api/engine';
@@ -137,6 +139,9 @@ export const engineApi = {
     post<JobRun>('paper/sessions/tick/', sessionIds ? { session_ids: sessionIds } : {}),
 
   live: () => request<LiveOverview>('live/status/'),
+  tradingMode: () => request<TradingModeResponse>('live/status/mode/'),
+  setTradingMode: (body: { mode: TradingMode; adx_enabled?: boolean; confirm?: boolean }) =>
+    post<TradingModeResponse>('live/status/mode/', body),
   requestApproval: (body: { paper_session: string; notes?: string; risk_acknowledged: boolean }) =>
     post<LiveApproval>('live/approvals/request_approval/', body),
   approveLive: (id: number, body: { reviewed_by?: string; notes?: string }) =>

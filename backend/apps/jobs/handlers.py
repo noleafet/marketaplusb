@@ -9,7 +9,7 @@ from django.utils import timezone
 
 from apps.coins.services.ingest import refresh_top_coins
 from apps.engine.analysis import run_daily_analysis
-from apps.engine.models import log_decision
+from apps.engine.models import AnalysisRun, log_decision
 from apps.trading.paper import evaluate_session, run_risk_guard, tick_paper_sessions
 
 logger = logging.getLogger("jobs")
@@ -26,19 +26,42 @@ def handle_coins_refresh(params: dict[str, Any], job_run) -> dict[str, Any]:
 
 
 def handle_daily_analysis(params: dict[str, Any], job_run) -> dict[str, Any]:
+    trigger = "scheduled" if job_run.trigger == "scheduled" else "manual"
     analysis = run_daily_analysis(
-        trigger="scheduled" if job_run.trigger == "scheduled" else "manual",
+        trigger=trigger,
         params=params,
         job_run_id=job_run.id,
     )
     if analysis.status != analysis.Status.SUCCEEDED:
         raise RuntimeError(analysis.error or "analysis run failed")
-    return {
+    result: dict[str, Any] = {
         "analysis_id": str(analysis.id),
         "status": analysis.status,
         "summary": analysis.summary,
         "duration_seconds": analysis.duration_seconds,
     }
+
+    # The hybrid run replays the same universe with the closed 1h/15m trend
+    # gate. It depends on the normal run only for the freshly synced candles.
+    try:
+        hybrid = run_daily_analysis(
+            trigger=trigger,
+            params=params,
+            job_run_id=job_run.id,
+            trend_mode=AnalysisRun.Mode.HYBRID,
+        )
+    except Exception as exc:  # noqa: BLE001 - normal results are already persisted
+        logger.exception("Hybrid analysis run failed")
+        raise RuntimeError(f"hybrid analysis run failed: {exc}") from exc
+    result["hybrid"] = {
+        "analysis_id": str(hybrid.id),
+        "status": hybrid.status,
+        "summary": hybrid.summary,
+        "duration_seconds": hybrid.duration_seconds,
+    }
+    if hybrid.status != hybrid.Status.SUCCEEDED:
+        raise RuntimeError(hybrid.error or "hybrid analysis run failed")
+    return result
 
 
 def handle_paper_tick(params: dict[str, Any], job_run) -> dict[str, Any]:

@@ -4,6 +4,7 @@ from unittest.mock import patch
 import numpy as np
 from django.conf import settings
 from django.test import TestCase, override_settings
+from rest_framework.test import APIClient
 
 from apps.coins.models import Coin
 from apps.engine.grid import GridParams, SimulationConfig
@@ -15,10 +16,14 @@ from apps.trading.execution import (
     assert_live_allowed,
     set_kill_switch,
 )
+from apps.trading.hybrid import TrendSignal, dmi, ema_series
+from apps.trading.hybrid import evaluate as evaluate_trend
 from apps.trading.models import (
+    LiveApproval,
     LiveOrderAudit,
     LiveTradingState,
     PaperEvaluation,
+    PaperFill,
     PaperSession,
 )
 from apps.trading.paper import (

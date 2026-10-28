@@ -36,15 +36,22 @@ class AnalysisRunViewSet(viewsets.ReadOnlyModelViewSet):
         queryset = AnalysisRun.objects.all()
         state = self.request.query_params.get("status")
         trigger = self.request.query_params.get("trigger")
+        mode = self.request.query_params.get("mode")
         if state:
             queryset = queryset.filter(status=state)
         if trigger:
             queryset = queryset.filter(trigger=trigger)
+        if mode:
+            queryset = queryset.filter(mode=mode)
         return queryset
 
     @action(detail=False, methods=["get"])
     def latest(self, request):
-        run = AnalysisRun.objects.order_by("-started_at").first()
+        run = AnalysisRun.objects.order_by("-started_at")
+        mode = request.query_params.get("mode")
+        if mode:
+            run = run.filter(mode=mode)
+        run = run.first()
         if run is None:
             return Response({"detail": "No analysis runs yet."}, status=status.HTTP_404_NOT_FOUND)
         return Response(AnalysisRunSerializer(run).data)
@@ -84,7 +91,8 @@ class CoinAnalysisViewSet(viewsets.ReadOnlyModelViewSet):
         queryset = CoinAnalysis.objects.select_related("coin", "analysis")
         analysis_id = self.request.query_params.get("analysis")
         if analysis_id in (None, "", "latest"):
-            run = latest_analysis() or AnalysisRun.objects.order_by("-started_at").first()
+            mode = self.request.query_params.get("mode") or AnalysisRun.Mode.NORMAL
+            run = latest_analysis(mode=mode) or AnalysisRun.objects.order_by("-started_at").first()
             if run is None:
                 return queryset.none()
             queryset = queryset.filter(analysis=run)
@@ -171,6 +179,7 @@ class DecisionLogViewSet(viewsets.ReadOnlyModelViewSet):
 class DashboardSummaryView(viewsets.ViewSet):
     def list(self, request):
         run = latest_analysis()
+        hybrid_run = latest_analysis(mode=AnalysisRun.Mode.HYBRID)
         results = (
             run.coin_results.select_related("coin").order_by("rank", "-score")[:10]
             if run
@@ -201,6 +210,11 @@ class DashboardSummaryView(viewsets.ViewSet):
                 "generated_at": timezone.now(),
                 "engine": {
                     "latest_analysis": AnalysisRunSerializer(run).data if run else None,
+                    "latest_hybrid_analysis": (
+                        AnalysisRunSerializer(hybrid_run).data
+                        if hybrid_run is not None and hybrid_run != run
+                        else None
+                    ),
                     "results": CoinAnalysisCompactSerializer(results, many=True).data,
                     "suitability_counts": suitability,
                 },

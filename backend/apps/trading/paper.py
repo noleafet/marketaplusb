@@ -16,7 +16,14 @@ from apps.engine.models import AnalysisRun, DecisionLog, log_decision
 from apps.engine.timescale import insert_equity_points
 from apps.trading import risk
 from apps.trading.execution import PaperExecutionAdapter
-from apps.trading.models import PaperEvaluation, PaperFill, PaperSession
+from apps.trading.hybrid import TrendSignal
+from apps.trading.hybrid import evaluate as evaluate_trend
+from apps.trading.models import (
+    LiveTradingState,
+    PaperEvaluation,
+    PaperFill,
+    PaperSession,
+)
 from apps.trading.strategy import IncrementalGridStrategy
 
 logger = logging.getLogger("engine")
@@ -137,6 +144,57 @@ def _fetch_price(client: BinanceFuturesClient, symbol: str) -> float:
         return float(payload["price"])
     except (KeyError, TypeError, ValueError) as exc:
         raise BinanceError(f"Invalid price response for {symbol}") from exc
+
+
+def _fetch_hybrid_frames(
+    client: BinanceFuturesClient, symbol: str, now: datetime
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Closed 1h candles for EMA/ADX and closed 15m candles for confirmation."""
+
+    end_1h = floor_to_interval(now, "1h") - timedelta(milliseconds=1)
+    klines_1h = client.klines_range(
+        symbol, "1h", end_1h - timedelta(hours=240), end_1h, max_requests=2
+    )
+    end_15m = floor_to_interval(now, "15m") - timedelta(milliseconds=1)
+    klines_15m = client.klines_range(
+        symbol, "15m", end_15m - timedelta(hours=12), end_15m, max_requests=1
+    )
+    return klines_1h, klines_15m
+
+
+def _hybrid_confidence(
+    client: BinanceFuturesClient,
+    symbol: str,
+    now: datetime,
+    strategy: IncrementalGridStrategy,
+    state: LiveTradingState,
+) -> TrendSignal | None:
+    try:
+        klines_1h, klines_15m = _fetch_hybrid_frames(client, symbol, now)
+    except BinanceError as exc:
+        logger.warning("Hybrid trend sync failed for %s: %s", symbol, exc)
+        return None
+    return evaluate_trend(
+        klines_1h,
+        klines_15m,
+        adx_enabled=bool((state.limits or {}).get("hybrid_adx")),
+        halted=strategy.hybrid_halted,
+    )
+
+
+def _hybrid_payload(session: PaperSession, signal: TrendSignal) -> dict[str, Any]:
+    return {
+        "session_id": str(session.id),
+        "mode": LiveTradingState.Mode.HYBRID,
+        "reason": signal.reason,
+        "ema_100": round(signal.ema_100, 8),
+        "price_1h": round(signal.price_1h, 8),
+        "adx_14": round(signal.adx, 4) if signal.adx is not None else None,
+        "plus_di": round(signal.plus_di, 4) if signal.plus_di is not None else None,
+        "minus_di": round(signal.minus_di, 4) if signal.minus_di is not None else None,
+        "above_streak": signal.above_streak,
+        "below_streak": signal.below_streak,
+    }
 
 
 def _grid_log_payload(
@@ -260,6 +318,9 @@ def _tick_session(
     if not symbol:
         return {"ok": False, "error": "no Binance symbol"}
 
+    trading_state = LiveTradingState.load()
+    hybrid = trading_state.mode == LiveTradingState.Mode.HYBRID
+
     # A bearish tag keeps the session live for marking/funding but locks the
     # grid: no new orders are armed and no fills are simulated.
     locked = session.bias == PaperSession.Bias.BEARISH
@@ -283,10 +344,21 @@ def _tick_session(
     if not locked:
         strategy.set_funding_context(_funding_context(client, symbol, now, params))
 
+    # Hybrid mode only trades confirmed 1h uptrends. The gate is recomputed
+    # from fully closed candles on every tick; normal mode clears any leftover
+    # hybrid state from a previous switch.
+    trend_signal: TrendSignal | None = None
+    if hybrid and not locked:
+        trend_signal = _hybrid_confidence(client, symbol, now, strategy, trading_state)
+    else:
+        strategy.clear_trend_filter()
+
     # First tick: build the grid around the live price and wait for future bars.
     if not strategy.initialized:
         price = _fetch_price(client, symbol)
         last_price = price
+        if trend_signal is not None:
+            strategy.apply_trend_signal(trend_signal, price, now)
         strategy.initialize(hist, price, now)
         if locked:
             strategy.orders.clear()
@@ -356,6 +428,29 @@ def _tick_session(
                 last_price = session.mark_price
         if last_price > 0:
             adapter.mark(last_price)
+
+        # The newest closed 1h/15m candles decide whether the ladder may arm.
+        # Bars above were replayed under the previous gate; a confirmed exit
+        # flattens now so no further inventory is added under a broken trend.
+        if not stopped and trend_signal is not None and last_price > 0:
+            event = strategy.apply_trend_signal(trend_signal, last_price, now)
+            if event == "halted":
+                log_decision(
+                    "risk",
+                    f"{session.coin.symbol} hybrid trend filter halted the grid: "
+                    f"2 closed 15m candles below the 1h EMA100. Position closed.",
+                    severity="warning",
+                    coin=session.coin,
+                    payload=_hybrid_payload(session, trend_signal),
+                )
+            elif event == "resumed":
+                log_decision(
+                    "paper",
+                    f"{session.coin.symbol} hybrid trend filter resumed: 2 closed 15m "
+                    "candles back above the 1h EMA100 and entry filters pass.",
+                    coin=session.coin,
+                    payload=_hybrid_payload(session, trend_signal),
+                )
 
         if stopped:
             session.status = PaperSession.Status.STOPPED
@@ -459,12 +554,14 @@ def _tick_session(
         "ok": True,
         "session_id": str(session.id),
         "symbol": session.coin.symbol,
+        "mode": trading_state.mode,
         "bars": bars_processed,
         "fills": len(fills),
         "equity": round(session.equity, 4),
         "status": session.status,
         "promotion_ready": session.promotion_ready,
         "risk": risk_result,
+        "trend": trend_signal.to_dict() if trend_signal is not None else None,
         "evaluation": evaluation,
     }
 

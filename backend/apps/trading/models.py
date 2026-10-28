@@ -129,7 +129,14 @@ class LiveApproval(models.Model):
 class LiveTradingState(models.Model):
     """Singleton safety state. Live trading requires all gates to agree."""
 
+    class Mode(models.TextChoices):
+        NORMAL = "normal", "Normal"
+        HYBRID = "hybrid", "Hybrid"
+
     id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
+    mode = models.CharField(
+        max_length=8, choices=Mode.choices, default=Mode.NORMAL, db_index=True
+    )
     kill_switch = models.BooleanField(default=True)
     kill_reason = models.CharField(max_length=255, default="Manual release required")
     active_approval = models.ForeignKey(

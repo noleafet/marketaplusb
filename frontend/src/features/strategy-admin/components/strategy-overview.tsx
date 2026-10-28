@@ -12,14 +12,10 @@ import type { CoinResult } from '@/features/grid/types';
 import { cn } from '@/lib/utils';
 import Link from 'next/link';
 import type { ReactNode } from 'react';
-import {
-  COIN_SETTINGS_PATH,
-  SECTION_PATHS,
-  STRATEGY_SECTIONS,
-  THRESHOLD_ROWS
-} from '../catalog';
+import { COIN_SETTINGS_PATH, SECTION_PATHS, STRATEGY_SECTIONS, THRESHOLD_ROWS } from '../catalog';
 import type { CatalogStat, CatalogTone } from '../catalog';
 import { signedPercent, scoreTone, toNumber } from '../format';
+import TradingModeCard from './trading-mode-card';
 import {
   DistributionBar,
   Meter,
@@ -76,6 +72,7 @@ export default function StrategyOverview() {
   const resultsQuery = useResults({ limit: 500 });
 
   const latest = dashboard.data?.engine.latest_analysis ?? null;
+  const hybridRun = dashboard.data?.engine.latest_hybrid_analysis ?? null;
   const summary = (latest?.summary ?? {}) as Record<string, unknown>;
   const results = resultsQuery.data?.results ?? [];
 
@@ -103,8 +100,7 @@ export default function StrategyOverview() {
     : regimeCountsFromResults(results);
   const maxRegimeCount = Math.max(1, ...regimeRows.map(([, count]) => count));
 
-  const deltaTone: CatalogTone =
-    delta === null ? 'neutral' : delta >= 0 ? 'good' : 'bad';
+  const deltaTone: CatalogTone = delta === null ? 'neutral' : delta >= 0 ? 'good' : 'bad';
 
   const cards: SummaryCard[] = [
     {
@@ -165,6 +161,37 @@ export default function StrategyOverview() {
       body: `${latest.trigger} trigger · ${formatDate(latest.started_at)} · ${latest.duration_seconds?.toFixed(1) ?? '—'}s`,
       icon: <Icons.activity className='size-4' />
     });
+
+    if (hybridRun) {
+      const hybridSummary = (hybridRun.summary ?? {}) as Record<string, unknown>;
+      const hybridGate = (hybridSummary.hybrid ?? {}) as Record<string, unknown>;
+      const blockedPct = toNumber(hybridGate.blocked_pct_avg);
+      const hybridExits = toNumber(hybridGate.confirmed_exits);
+      const hybridTone: CatalogTone =
+        hybridRun.status === 'succeeded' ? 'good' : hybridRun.status === 'failed' ? 'bad' : 'info';
+      notes.push({
+        tone: hybridTone,
+        title: `Hybrid backtest ${hybridRun.status}`,
+        body:
+          hybridRun.status === 'failed'
+            ? hybridRun.error || 'Hybrid analysis failed.'
+            : `${formatDate(hybridRun.started_at)} · ${
+                blockedPct !== null
+                  ? `${formatPercent(blockedPct, 0)} of bars below trend`
+                  : 'gate stats pending'
+              } · ${
+                hybridExits !== null ? `${hybridExits} confirmed exits` : 'no exits counted'
+              }${hybridGate.adx_enabled ? ' · ADX filter on' : ''}`,
+        icon: <Icons.activity className='size-4' />
+      });
+    } else {
+      notes.push({
+        tone: 'neutral',
+        title: 'No hybrid backtest yet',
+        body: 'The daily job replays the trend-gated backtest right after the normal analysis.',
+        icon: <Icons.clock className='size-4' />
+      });
+    }
   }
 
   notes.push(
@@ -205,7 +232,12 @@ export default function StrategyOverview() {
           tone: deltaTone,
           title: `Average score ${delta >= 0 ? 'above' : 'below'} baseline`,
           body: `${avgScore?.toFixed(1) ?? '—'} versus baseline ${avgBaseline?.toFixed(1) ?? '—'} (${signedPercent(delta / 100, 1)}).`,
-          icon: delta >= 0 ? <Icons.trendingUp className='size-4' /> : <Icons.trendingDown className='size-4' />
+          icon:
+            delta >= 0 ? (
+              <Icons.trendingUp className='size-4' />
+            ) : (
+              <Icons.trendingDown className='size-4' />
+            )
         }
   );
 
@@ -215,19 +247,21 @@ export default function StrategyOverview() {
         <Icons.lock />
         <AlertTitle>Internal strategy reference</AlertTitle>
         <AlertDescription>
-          Summary of every analysis, grid, backtest, and risk strategy the engine runs. Each
-          section lives on its own page via the sidebar; the header link is the only route back to
-          the dashboard.
+          Summary of every analysis, grid, backtest, and risk strategy the engine runs. Each section
+          lives on its own page via the sidebar; the header link is the only route back to the
+          dashboard.
         </AlertDescription>
       </Alert>
+
+      <TradingModeCard />
 
       {dashboard.isError ? (
         <Alert variant='destructive'>
           <Icons.warning />
           <AlertTitle>Live data is unavailable</AlertTitle>
           <AlertDescription>
-            Static strategy sections still work. Counts and run health will populate once the
-            engine API responds.
+            Static strategy sections still work. Counts and run health will populate once the engine
+            API responds.
           </AlertDescription>
         </Alert>
       ) : null}
@@ -248,7 +282,10 @@ export default function StrategyOverview() {
           value={
             <span className={toneText[eligible > 0 ? 'good' : 'warn']}>
               {eligible}
-              <span className='text-muted-foreground text-base font-normal'> / {universe || '—'}</span>
+              <span className='text-muted-foreground text-base font-normal'>
+                {' '}
+                / {universe || '—'}
+              </span>
             </span>
           }
           hint={`${results.length} coin results loaded · ${flagged} flagged`}
@@ -278,10 +315,10 @@ export default function StrategyOverview() {
         />
         <MetricCard
           title='Dominant regime'
-          value={
-            regimeRows[0] ? regimeRows[0][0].replace(/_/g, ' ') : '—'
+          value={regimeRows[0] ? regimeRows[0][0].replace(/_/g, ' ') : '—'}
+          hint={
+            regimeRows[0] ? `${regimeRows[0][1]} coins led by this regime` : 'No regime data yet'
           }
-          hint={regimeRows[0] ? `${regimeRows[0][1]} coins led by this regime` : 'No regime data yet'}
           icon={<Icons.grid />}
         />
       </div>

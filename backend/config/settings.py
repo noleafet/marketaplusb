@@ -147,6 +147,9 @@ ENGINE = {
     "STOP_LOSS_PCT": env.float("ENGINE_STOP_LOSS_PCT", default=0.30),
     "WARMUP_BUFFER_DAYS": env.int("ENGINE_WARMUP_BUFFER_DAYS", default=45),
     "CANDLE_SYNC_TIMEOUT": env.int("ENGINE_CANDLE_SYNC_TIMEOUT", default=30),
+    # Hybrid analysis replays closed 1h and 15m trend filters over this trailing
+    # window. Older bars sit outside the fetched klines and simulate ungated.
+    "HYBRID_LOOKBACK_DAYS": env.int("ENGINE_HYBRID_LOOKBACK_DAYS", default=180),
 }
 
 PAPER = {

@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 
 from apps.engine.grid import GridParams, SimulationConfig, simulate_grid
+from apps.engine.hybrid_gate import Gate
 from apps.engine.robustness import classify_regime, regime_summary
 
 MAX_FOLDS = 3
@@ -180,6 +181,8 @@ def _fold_metrics_subset(metrics: dict[str, Any]) -> dict[str, Any]:
         "funding_trims",
         "funding_z_max",
         "buy_blocks",
+        "hybrid_blocked_bars",
+        "hybrid_exits",
         "rebalances",
         "adaptive_rebalances",
     ]
@@ -238,6 +241,7 @@ def run_walk_forward(
     min_trades: int,
     cost_stress_multiplier: float = 2.0,
     sensitivity: bool = True,
+    gate: Gate | None = None,
 ) -> WalkForwardResult:
     if len(rows) < 200:
         return WalkForwardResult(
@@ -289,7 +293,9 @@ def run_walk_forward(
         best_train_metrics: dict[str, Any] = {}
         best_objective = -1e9
         for candidate in params_candidates:
-            result = simulate_grid(train_rows, funding_rows, train_start, candidate, config)
+            result = simulate_grid(
+                train_rows, funding_rows, train_start, candidate, config, gate=gate
+            )
             if result.error:
                 continue
             objective = _train_objective(result.metrics, min_trades)
@@ -301,7 +307,9 @@ def run_walk_forward(
             continue
 
         test_rows = _slice_until(rows, test_end)
-        test_result = simulate_grid(test_rows, funding_rows, test_start, best_params, config)
+        test_result = simulate_grid(
+            test_rows, funding_rows, test_start, best_params, config, gate=gate
+        )
         if test_result.error:
             continue
 
@@ -315,6 +323,7 @@ def run_walk_forward(
             test_start,
             best_params,
             _stressed_config(config, cost_stress_multiplier),
+            gate=gate,
         )
         stress = (
             {
@@ -330,7 +339,7 @@ def run_walk_forward(
         if sensitivity:
             for label, variant in _sensitivity_variants(best_params):
                 variant_result = simulate_grid(
-                    test_rows, funding_rows, test_start, variant, config
+                    test_rows, funding_rows, test_start, variant, config, gate=gate
                 )
                 if variant_result.error:
                     continue
@@ -581,6 +590,12 @@ def run_walk_forward(
             int(f["test_metrics"].get("funding_trims") or 0) for f in folds_out
         ),
         "buy_blocks": sum(int(f["test_metrics"].get("buy_blocks") or 0) for f in folds_out),
+        "hybrid_blocked_bars": sum(
+            int(f["test_metrics"].get("hybrid_blocked_bars") or 0) for f in folds_out
+        ),
+        "hybrid_exits": sum(
+            int(f["test_metrics"].get("hybrid_exits") or 0) for f in folds_out
+        ),
         "funding_z_max": round(
             max(float(f["test_metrics"].get("funding_z_max") or 0.0) for f in folds_out),
             4,

@@ -229,6 +229,15 @@ def live_status() -> dict[str, Any]:
     return {
         "env_enabled": enabled,
         "keys_present": keys_present,
+        "mode": state.mode,
+        "hybrid": {
+            "ema_period": 100,
+            "adx_period": 14,
+            "adx_entry": 25.0,
+            "adx_exit": 20.0,
+            "confirm_bars": 2,
+            "adx_enabled": bool((state.limits or {}).get("hybrid_adx")),
+        },
         "kill_switch": state.kill_switch,
         "kill_reason": state.kill_reason,
         "approval": (
@@ -264,6 +273,10 @@ def assert_live_allowed(symbol: str, notional: float, leverage: float) -> LiveTr
         reason = f"Kill switch engaged: {state.kill_reason}"
     elif not status["approval"] or status["approval"]["status"] != "approved":
         reason = "No approved live-trading approval record"
+    elif state.mode == LiveTradingState.Mode.HYBRID:
+        reason = (
+            "Hybrid mode: new live orders are disabled until open positions are filled"
+        )
     elif settings.LIVE["SYMBOL_ALLOWLIST"] and symbol not in settings.LIVE["SYMBOL_ALLOWLIST"]:
         reason = f"{symbol} is not in LIVE_SYMBOL_ALLOWLIST"
     elif notional > settings.LIVE["MAX_NOTIONAL_USD"]:

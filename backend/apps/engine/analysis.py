@@ -11,11 +11,12 @@ from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
-from apps.common.binance import BinanceFuturesClient
+from apps.common.binance import INTERVAL_MS, BinanceFuturesClient
 from apps.coins.models import Coin
 from apps.engine.binance_sync import sync_coin_market_data
 from apps.engine.features import compute_features
 from apps.engine.grid import GridParams, SimulationConfig
+from apps.engine.hybrid_gate import Gate, build_gate
 from apps.engine.models import AnalysisRun, CoinAnalysis, log_decision
 from apps.engine.reports import build_reports
 from apps.engine.robustness import daily_returns, select_diversified
@@ -24,6 +25,8 @@ from apps.engine.timescale import load_candles, load_funding
 from apps.engine.walkforward import run_walk_forward
 
 logger = logging.getLogger("engine")
+
+HYBRID_WARMUP_DAYS = 10
 
 
 def engine_config() -> SimulationConfig:
@@ -125,23 +128,76 @@ def _analysis_params(params: dict[str, Any] | None) -> dict[str, Any]:
     return result
 
 
+def _hybrid_adx_enabled() -> bool:
+    from apps.trading.models import LiveTradingState
+
+    return bool((LiveTradingState.load().limits or {}).get("hybrid_adx"))
+
+
+def _closed_klines(
+    client: BinanceFuturesClient,
+    symbol: str,
+    interval: str,
+    start: datetime,
+    end: datetime,
+) -> list[dict[str, Any]]:
+    """Fetch klines and drop the candle that is still forming at ``end``."""
+
+    rows = client.klines_range(symbol, interval, start, end)
+    step = timedelta(milliseconds=INTERVAL_MS[interval])
+    return [row for row in rows if row["time"] + step <= end]
+
+
+def _build_hybrid_gate(
+    client: BinanceFuturesClient,
+    symbol: str,
+    rows: list[dict[str, Any]],
+    *,
+    lookback_days: int,
+    adx_enabled: bool,
+) -> Gate | None:
+    """Hybrid 1h/15m trend gate covering the simulation window."""
+
+    if not symbol:
+        return None
+    end = timezone.now()
+    start = end - timedelta(days=lookback_days + HYBRID_WARMUP_DAYS)
+    klines_1h = _closed_klines(client, symbol, "1h", start, end)
+    klines_15m = _closed_klines(client, symbol, "15m", start, end)
+    gate = build_gate(rows, klines_1h, klines_15m, adx_enabled=adx_enabled)
+    return gate if gate.allow else None
+
+
 def run_daily_analysis(
     *,
     trigger: str = "scheduled",
     params: dict[str, Any] | None = None,
     job_run_id=None,
+    trend_mode: str = AnalysisRun.Mode.NORMAL,
 ) -> AnalysisRun:
+    if trend_mode not in AnalysisRun.Mode.values:
+        raise ValueError(f"Unknown analysis mode: {trend_mode}")
+    hybrid = trend_mode == AnalysisRun.Mode.HYBRID
     analysis_params = _analysis_params(params)
     cfg = settings.ENGINE
     config = engine_config()
     base_params = base_grid_params()
     interval = analysis_params["interval"]
-    lookback_days = analysis_params["lookback_days"]
+    hybrid_days = max(120, int(cfg["HYBRID_LOOKBACK_DAYS"]))
+    # Hybrid results only count bars inside the fetched 1h/15m coverage, so the
+    # simulation window is clamped to the hybrid lookback.
+    lookback_days = (
+        min(analysis_params["lookback_days"], hybrid_days)
+        if hybrid
+        else analysis_params["lookback_days"]
+    )
+    hybrid_adx = _hybrid_adx_enabled() if hybrid else False
     warmup_days = int(cfg["WARMUP_BUFFER_DAYS"])
 
     analysis = AnalysisRun.objects.create(
         status=AnalysisRun.Status.RUNNING,
         trigger=trigger,
+        mode=trend_mode,
         scope=(
             AnalysisRun.Scope.SOLO
             if analysis_params["symbols"]
@@ -149,6 +205,9 @@ def run_daily_analysis(
         ),
         params={
             **analysis_params,
+            "lookback_days": lookback_days,
+            "mode": trend_mode,
+            "hybrid_adx": hybrid_adx,
             "config": {
                 "capital": config.capital,
                 "leverage": config.leverage,
@@ -174,10 +233,10 @@ def run_daily_analysis(
     )
     log_decision(
         "analysis",
-        f"Analysis run {analysis.id} started ({trigger}).",
+        f"Analysis run {analysis.id} started ({trigger}, {trend_mode}).",
         analysis=analysis,
         job_run_id=job_run_id,
-        payload=analysis_params,
+        payload={**analysis_params, "mode": trend_mode},
     )
 
     client = BinanceFuturesClient()
@@ -216,21 +275,24 @@ def run_daily_analysis(
 
     for index, coin in enumerate(coin_list, start=1):
         sync_info: dict[str, Any] = {}
-        try:
-            sync_info = sync_coin_market_data(
-                coin,
-                client,
-                lookback_days=lookback_days,
-                interval=interval,
-                warmup_days=warmup_days,
-                force=bool(analysis_params["force"]),
-            )
-            if not sync_info.get("ok"):
-                data_errors.append({"symbol": coin.symbol, "error": sync_info.get("error")})
-        except Exception as exc:  # keep going on per-coin failures
-            logger.warning("Market data sync failed for %s: %s", coin.symbol, exc)
-            data_errors.append({"symbol": coin.symbol, "error": str(exc)})
-            sync_info = {"ok": False, "error": str(exc)}
+        # The hybrid run follows the normal run in the same job and reuses the
+        # 4h candles it just synced; only the 1h/15m gate inputs are fetched.
+        if not hybrid:
+            try:
+                sync_info = sync_coin_market_data(
+                    coin,
+                    client,
+                    lookback_days=lookback_days,
+                    interval=interval,
+                    warmup_days=warmup_days,
+                    force=bool(analysis_params["force"]),
+                )
+                if not sync_info.get("ok"):
+                    data_errors.append({"symbol": coin.symbol, "error": sync_info.get("error")})
+            except Exception as exc:  # keep going on per-coin failures
+                logger.warning("Market data sync failed for %s: %s", coin.symbol, exc)
+                data_errors.append({"symbol": coin.symbol, "error": str(exc)})
+                sync_info = {"ok": False, "error": str(exc)}
 
         rows = load_candles(coin.binance_symbol, interval, data_start_floor, timezone.now())
         funding = load_funding(coin.binance_symbol, data_start_floor, timezone.now())
@@ -259,12 +321,29 @@ def run_daily_analysis(
             "data_end": rows[-1]["time"] if rows else None,
         }
 
+        gate: Gate | None = None
+        if hybrid and len(rows) >= 200:
+            try:
+                gate = _build_hybrid_gate(
+                    client,
+                    coin.binance_symbol,
+                    rows,
+                    lookback_days=lookback_days,
+                    adx_enabled=hybrid_adx,
+                )
+            except Exception as exc:  # noqa: BLE001 - keep the rest of the universe
+                logger.warning("Hybrid kline fetch failed for %s: %s", coin.symbol, exc)
+                data_errors.append({"symbol": coin.symbol, "error": str(exc)})
+
         if len(rows) < 200:
             item["eligible"] = False
             item["exclusion_reason"] = (
                 f"insufficient candle history ({len(rows)} bars)"
                 + (f"; sync error: {sync_info.get('error')}" if sync_info.get("error") else "")
             )
+        elif hybrid and gate is None:
+            item["eligible"] = False
+            item["exclusion_reason"] = "hybrid trend data unavailable"
         else:
             try:
                 wf = run_walk_forward(
@@ -276,6 +355,7 @@ def run_daily_analysis(
                     min_trades=int(cfg["MIN_OOS_TRADES"]),
                     cost_stress_multiplier=float(cfg["COST_STRESS_MULTIPLIER"]),
                     sensitivity=bool(cfg["WALKFORWARD_SENSITIVITY"]),
+                    gate=gate,
                 )
             except Exception as exc:  # noqa: BLE001 - protect the rest of the universe
                 logger.exception("Backtest failed for %s", coin.symbol)
@@ -319,6 +399,11 @@ def run_daily_analysis(
                         )
                         if book:
                             item["features"] = {**features, **book}
+                    if gate is not None:
+                        item["features"] = {
+                            **item["features"],
+                            "hybrid_gate": gate.stats(),
+                        }
         results.append(item)
 
         if index % 10 == 0 or index == len(coin_list):
@@ -410,6 +495,28 @@ def run_daily_analysis(
     )
     analysis.save(update_fields=["data_cutoff", "summary"])
 
+    analysis.summary["mode"] = trend_mode
+    if hybrid:
+        gate_rows = [
+            item["features"]["hybrid_gate"]
+            for item in ranked
+            if (item.get("features") or {}).get("hybrid_gate")
+        ]
+        analysis.summary["hybrid"] = {
+            "adx_enabled": hybrid_adx,
+            "lookback_days": lookback_days,
+            "warmup_days": HYBRID_WARMUP_DAYS,
+            "covered_symbols": len(gate_rows),
+            "blocked_pct_avg": round(
+                sum(float(row.get("blocked_pct") or 0.0) for row in gate_rows)
+                / max(1, len(gate_rows)),
+                4,
+            ),
+            "confirmed_exits": sum(
+                int(row.get("confirmed_exits") or 0) for row in gate_rows
+            ),
+        }
+
     config_payload = {
         "min_adv_usd": cfg["MIN_ADV_USD"],
         "min_oos_trades": cfg["MIN_OOS_TRADES"],
@@ -425,8 +532,9 @@ def run_daily_analysis(
         "max_correlation": cfg["MAX_CORRELATION"],
         "max_top_trade_share": cfg["MAX_TOP_TRADE_SHARE"],
     }
-    # Solo runs must not displace the universe ranking/performance reports.
-    if analysis.scope == AnalysisRun.Scope.UNIVERSE:
+    # Solo runs must not displace the universe ranking/performance reports, and
+    # hybrid runs are diagnostics rather than the published report set.
+    if analysis.scope == AnalysisRun.Scope.UNIVERSE and not hybrid:
         try:
             reports = build_reports(analysis, ranked, config_payload)
             analysis.summary["report_ids"] = [str(report.id) for report in reports]
@@ -434,40 +542,41 @@ def run_daily_analysis(
             logger.exception("Report generation failed")
             analysis.summary["report_error"] = str(exc)
 
-    try:
-        from apps.trading.paper import ensure_paper_sessions
+    if not hybrid:
+        try:
+            from apps.trading.paper import ensure_paper_sessions
 
-        candidates = [
-            item
-            for item in ranked
-            if item.get("eligible")
-            and item.get("suitability") in {"prime", "viable"}
-        ]
-        selected, skipped = select_diversified(
-            candidates,
-            max_corr=float(cfg["MAX_CORRELATION"]),
-            limit=int(cfg["TOP_N_PAPER"]),
-        )
-        sessions = ensure_paper_sessions(analysis, selected)
-        analysis.summary["paper_sessions_created"] = len(sessions)
-        analysis.summary["paper_symbols"] = [s.coin.symbol for s in sessions]
-        analysis.summary["paper_skipped_correlation"] = skipped
-        if skipped:
-            log_decision(
-                "paper",
-                "Correlation filter skipped duplicate paper candidates: "
-                + ", ".join(
-                    f"{row['symbol']} ({row['correlation']:.2f} with {row['correlated_with']})"
-                    for row in skipped
-                ),
-                severity="warning",
-                analysis=analysis,
-                job_run_id=job_run_id,
-                payload={"skipped": skipped},
+            candidates = [
+                item
+                for item in ranked
+                if item.get("eligible")
+                and item.get("suitability") in {"prime", "viable"}
+            ]
+            selected, skipped = select_diversified(
+                candidates,
+                max_corr=float(cfg["MAX_CORRELATION"]),
+                limit=int(cfg["TOP_N_PAPER"]),
             )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Paper session bootstrap failed")
-        analysis.summary["paper_session_error"] = str(exc)
+            sessions = ensure_paper_sessions(analysis, selected)
+            analysis.summary["paper_sessions_created"] = len(sessions)
+            analysis.summary["paper_symbols"] = [s.coin.symbol for s in sessions]
+            analysis.summary["paper_skipped_correlation"] = skipped
+            if skipped:
+                log_decision(
+                    "paper",
+                    "Correlation filter skipped duplicate paper candidates: "
+                    + ", ".join(
+                        f"{row['symbol']} ({row['correlation']:.2f} with {row['correlated_with']})"
+                        for row in skipped
+                    ),
+                    severity="warning",
+                    analysis=analysis,
+                    job_run_id=job_run_id,
+                    payload={"skipped": skipped},
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Paper session bootstrap failed")
+            analysis.summary["paper_session_error"] = str(exc)
 
     flagged = [item for item in ranked if item.get("flags")]
     if flagged:
@@ -505,9 +614,12 @@ def run_daily_analysis(
     return analysis
 
 
-def latest_analysis() -> AnalysisRun | None:
-    """Latest succeeded universe run, falling back to any run before the first scan."""
+def latest_analysis(mode: str = AnalysisRun.Mode.NORMAL) -> AnalysisRun | None:
+    """Latest succeeded universe run of ``mode``, falling back to any run."""
+
     succeeded = AnalysisRun.objects.filter(status=AnalysisRun.Status.SUCCEEDED)
+    if mode:
+        succeeded = succeeded.filter(mode=mode)
     return (
         succeeded.filter(scope=AnalysisRun.Scope.UNIVERSE).order_by("-started_at").first()
         or succeeded.order_by("-started_at").first()

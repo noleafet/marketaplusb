@@ -21,6 +21,7 @@ export interface AnalysisRun {
   id: string;
   status: 'running' | 'succeeded' | 'failed';
   trigger: string;
+  mode: 'normal' | 'hybrid';
   scope: 'universe' | 'solo';
   params: Record<string, unknown>;
   summary: Record<string, unknown>;
@@ -212,6 +213,7 @@ export interface DashboardSummary {
   generated_at: string;
   engine: {
     latest_analysis: AnalysisRun | null;
+    latest_hybrid_analysis: AnalysisRun | null;
     results: CoinResult[];
     suitability_counts: Record<string, number>;
   };
@@ -352,6 +354,19 @@ export interface PaperEquityPoint {
   drawdown: number | null;
 }
 
+export type TradingMode = 'normal' | 'hybrid';
+
+export interface TradingModeState {
+  mode: TradingMode;
+  adx_enabled: boolean;
+  updated_at: string;
+}
+
+export interface TradingModeResponse extends TradingModeState {
+  purge?: { sessions: number; positions: number };
+  live?: LiveStatus;
+}
+
 export interface LiveApproval {
   id: number;
   status: 'pending' | 'approved' | 'revoked' | 'rejected';
@@ -368,6 +383,15 @@ export interface LiveApproval {
 export interface LiveStatus {
   env_enabled: boolean;
   keys_present: boolean;
+  mode: TradingMode;
+  hybrid: {
+    ema_period: number;
+    adx_period: number;
+    adx_entry: number;
+    adx_exit: number;
+    confirm_bars: number;
+    adx_enabled: boolean;
+  };
   kill_switch: boolean;
   kill_reason: string;
   approval: {
@@ -387,6 +411,7 @@ export interface LiveStatus {
 }
 
 export interface LiveState {
+  mode: TradingMode;
   kill_switch: boolean;
   kill_reason: string;
   active_approval: LiveApproval | null;

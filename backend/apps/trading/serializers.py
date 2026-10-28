@@ -122,6 +122,7 @@ class LiveTradingStateSerializer(serializers.ModelSerializer):
     class Meta:
         model = LiveTradingState
         fields = [
+            "mode",
             "kill_switch",
             "kill_reason",
             "active_approval",
@@ -152,3 +153,9 @@ class ApprovalReviewSerializer(serializers.Serializer):
 class KillSwitchSerializer(serializers.Serializer):
     engaged = serializers.BooleanField()
     reason = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class TradingModeSerializer(serializers.Serializer):
+    mode = serializers.ChoiceField(choices=LiveTradingState.Mode.choices)
+    adx_enabled = serializers.BooleanField(required=False, allow_null=True, default=None)
+    confirm = serializers.BooleanField(default=False)

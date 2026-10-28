@@ -8,6 +8,11 @@ from apps.jobs.models import JobRun
 from apps.jobs.runner import enqueue_job
 from apps.jobs.serializers import JobRunSerializer
 from apps.trading.execution import live_status, set_kill_switch
+from apps.trading.modes import (
+    ModeConfirmationRequired,
+    mode_payload,
+    set_trading_mode,
+)
 from apps.trading.models import (
     LiveApproval,
     LiveOrderAudit,
@@ -34,6 +39,7 @@ from apps.trading.serializers import (
     PaperFillSerializer,
     PaperSessionListSerializer,
     PaperSessionSerializer,
+    TradingModeSerializer,
 )
 
 
@@ -278,6 +284,34 @@ class LiveStatusView(viewsets.ViewSet):
         )
         return Response(
             {"state": LiveTradingStateSerializer(state).data, "live": live_status()}
+        )
+
+    @action(detail=False, methods=["get", "post"], url_path="mode")
+    def mode(self, request):
+        if request.method == "GET":
+            state = LiveTradingState.load()
+            return Response({**mode_payload(state), "live": live_status()})
+        serializer = TradingModeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        try:
+            state, purge = set_trading_mode(
+                mode=data["mode"],
+                adx_enabled=data.get("adx_enabled"),
+                confirm=data.get("confirm", False),
+            )
+        except ModeConfirmationRequired as exc:
+            return Response(
+                {"detail": str(exc), "requires_confirmation": True},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(
+            {
+                **mode_payload(state),
+                "state": LiveTradingStateSerializer(state).data,
+                "purge": purge,
+                "live": live_status(),
+            }
         )
 
 
