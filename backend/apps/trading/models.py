@@ -13,18 +13,24 @@ class PaperSession(models.Model):
         PAUSED = "paused", "Paused"
         STOPPED = "stopped", "Stopped"
 
+    class Bias(models.TextChoices):
+        BULLISH = "bullish", "Bullish"
+        BEARISH = "bearish", "Bearish"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     coin = models.ForeignKey(Coin, on_delete=models.PROTECT, related_name="paper_sessions")
     analysis = models.ForeignKey(
         AnalysisRun, on_delete=models.SET_NULL, null=True, blank=True, related_name="paper_sessions"
     )
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE)
+    bias = models.CharField(max_length=8, choices=Bias.choices, default=Bias.BULLISH)
     promotion_ready = models.BooleanField(default=False)
     stop_reason = models.CharField(max_length=255, blank=True, default="")
 
     params = models.JSONField(default=dict, blank=True)
     config = models.JSONField(default=dict, blank=True)
     grid_state = models.JSONField(default=dict, blank=True)
+    risk_state = models.JSONField(default=dict, blank=True)
 
     capital = models.FloatField(default=1000.0)
     leverage = models.FloatField(default=2.0)

@@ -1,10 +1,15 @@
-from rest_framework import viewsets
+from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from apps.coins.models import Coin
-from apps.coins.serializers import CoinSerializer
+from apps.coins.serializers import CoinAddSerializer, CoinSerializer
+from apps.coins.services.ingest import ensure_manual_coin
 from apps.coins.services.timescale import market_snapshots
+from apps.engine.models import log_decision
+from apps.jobs.models import JobRun
+from apps.jobs.runner import enqueue_job
+from apps.jobs.serializers import JobRunSerializer
 
 
 class CoinViewSet(viewsets.ReadOnlyModelViewSet):
@@ -34,3 +39,36 @@ class CoinViewSet(viewsets.ReadOnlyModelViewSet):
         limit = min(int(request.query_params.get("limit", 24)), 120)
         rows = market_snapshots(coin.symbol, limit=limit)
         return Response({"symbol": coin.symbol, "snapshots": rows})
+
+    @action(detail=False, methods=["post"])
+    def add(self, request):
+        serializer = CoinAddSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            coin = ensure_manual_coin(
+                serializer.validated_data["symbol"],
+                serializer.validated_data.get("name") or "",
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        job = enqueue_job(
+            "daily_analysis",
+            trigger=JobRun.Trigger.MANUAL,
+            params={"symbols": [coin.symbol]},
+        )
+        log_decision(
+            "coins",
+            f"{coin.symbol} added manually; solo analysis queued.",
+            coin=coin,
+            job_run_id=job.id,
+            payload={
+                "symbol": coin.symbol,
+                "binance_symbol": coin.binance_symbol,
+                "job_id": str(job.id),
+            },
+        )
+        return Response(
+            {"coin": CoinSerializer(coin).data, "job": JobRunSerializer(job).data},
+            status=status.HTTP_202_ACCEPTED,
+        )

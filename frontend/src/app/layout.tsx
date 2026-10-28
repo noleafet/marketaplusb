@@ -20,8 +20,8 @@ export const metadata: Metadata = {
     ? { metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL) }
     : {}),
   title: {
-    default: 'Grid Suitability Engine',
-    template: '%s | Grid Engine'
+    default: 'Marketa+b',
+    template: '%s | Grid Suitability Engine'
   },
   description:
     'Grid trading coin selection, walk-forward backtesting, paper trading, and risk monitoring for Binance USDⓈ-M futures.'

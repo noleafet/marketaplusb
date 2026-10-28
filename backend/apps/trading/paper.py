@@ -11,9 +11,11 @@ from django.db import transaction
 from django.utils import timezone
 
 from apps.common.binance import INTERVAL_MS, BinanceError, BinanceFuturesClient, floor_to_interval
+from apps.common.webhook import send_webhook
 from apps.engine.grid import GridParams, SimulationConfig
-from apps.engine.models import AnalysisRun, log_decision
+from apps.engine.models import AnalysisRun, DecisionLog, log_decision
 from apps.engine.timescale import insert_equity_points
+from apps.trading import risk
 from apps.trading.execution import PaperExecutionAdapter
 from apps.trading.models import PaperEvaluation, PaperFill, PaperSession
 from apps.trading.strategy import IncrementalGridStrategy
@@ -125,6 +127,80 @@ def _apply_funding_events(
     return idx, paid
 
 
+def _pause_for_overbought(
+    session: PaperSession,
+    strategy: IncrementalGridStrategy,
+    adapter: PaperExecutionAdapter,
+    snapshot: risk.RiskSnapshot,
+    decision: risk.RiskDecision,
+    now: datetime,
+) -> None:
+    symbol = session.coin.binance_symbol
+    position_qty = adapter.position_qty
+    price = snapshot.price or session.mark_price
+    if price > 0:
+        strategy.flatten(price, now, f"overbought_{decision.reason}")
+        adapter.flush()
+    session.status = PaperSession.Status.PAUSED
+    metrics = (decision.state.get("last_metrics") or {}).copy()
+    payload = {
+        "event": "overbought_pause",
+        "symbol": symbol,
+        "coin": session.coin.symbol,
+        "session_id": str(session.id),
+        "reason": decision.reason,
+        "price": round(price, 10),
+        "position_qty": round(position_qty, 10),
+        "equity": round(session.equity, 4),
+        "paused_at": now.isoformat(),
+        **{
+            key: metrics.get(key)
+            for key in (
+                "rsi_15m",
+                "macd_hist_15m",
+                "vwap_15m",
+                "peak_high",
+                "drawdown_pct",
+                "oi_change_pct",
+            )
+        },
+    }
+    session.risk_state["webhook_ok"] = send_webhook(payload)
+    log_decision(
+        "risk",
+        f"{session.coin.symbol} paused by overbought guard ({decision.reason}); "
+        f"inventory sold to USDT until recovery confirms.",
+        severity="warning",
+        coin=session.coin,
+        payload=payload,
+    )
+
+
+def _apply_overbought_guard(
+    session: PaperSession,
+    strategy: IncrementalGridStrategy,
+    adapter: PaperExecutionAdapter,
+    client: BinanceFuturesClient,
+    now: datetime,
+    price: float,
+) -> dict[str, Any] | None:
+    symbol = session.coin.binance_symbol
+    if not symbol or not settings.RISK.get("ENABLED", True):
+        return None
+    try:
+        snapshot = risk.fetch_snapshot(
+            client, symbol, now, settings.RISK, price=price or None
+        )
+    except BinanceError as exc:
+        logger.warning("Risk snapshot failed for %s: %s", symbol, exc)
+        return None
+    decision = risk.evaluate(session.risk_state or {}, snapshot, settings.RISK, now)
+    session.risk_state = decision.state
+    if decision.action == "pause":
+        _pause_for_overbought(session, strategy, adapter, snapshot, decision, now)
+    return {"action": decision.action, "reason": decision.reason}
+
+
 def _tick_session(
     session: PaperSession,
     client: BinanceFuturesClient,
@@ -138,16 +214,26 @@ def _tick_session(
     if not symbol:
         return {"ok": False, "error": "no Binance symbol"}
 
+    # A bearish tag keeps the session live for marking/funding but locks the
+    # grid: no new orders are armed and no fills are simulated.
+    locked = session.bias == PaperSession.Bias.BEARISH
+    if locked:
+        strategy.orders.clear()
+
     bars_processed = 0
     funding_paid = 0.0
     funding_until = session.last_funding_at or session.started_at
     funding_fetched = True
+    last_price = 0.0
 
     # First tick: build the grid around the live price and wait for future bars.
     if not strategy.initialized:
         price = _fetch_price(client, symbol)
+        last_price = price
         hist = _fetch_hist(client, symbol, now, params)
         strategy.initialize(hist, price, now)
+        if locked:
+            strategy.orders.clear()
         adapter.mark(price)
         session.last_funding_at = now
         funding_fetched = True
@@ -208,7 +294,7 @@ def _tick_session(
             session.promotion_ready = False
 
         # Re-center after processing bars so new orders only apply to future data.
-        if session.status == PaperSession.Status.ACTIVE:
+        if session.status == PaperSession.Status.ACTIVE and not locked:
             due = strategy.last_rebalance_at is None or now >= (
                 strategy.last_rebalance_at + timedelta(days=params.rebalance_days)
             )
@@ -223,6 +309,14 @@ def _tick_session(
 
         if funding_fetched and funding_events:
             funding_until = funding_events[-1]["time"]
+
+    # Overbought guard: arm on RSI(15m) > threshold, pause on exhaustion.
+    # A bearish session is already locked and holds no ladder to protect.
+    risk_result = None
+    if session.status == PaperSession.Status.ACTIVE and not locked:
+        risk_result = _apply_overbought_guard(
+            session, strategy, adapter, client, now, last_price
+        )
 
     # Persist fills, state, and equity.
     adapter.flush()
@@ -298,6 +392,7 @@ def _tick_session(
         "equity": round(session.equity, 4),
         "status": session.status,
         "promotion_ready": session.promotion_ready,
+        "risk": risk_result,
         "evaluation": evaluation,
     }
 
@@ -418,6 +513,119 @@ def tick_paper_sessions(
     return summary
 
 
+def run_risk_guard(*, job_run_id=None) -> dict[str, Any]:
+    """Evaluate paused sessions and resume them once recovery confirms.
+
+    Active sessions are evaluated inside the paper tick, which runs on the same
+    interval; this job only watches the paused queue, because paused sessions
+    are not ticked and would otherwise never see a recovery check.
+    """
+
+    if not settings.RISK.get("ENABLED", True):
+        return {"ok": True, "enabled": False, "sessions": 0, "resumed": 0, "results": []}
+    now = timezone.now()
+    sessions = [
+        session
+        for session in PaperSession.objects.filter(
+            status=PaperSession.Status.PAUSED
+        ).select_related("coin")
+        # A manual pause is the operator's call; the guard must not resume it.
+        if (session.risk_state or {}).get("phase") == "paused"
+    ]
+    client = BinanceFuturesClient()
+    results: list[dict[str, Any]] = []
+    errors = 0
+    resumed = 0
+    for session in sessions:
+        symbol = session.coin.binance_symbol
+        if not symbol:
+            results.append(
+                {
+                    "session_id": str(session.id),
+                    "symbol": session.coin.symbol,
+                    "error": "no Binance symbol",
+                }
+            )
+            continue
+        try:
+            snapshot = risk.fetch_snapshot(client, symbol, now, settings.RISK)
+            decision = risk.evaluate(session.risk_state or {}, snapshot, settings.RISK, now)
+            session.risk_state = decision.state
+            if decision.action == "resume":
+                resume_session(session)
+                resumed += 1
+                log_decision(
+                    "risk",
+                    f"{session.coin.symbol} resumed: RSI recovered above "
+                    f"{settings.RISK['RSI_RECOVERY']:.0f}, 15m close above VWAP, "
+                    "open interest turning up.",
+                    coin=session.coin,
+                    payload={
+                        "session_id": str(session.id),
+                        "metrics": decision.state.get("last_metrics"),
+                    },
+                )
+            session.save(update_fields=["risk_state", "updated_at"])
+            results.append(
+                {
+                    "session_id": str(session.id),
+                    "symbol": session.coin.symbol,
+                    "action": decision.action,
+                    "reason": decision.reason,
+                }
+            )
+        except Exception:  # noqa: BLE001 - one session must not stop the guard
+            logger.exception("Risk guard failed for %s", session.coin.symbol)
+            errors += 1
+            results.append(
+                {
+                    "session_id": str(session.id),
+                    "symbol": session.coin.symbol,
+                    "error": "risk guard failed",
+                }
+            )
+    summary = {
+        "ok": errors == 0,
+        "enabled": True,
+        "sessions": len(sessions),
+        "resumed": resumed,
+        "errors": errors,
+        "results": results,
+    }
+    if resumed or errors:
+        log_decision(
+            "risk",
+            f"Risk guard resumed {resumed} session(s) with {errors} error(s).",
+            severity="warning" if errors else DecisionLog.Severity.INFO,
+            job_run_id=job_run_id,
+            payload=summary,
+        )
+    return summary
+
+
+def set_bias(session: PaperSession, bias: str) -> PaperSession:
+    if bias not in PaperSession.Bias.values:
+        raise ValueError(f"Unknown bias: {bias}")
+    if session.bias == bias:
+        return session
+    session.bias = bias
+    # Drop the ladder on either transition: a bearish session stays locked, and
+    # flipping back to bullish must re-center around the live price.
+    session.grid_state = {}
+    session.save(update_fields=["bias", "grid_state", "updated_at"])
+    log_decision(
+        "paper",
+        (
+            f"{session.coin.symbol} marked bearish; grid trading locked, inventory held."
+            if bias == PaperSession.Bias.BEARISH
+            else f"{session.coin.symbol} marked bullish; grid trading unlocked."
+        ),
+        coin=session.coin,
+        payload={"session_id": str(session.id), "bias": bias},
+    )
+    return session
+
+
 def pause_session(session: PaperSession) -> PaperSession:
     if session.status == PaperSession.Status.ACTIVE:
         session.status = PaperSession.Status.PAUSED
@@ -435,7 +643,10 @@ def resume_session(session: PaperSession) -> PaperSession:
     if session.status == PaperSession.Status.PAUSED:
         session.status = PaperSession.Status.ACTIVE
         session.last_tick_at = timezone.now()
-        session.save(update_fields=["status", "last_tick_at", "updated_at"])
+        # Drop the stale ladder: the next tick rebuilds around the live price
+        # instead of replaying bars from before the pause.
+        session.grid_state = {}
+        session.save(update_fields=["status", "last_tick_at", "grid_state", "updated_at"])
         log_decision(
             "paper",
             f"{session.coin.symbol} paper session resumed.",

@@ -22,6 +22,7 @@ class PaperSessionListSerializer(serializers.ModelSerializer):
             "coin",
             "analysis",
             "status",
+            "bias",
             "promotion_ready",
             "stop_reason",
             "params",

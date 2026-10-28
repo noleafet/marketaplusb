@@ -20,6 +20,7 @@ from apps.trading.paper import (
     evaluate_session,
     pause_session,
     resume_session,
+    set_bias,
     stop_session,
 )
 from apps.trading.serializers import (
@@ -97,6 +98,14 @@ class PaperSessionViewSet(viewsets.ReadOnlyModelViewSet):
         session = self.get_object()
         queryset = PaperEvaluation.objects.filter(session=session)[:100]
         return Response(PaperEvaluationSerializer(queryset, many=True).data)
+
+    @action(detail=True, methods=["post"])
+    def bias(self, request, id=None):
+        value = str(request.data.get("bias") or "").strip().lower()
+        if value not in {"bullish", "bearish"}:
+            raise serializers.ValidationError({"bias": "must be bullish or bearish"})
+        session = set_bias(self.get_object(), value)
+        return Response(PaperSessionListSerializer(session).data)
 
     @action(detail=True, methods=["post"])
     def pause(self, request, id=None):

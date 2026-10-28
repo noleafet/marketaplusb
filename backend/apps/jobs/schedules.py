@@ -46,6 +46,18 @@ DEFAULT_SCHEDULES = [
         "params": {},
         "interval_seconds": max(300, int(settings.PAPER.get("EVAL_INTERVAL_HOURS", 6)) * 3600),
     },
+    {
+        "slug": "paper-risk",
+        "name": "Overbought pause/resume guard",
+        "description": (
+            "Evaluate 15m RSI/MACD/VWAP and 1h open interest to pause paper "
+            "sessions near exhaustion and resume them after recovery."
+        ),
+        "job_type": "paper_risk",
+        "kind": JobSchedule.Kind.INTERVAL,
+        "params": {},
+        "interval_seconds": max(60, int(settings.RISK.get("INTERVAL_SECONDS", 300))),
+    },
 ]
 
 

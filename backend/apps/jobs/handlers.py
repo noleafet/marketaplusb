@@ -10,7 +10,7 @@ from django.utils import timezone
 from apps.coins.services.ingest import refresh_top_coins
 from apps.engine.analysis import run_daily_analysis
 from apps.engine.models import log_decision
-from apps.trading.paper import evaluate_session, tick_paper_sessions
+from apps.trading.paper import evaluate_session, run_risk_guard, tick_paper_sessions
 
 logger = logging.getLogger("jobs")
 
@@ -83,11 +83,16 @@ def handle_paper_evaluate(params: dict[str, Any], job_run) -> dict[str, Any]:
     return summary
 
 
+def handle_paper_risk(params: dict[str, Any], job_run) -> dict[str, Any]:
+    return run_risk_guard(job_run_id=job_run.id)
+
+
 HANDLERS: dict[str, JobHandler] = {
     "coins_refresh": handle_coins_refresh,
     "daily_analysis": handle_daily_analysis,
     "paper_tick": handle_paper_tick,
     "paper_evaluate": handle_paper_evaluate,
+    "paper_risk": handle_paper_risk,
 }
 
 

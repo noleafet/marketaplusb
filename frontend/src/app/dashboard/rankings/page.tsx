@@ -3,7 +3,16 @@
 import PageContainer from '@/components/layout/page-container';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle
+} from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select';
 import {
   Table,
@@ -15,16 +24,48 @@ import {
 } from '@/components/ui/table';
 import { Icons } from '@/components/icons';
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { useMemo, useState } from 'react';
+import type { FormEvent } from 'react';
+import { toast } from 'sonner';
 import { formatCompactUsd, formatPercent, metricsNumber } from '@/features/grid/api';
 import EmptyPanel from '@/features/grid/components/empty-panel';
 import StatusBadge from '@/features/grid/components/status-badge';
-import { useResults } from '@/features/grid/queries';
+import { useAddCoin, useResults } from '@/features/grid/queries';
 
 export default function RankingsPage() {
   const results = useResults({ limit: 200 });
+  const addCoin = useAddCoin();
+  const router = useRouter();
   const [search, setSearch] = useState('');
   const [suitability, setSuitability] = useState('all');
+  const [addOpen, setAddOpen] = useState(false);
+  const [symbol, setSymbol] = useState('');
+  const [name, setName] = useState('');
+
+  const submitCoin = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const ticker = symbol.trim().toUpperCase();
+    if (!ticker) {
+      toast.error('Enter a ticker symbol');
+      return;
+    }
+    addCoin.mutate(
+      { symbol: ticker, name: name.trim() || undefined },
+      {
+        onSuccess: ({ coin }) => {
+          setAddOpen(false);
+          setSymbol('');
+          setName('');
+          toast.success(`${coin.symbol} queued for solo analysis`, {
+            description: 'Results appear on the coin page once the worker finishes.'
+          });
+          router.push(`/dashboard/coins/${coin.symbol}`);
+        },
+        onError: (error: Error) => toast.error(error.message)
+      }
+    );
+  };
 
   const rows = useMemo(() => {
     const list = results.data?.results ?? [];
@@ -43,15 +84,21 @@ export default function RankingsPage() {
       pageTitle='Coin rankings'
       pageDescription='Composite suitability scores with out-of-sample performance, exposure quality, and execution costs.'
       pageHeaderAction={
-        <Button
-          variant='outline'
-          size='sm'
-          nativeButton={false}
-          render={<Link href='/dashboard' aria-label='Overview' />}
-        >
-          <Icons.dashboard />
-          Overview
-        </Button>
+        <div className='flex flex-wrap items-center gap-2'>
+          <Button size='sm' onClick={() => setAddOpen(true)}>
+            <Icons.add />
+            Add coin
+          </Button>
+          <Button
+            variant='outline'
+            size='sm'
+            nativeButton={false}
+            render={<Link href='/dashboard' aria-label='Overview' />}
+          >
+            <Icons.dashboard />
+            Overview
+          </Button>
+        </div>
       }
     >
       <div className='space-y-4'>
@@ -183,6 +230,49 @@ export default function RankingsPage() {
           or high-drawdown candidates. Past performance is not a guarantee.
         </p>
       </div>
+
+      <Dialog open={addOpen} onOpenChange={setAddOpen}>
+        <DialogContent>
+          <form className='space-y-4' onSubmit={submitCoin}>
+            <DialogHeader>
+              <DialogTitle>Add a coin</DialogTitle>
+              <DialogDescription>
+                Validated against Binance USDⓈ-M USDT perpetuals. The coin runs its own
+                walk-forward analysis and does not join the scheduled universe.
+              </DialogDescription>
+            </DialogHeader>
+            <div className='space-y-2'>
+              <Label htmlFor='coin-symbol'>Ticker</Label>
+              <Input
+                id='coin-symbol'
+                value={symbol}
+                onChange={(event) => setSymbol(event.target.value)}
+                placeholder='e.g. TAO'
+                maxLength={15}
+                autoFocus
+              />
+            </div>
+            <div className='space-y-2'>
+              <Label htmlFor='coin-name'>Name (optional)</Label>
+              <Input
+                id='coin-name'
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+                placeholder='e.g. Bittensor'
+                maxLength={160}
+              />
+            </div>
+            <DialogFooter>
+              <Button type='button' variant='outline' onClick={() => setAddOpen(false)}>
+                Cancel
+              </Button>
+              <Button type='submit' disabled={addCoin.isPending}>
+                {addCoin.isPending ? 'Queuing…' : 'Add and analyse'}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
     </PageContainer>
   );
 }

@@ -41,9 +41,10 @@ At Northflank's current rates ($0.01667/vCPU-hour and $0.00833/GB-hour), the thr
 about **$16.41/month**, inside the $20 Sandbox credit. The API can use `nf-compute-10`
 (0.1 vCPU / 256 MB) to free up more headroom if dashboard queries stay light.
 
-The daily analysis consumed **~989 CPU-seconds** locally. On 0.2 vCPU, expect roughly 75–90
-minutes of wall time. Keep `ENGINE_SYMBOL_LIMIT` around 40 for the first runs; paper ticks are
-cheap.
+The daily analysis consumed **~989 CPU-seconds** locally. Measured on Northflank on 2026-10-27,
+a 40-symbol run on an `nf-compute-20` worker finished in **245.7 s**, so the earlier 75–90 minute
+estimate was far too pessimistic. Start with `ENGINE_SYMBOL_LIMIT=40` to validate the pipeline,
+then raise it toward 0; runtime scales roughly linearly with the symbol count.
 
 The Sandbox is intended for development and evaluation. If this becomes a production service
 with an SLA, move to Northflank's pay-as-you-go plan.
@@ -305,15 +306,23 @@ minutes, paper evaluation every 6 hours.
 
 - **Keep the $20 credit in mind.** Three `nf-compute-20` workloads are ~$16.41/month before
   storage and bandwidth. Do not add replicas or larger plans without checking usage.
-- **CPU is the limiting factor.** `ENGINE_SYMBOL_LIMIT` is the main control. Start at 40; a
-  10-coin smoke test is cheap.
+- **CPU is the limiting factor.** `ENGINE_SYMBOL_LIMIT` is the main control. The measured
+  40-symbol run took ~4 minutes, so raise the limit (0 = no cap) once a run has been verified.
 - **Paper trading runs continuously.** The database add-on is provisioned compute, so the
   5-minute tick and the worker's 2-second queue poll do not consume a metered query quota. There
   is no equivalent of Neon Free's 100 CU-hour limit; the cost is the fixed add-on price.
 - **Database access:** the linked secret group injects `DATABASE_URL`; the app also accepts
   `POSTGRES_URI`. Keep `DB_CONN_MAX_AGE=60` for Northflank's persistent database.
-- **State lives in Postgres**, including `PaperSession.grid_state`, so restarting services is
-  safe.
+- **State lives in Postgres**, including `PaperSession.grid_state` and
+  `PaperSession.risk_state`, so restarting services is safe.
+- **Overbought guard.** The paper tick evaluates 15m RSI/MACD/VWAP and 1h open interest for every
+  active session. RSI above `RISK_RSI_OVERBOUGHT` arms a peak trail; a 6% drop from the peak, a
+  shrinking MACD histogram with the 15m close below VWAP, or a 5% open-interest flush near the
+  peak flattens inventory, pauses the session, and fires `RISK_WEBHOOK_URL` (if set). A separate
+  `paper-risk` job (`RISK_INTERVAL_SECONDS`, default 300) resumes paused sessions once RSI is
+  back above 35 and rising, the 15m close is above VWAP, and 1h open interest turns up. If OI
+  data stays unavailable for `RISK_OI_FAILSAFE_MINUTES`, recovery falls back to RSI + VWAP only.
+  Every decision is recorded in the decision log under the `risk` category.
 - **Live trading stays off.** `LIVE_TRADING_ENABLED=false` and no scheduler or endpoint places
   live orders.
 - **Backups:** Northflank's managed Postgres includes backups; verify the retention period in the

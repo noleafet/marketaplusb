@@ -19,12 +19,29 @@ import { formatPercent, formatUsd, relativeTime } from '@/features/grid/api';
 import EmptyPanel from '@/features/grid/components/empty-panel';
 import MetricCard from '@/features/grid/components/metric-card';
 import StatusBadge from '@/features/grid/components/status-badge';
-import { usePaperSessions, useTickAll, useTriggerJob } from '@/features/grid/queries';
+import { usePaperSessions, useSetBias, useTickAll, useTriggerJob } from '@/features/grid/queries';
 
 export default function PaperSessionsPage() {
   const sessions = usePaperSessions();
   const tickAll = useTickAll();
   const trigger = useTriggerJob();
+  const setBias = useSetBias();
+
+  const markBias = (id: string, bias: 'bullish' | 'bearish') => {
+    setBias.mutate(
+      { id, bias },
+      {
+        onSuccess: () =>
+          toast.success(bias === 'bearish' ? 'Trading locked' : 'Trading unlocked', {
+            description:
+              bias === 'bearish'
+                ? 'The grid stops opening trades; existing inventory is held.'
+                : 'The grid re-centers around the live price on the next tick.'
+          }),
+        onError: (error: Error) => toast.error(error.message)
+      }
+    );
+  };
 
   const rows = sessions.data?.results ?? [];
   const active = rows.filter((row) => row.status === 'active');
@@ -142,6 +159,7 @@ export default function PaperSessionsPage() {
                   <TableRow>
                     <TableHead>Coin</TableHead>
                     <TableHead>Status</TableHead>
+                    <TableHead>Bias</TableHead>
                     <TableHead className='text-right'>Equity</TableHead>
                     <TableHead className='text-right'>Net return</TableHead>
                     <TableHead className='text-right'>Max DD</TableHead>
@@ -174,6 +192,50 @@ export default function PaperSessionsPage() {
                               className='border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
                             >
                               Ready
+                            </Badge>
+                          ) : null}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <div className='flex items-center gap-0.5'>
+                          <Button
+                            variant='ghost'
+                            size='icon-sm'
+                            aria-label={`Mark ${row.coin.symbol} bullish`}
+                            aria-pressed={row.bias === 'bullish'}
+                            title='Bullish — grid trades normally'
+                            disabled={row.status === 'stopped' || setBias.isPending}
+                            className={
+                              row.bias === 'bullish'
+                                ? 'text-emerald-600 dark:text-emerald-400'
+                                : 'text-muted-foreground'
+                            }
+                            onClick={() => markBias(row.id, 'bullish')}
+                          >
+                            <Icons.trendingUp />
+                          </Button>
+                          <Button
+                            variant='ghost'
+                            size='icon-sm'
+                            aria-label={`Mark ${row.coin.symbol} bearish`}
+                            aria-pressed={row.bias === 'bearish'}
+                            title='Bearish — locks grid trading'
+                            disabled={row.status === 'stopped' || setBias.isPending}
+                            className={
+                              row.bias === 'bearish'
+                                ? 'text-rose-600 dark:text-rose-400'
+                                : 'text-muted-foreground'
+                            }
+                            onClick={() => markBias(row.id, 'bearish')}
+                          >
+                            <Icons.trendingDown />
+                          </Button>
+                          {row.bias === 'bearish' ? (
+                            <Badge
+                              variant='outline'
+                              className='ml-1 border-rose-500/30 bg-rose-500/10 text-rose-600 dark:text-rose-400'
+                            >
+                              Locked
                             </Badge>
                           ) : null}
                         </div>
@@ -233,6 +295,8 @@ export default function PaperSessionsPage() {
           Paper fills use live public market data but never touch an exchange account. Promotion
           requires the configured minimum days, net return, drawdown, and fill thresholds. Passing
           thresholds only unlocks an approval review — live trading stays disabled by default.
+          Marking a coin bearish locks new grid orders; existing inventory is held and still marked
+          to market.
         </p>
       </div>
     </PageContainer>

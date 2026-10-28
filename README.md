@@ -111,6 +111,7 @@ with row locks, and stale running jobs are reaped after 60 minutes.
 | `daily-analysis` | Daily at 00:10 UTC | Sync candles/funding, run walk-forward, score, report, create paper sessions |
 | `paper-tick` | Every `PAPER_TICK_MINUTES` (default 5) | Advance active paper sessions from live public data |
 | `paper-evaluate` | Every `PAPER_EVAL_INTERVAL_HOURS` (default 6) | Check promotion thresholds and hard stops |
+| `paper-risk` | Every `RISK_INTERVAL_SECONDS` (default 5 min) | Run the overbought guard and resume sessions whose recovery confirmed |
 
 All jobs can be triggered manually from the Jobs page or the API. Coin ingestion never deletes
 rows: coins that leave the top 100 are kept with `in_top100=False`.
@@ -190,6 +191,7 @@ browser.
 | --- | --- | --- |
 | GET | `/api/health/` | Liveness probe |
 | GET | `/api/coins/` | Coin universe (`in_top100`, `eligible`, `search`) |
+| POST | `/api/coins/add/` | Add a coin manually (Binance contract required) and queue a solo analysis run |
 | GET | `/api/coins/{coingecko_id}/snapshots/` | Market-cap snapshot history |
 | GET | `/api/engine/dashboard/` | Dashboard aggregate |
 | GET | `/api/engine/analysis/` · `/latest/` | Analysis runs |
@@ -201,7 +203,7 @@ browser.
 | GET | `/api/engine/decisions/` | Decision log |
 | GET | `/api/paper/sessions/` · `/{id}/` | Paper sessions |
 | GET | `/api/paper/sessions/{id}/equity/` · `/fills/` · `/evaluations/` | Session history |
-| POST | `/api/paper/sessions/{id}/tick/` · `/pause/` · `/resume/` · `/stop/` · `/evaluate/` | Session actions |
+| POST | `/api/paper/sessions/{id}/tick/` · `/pause/` · `/resume/` · `/stop/` · `/evaluate/` · `/bias/` | Session actions (`bias` is `bullish` or `bearish`) |
 | POST | `/api/paper/sessions/tick/` | Queue a tick for all (or selected) sessions |
 | GET | `/api/live/status/` | Gate status, approvals, audit trail |
 | POST | `/api/live/approvals/request_approval/` | Request approval for a promotion-ready session |

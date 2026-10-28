@@ -21,6 +21,7 @@ export interface AnalysisRun {
   id: string;
   status: 'running' | 'succeeded' | 'failed';
   trigger: string;
+  scope: 'universe' | 'solo';
   params: Record<string, unknown>;
   summary: Record<string, unknown>;
   error: string;
@@ -174,6 +175,7 @@ export interface PaperSession {
   coin: Coin;
   analysis: string | null;
   status: 'active' | 'paused' | 'stopped';
+  bias: 'bullish' | 'bearish';
   promotion_ready: boolean;
   stop_reason: string;
   params: Record<string, number | string>;

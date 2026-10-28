@@ -135,6 +135,29 @@ PAPER = {
     "EVAL_INTERVAL_HOURS": env.int("PAPER_EVAL_INTERVAL_HOURS", default=6),
 }
 
+# ------------------------------------ overbought pause / resume risk guard
+RISK = {
+    "ENABLED": env.bool("RISK_GUARD_ENABLED", default=True),
+    "INTERVAL_SECONDS": env.int("RISK_INTERVAL_SECONDS", default=300),
+    "RSI_PERIOD": env.int("RISK_RSI_PERIOD", default=14),
+    "RSI_OVERBOUGHT": env.float("RISK_RSI_OVERBOUGHT", default=75.0),
+    "RSI_RECOVERY": env.float("RISK_RSI_RECOVERY", default=35.0),
+    "TRAILING_STOP_PCT": env.float("RISK_TRAILING_STOP_PCT", default=0.06),
+    "MACD_FAST": env.int("RISK_MACD_FAST", default=12),
+    "MACD_SLOW": env.int("RISK_MACD_SLOW", default=26),
+    "MACD_SIGNAL": env.int("RISK_MACD_SIGNAL", default=9),
+    "MACD_SHRINK_BARS": env.int("RISK_MACD_SHRINK_BARS", default=2),
+    "OI_PERIOD": env("RISK_OI_PERIOD", default="1h"),
+    "OI_LOOKBACK": env.int("RISK_OI_LOOKBACK", default=6),
+    "OI_DROP_PCT": env.float("RISK_OI_DROP_PCT", default=0.05),
+    "OI_NEAR_HIGH_PCT": env.float("RISK_OI_NEAR_HIGH_PCT", default=0.03),
+    "OI_FAILSAFE_MINUTES": env.int("RISK_OI_FAILSAFE_MINUTES", default=60),
+    "ARM_TIMEOUT_HOURS": env.int("RISK_ARM_TIMEOUT_HOURS", default=24),
+    "RECOVERY_COOLDOWN_MINUTES": env.int("RISK_RECOVERY_COOLDOWN_MINUTES", default=30),
+    "WEBHOOK_URL": env("RISK_WEBHOOK_URL", default=""),
+    "WEBHOOK_TIMEOUT": env.int("RISK_WEBHOOK_TIMEOUT", default=10),
+}
+
 # ---------------------------------------------------------- live trading
 LIVE = {
     "ENABLED": env("LIVE_TRADING_ENABLED"),

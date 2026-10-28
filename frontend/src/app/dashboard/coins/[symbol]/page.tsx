@@ -134,7 +134,7 @@ export default function CoinDetailPage() {
       ) : !latest ? (
         <EmptyPanel
           title='No analysis for this coin'
-          description='Run the daily analysis after the monthly coin refresh to generate walk-forward results.'
+          description='Walk-forward results appear here after an analysis run. A queued solo analysis shows up once the worker finishes.'
           action={
             <Button
               variant='outline'

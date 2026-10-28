@@ -1,6 +1,19 @@
+import re
+
 from rest_framework import serializers
 
 from apps.coins.models import Coin
+
+
+class CoinAddSerializer(serializers.Serializer):
+    symbol = serializers.CharField(max_length=15)
+    name = serializers.CharField(max_length=160, required=False, allow_blank=True, default="")
+
+    def validate_symbol(self, value):
+        symbol = value.strip().upper()
+        if not re.fullmatch(r"[A-Z0-9]{2,15}", symbol):
+            raise serializers.ValidationError("Use 2-15 letters or digits, e.g. BTC.")
+        return symbol
 
 
 class CoinSerializer(serializers.ModelSerializer):

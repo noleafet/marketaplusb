@@ -139,6 +139,46 @@ def refresh_binance_eligibility(coins: list[Coin]) -> dict[str, Any]:
     return {"ok": True, "eligible": eligible, "excluded": excluded}
 
 
+def lookup_contract(symbol: str) -> dict[str, Any] | None:
+    """Resolve a symbol to its Binance USDⓈ-M USDT perpetual contract."""
+    symbol = symbol.upper()
+    exchange_info = BinanceFuturesClient().exchange_info()
+    candidates = _contract_map(exchange_info).get(symbol, [])
+    if not candidates:
+        return None
+    return _pick_contract(candidates, symbol)
+
+
+def ensure_manual_coin(symbol: str, name: str = "") -> Coin:
+    """Create or re-enable a coin that is not part of the top-100 snapshot.
+
+    Manual coins stay ``in_top100=False`` so they never join the scheduled
+    universe scan; they are analysed only when explicitly requested.
+    """
+    symbol = symbol.strip().upper()
+    if symbol in STABLECOINS:
+        raise ValueError(f"{symbol} is a stablecoin; the grid strategy needs volatility.")
+    try:
+        contract = lookup_contract(symbol)
+    except BinanceError as exc:
+        raise ValueError(f"Binance contract lookup failed: {exc}") from exc
+    if contract is None:
+        raise ValueError(f"No Binance USDⓈ-M USDT perpetual contract for {symbol}.")
+
+    coin = Coin.objects.filter(symbol=symbol).order_by("id").first()
+    if coin is None:
+        coin = Coin(coingecko_id=f"manual:{symbol}", symbol=symbol)
+    coin.name = name.strip() or coin.name or symbol
+    coin.binance_symbol = contract["symbol"]
+    coin.binance_contract_multiplier = contract["multiplier"]
+    coin.analysis_eligible = True
+    coin.analysis_exclusion_reason = ""
+    coin.is_stablecoin = False
+    coin.last_updated_at = timezone.now()
+    coin.save()
+    return coin
+
+
 def refresh_top_coins(per_page: int = 100) -> dict[str, Any]:
     """Fetch the current top-100 and apply non-destructive upserts.
 

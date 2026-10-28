@@ -90,6 +90,11 @@ def run_daily_analysis(
     analysis = AnalysisRun.objects.create(
         status=AnalysisRun.Status.RUNNING,
         trigger=trigger,
+        scope=(
+            AnalysisRun.Scope.SOLO
+            if analysis_params["symbols"]
+            else AnalysisRun.Scope.UNIVERSE
+        ),
         params={
             **analysis_params,
             "config": {
@@ -115,14 +120,23 @@ def run_daily_analysis(
     )
 
     client = BinanceFuturesClient()
-    coins = Coin.objects.filter(in_top100=True, analysis_eligible=True).order_by("rank", "symbol")
+    coins = Coin.objects.filter(analysis_eligible=True)
     if analysis_params["symbols"]:
+        # Explicit symbols bypass the top-100 universe so manually added coins
+        # can be analysed without joining the recurring scans.
         coins = coins.filter(symbol__in=analysis_params["symbols"])
+    else:
+        coins = coins.filter(in_top100=True)
+    coins = coins.order_by("rank", "symbol")
     if analysis_params["limit"]:
         coins = coins[: analysis_params["limit"]]
     coin_list = list(coins)
     if not coin_list:
-        message = "No eligible top-100 coins found. Run the monthly coin refresh first."
+        message = (
+            f"No analysis-eligible coins found for {', '.join(analysis_params['symbols'])}."
+            if analysis_params["symbols"]
+            else "No eligible top-100 coins found. Run the monthly coin refresh first."
+        )
         analysis.status = AnalysisRun.Status.FAILED
         analysis.error = message
         analysis.finished_at = timezone.now()
@@ -288,12 +302,14 @@ def run_daily_analysis(
         "min_oos_trades": cfg["MIN_OOS_TRADES"],
         "max_drawdown": cfg["MAX_DRAWDOWN"],
     }
-    try:
-        reports = build_reports(analysis, ranked, config_payload)
-        analysis.summary["report_ids"] = [str(report.id) for report in reports]
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Report generation failed")
-        analysis.summary["report_error"] = str(exc)
+    # Solo runs must not displace the universe ranking/performance reports.
+    if analysis.scope == AnalysisRun.Scope.UNIVERSE:
+        try:
+            reports = build_reports(analysis, ranked, config_payload)
+            analysis.summary["report_ids"] = [str(report.id) for report in reports]
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Report generation failed")
+            analysis.summary["report_error"] = str(exc)
 
     try:
         from apps.trading.paper import ensure_paper_sessions
@@ -333,8 +349,9 @@ def run_daily_analysis(
 
 
 def latest_analysis() -> AnalysisRun | None:
+    """Latest succeeded universe run, falling back to any run before the first scan."""
+    succeeded = AnalysisRun.objects.filter(status=AnalysisRun.Status.SUCCEEDED)
     return (
-        AnalysisRun.objects.filter(status=AnalysisRun.Status.SUCCEEDED)
-        .order_by("-started_at")
-        .first()
+        succeeded.filter(scope=AnalysisRun.Scope.UNIVERSE).order_by("-started_at").first()
+        or succeeded.order_by("-started_at").first()
     )

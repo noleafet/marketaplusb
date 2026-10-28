@@ -18,9 +18,14 @@ class AnalysisRun(models.Model):
         MANUAL = "manual", "Manual"
         API = "api", "API"
 
+    class Scope(models.TextChoices):
+        UNIVERSE = "universe", "Universe"
+        SOLO = "solo", "Solo"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.RUNNING)
     trigger = models.CharField(max_length=16, choices=Trigger.choices, default=Trigger.SCHEDULED)
+    scope = models.CharField(max_length=16, choices=Scope.choices, default=Scope.UNIVERSE)
     params = models.JSONField(default=dict, blank=True)
     summary = models.JSONField(default=dict, blank=True)
     error = models.TextField(blank=True, default="")

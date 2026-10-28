@@ -6,6 +6,7 @@ from django.test import TestCase
 from apps.coins.models import Coin
 from apps.coins.services.ingest import (
     _base_asset_underlying,
+    ensure_manual_coin,
     refresh_binance_eligibility,
     refresh_top_coins,
 )
@@ -68,6 +69,36 @@ class TopCoinRefreshTests(TestCase):
         self.assertEqual(Coin.objects.count(), 2)
         snapshots.assert_called_once()
         self.assertEqual(snapshots.call_args.args[0][0]["symbol"], "BTC")
+
+
+class ManualCoinTests(TestCase):
+    @patch("apps.coins.services.ingest.lookup_contract")
+    def test_ensure_manual_coin_creates_off_universe_row(self, lookup):
+        lookup.return_value = {"symbol": "TAOUSDT", "multiplier": 1.0}
+
+        coin = ensure_manual_coin("tao", "Bittensor")
+
+        self.assertEqual(coin.symbol, "TAO")
+        self.assertEqual(coin.coingecko_id, "manual:TAO")
+        self.assertEqual(coin.name, "Bittensor")
+        self.assertEqual(coin.binance_symbol, "TAOUSDT")
+        self.assertTrue(coin.analysis_eligible)
+        self.assertFalse(coin.in_top100)
+
+        again = ensure_manual_coin("TAO")
+        self.assertEqual(Coin.objects.count(), 1)
+        self.assertEqual(again.name, "Bittensor")
+        self.assertTrue(again.analysis_eligible)
+
+    @patch("apps.coins.services.ingest.lookup_contract")
+    def test_ensure_manual_coin_rejects_unknown_and_stablecoins(self, lookup):
+        lookup.return_value = None
+
+        with self.assertRaises(ValueError):
+            ensure_manual_coin("NOPE")
+        with self.assertRaises(ValueError):
+            ensure_manual_coin("USDC")
+        self.assertFalse(Coin.objects.exists())
 
 
 class BinanceEligibilityTests(TestCase):

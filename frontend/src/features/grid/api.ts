@@ -86,6 +86,8 @@ export const engineApi = {
     if (params.eligible) search.set('eligible', 'true');
     return request<Paginated<Coin>>(`coins/?${search.toString()}`);
   },
+  addCoin: (body: { symbol: string; name?: string }) =>
+    post<{ coin: Coin; job: JobRun }>('coins/add/', body),
 
   reports: (kind?: string) =>
     request<Paginated<Report>>(`engine/reports/?limit=100${kind ? `&kind=${kind}` : ''}`),
@@ -129,6 +131,8 @@ export const engineApi = {
     action: 'pause' | 'resume' | 'stop' | 'evaluate' | 'tick',
     body?: Record<string, unknown>
   ) => post<unknown>(`paper/sessions/${id}/${action}/`, body),
+  setBias: (id: string, bias: 'bullish' | 'bearish') =>
+    post<PaperSession>(`paper/sessions/${id}/bias/`, { bias }),
   tickAll: (sessionIds?: string[]) =>
     post<JobRun>('paper/sessions/tick/', sessionIds ? { session_ids: sessionIds } : {}),
 

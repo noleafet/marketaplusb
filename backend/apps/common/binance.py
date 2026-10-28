@@ -260,6 +260,38 @@ class BinanceFuturesClient:
     def premium_index(self, symbol: str | None = None) -> Any:
         return self._request("GET", "/fapi/v1/premiumIndex", {"symbol": symbol} if symbol else None)
 
+    def open_interest_hist(
+        self,
+        symbol: str,
+        period: str = "1h",
+        *,
+        limit: int = 6,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Open interest history for `/futures/data/openInterestHist` (public)."""
+        payload = self._request(
+            "GET",
+            "/futures/data/openInterestHist",
+            {
+                "symbol": symbol,
+                "period": period,
+                "limit": min(max(1, limit), 500),
+                "startTime": start_ms,
+                "endTime": end_ms,
+            },
+        )
+        if not isinstance(payload, list):
+            raise BinanceError("Unexpected open interest response")
+        return [
+            {
+                "time": datetime.fromtimestamp(float(item["timestamp"]) / 1000, tz=dt_timezone.utc),
+                "open_interest": float(item["sumOpenInterest"]),
+                "open_interest_value": float(item["sumOpenInterestValue"]),
+            }
+            for item in payload
+        ]
+
     def server_time(self) -> datetime:
         payload = self._request("GET", "/fapi/v1/time")
         return datetime.fromtimestamp(payload["serverTime"] / 1000, tz=dt_timezone.utc)

@@ -11,6 +11,7 @@ class AnalysisRunSerializer(serializers.ModelSerializer):
             "id",
             "status",
             "trigger",
+            "scope",
             "params",
             "summary",
             "error",

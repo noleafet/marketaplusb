@@ -283,3 +283,16 @@ class IncrementalGridStrategy:
         self.orders.clear()
         self.stopped = True
         self.stop_reason = reason
+
+    def flatten(self, price: float, now: datetime, reason: str = "risk_pause") -> None:
+        """Sell inventory and disarm orders without ending the session.
+
+        Used by the overbought guard: the session is paused, so the strategy
+        must stay resumable instead of flipping the permanent ``stopped`` flag.
+        """
+        if self.adapter.position_qty > 0:
+            self.adapter.close_position(price, now, reason)
+        self.adapter.mark(price)
+        self.orders.clear()
+        self.prev_close = price
+        self.last_bar_time = now

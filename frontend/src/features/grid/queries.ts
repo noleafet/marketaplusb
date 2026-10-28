@@ -43,6 +43,14 @@ export function useCoins() {
   });
 }
 
+export function useAddCoin() {
+  const refresh = useRefresh();
+  return useMutation({
+    mutationFn: engineApi.addCoin,
+    onSuccess: refresh
+  });
+}
+
 export function useCoinHistory(symbol: string) {
   return useQuery({
     queryKey: gridKeys.coinHistory(symbol),
@@ -179,6 +187,15 @@ export function useTickAll() {
   const refresh = useRefresh();
   return useMutation({
     mutationFn: () => engineApi.tickAll(),
+    onSuccess: refresh
+  });
+}
+
+export function useSetBias() {
+  const refresh = useRefresh();
+  return useMutation({
+    mutationFn: (input: { id: string; bias: 'bullish' | 'bearish' }) =>
+      engineApi.setBias(input.id, input.bias),
     onSuccess: refresh
   });
 }

@@ -4,8 +4,9 @@ from datetime import datetime, timedelta, timezone as dt_timezone
 import numpy as np
 from django.test import TestCase
 
+from apps.engine.analysis import latest_analysis
 from apps.engine.grid import GridParams, SimulationConfig, simulate_grid
-from apps.engine.models import CoinAnalysis
+from apps.engine.models import AnalysisRun, CoinAnalysis
 from apps.engine.scoring import score_results
 from apps.engine.walkforward import parameter_grid, run_walk_forward
 
@@ -232,3 +233,22 @@ class ScoringTests(TestCase):
         )
         self.assertFalse(ranked[0]["eligible"])
         self.assertIn("liquidity", " ".join(ranked[0]["eligibility_reasons"]))
+
+
+class AnalysisScopeTests(TestCase):
+    def test_latest_analysis_prefers_universe_scope(self):
+        universe = AnalysisRun.objects.create(
+            status=AnalysisRun.Status.SUCCEEDED, scope=AnalysisRun.Scope.UNIVERSE
+        )
+        AnalysisRun.objects.create(
+            status=AnalysisRun.Status.SUCCEEDED, scope=AnalysisRun.Scope.SOLO
+        )
+
+        self.assertEqual(latest_analysis().id, universe.id)
+
+    def test_latest_analysis_falls_back_to_solo_run(self):
+        solo = AnalysisRun.objects.create(
+            status=AnalysisRun.Status.SUCCEEDED, scope=AnalysisRun.Scope.SOLO
+        )
+
+        self.assertEqual(latest_analysis().id, solo.id)
