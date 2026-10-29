@@ -129,8 +129,9 @@ FIELD_TYPES: dict[str, str] = {
         )
     },
 }
-# `id` is an integer for backtests, fills, evaluations and events; a string elsewhere.
-_INTEGER_ID = {"backtest", "fill", "evaluation", "event"}
+# `id` is an integer for backtests, fills, evaluations, events, snapshots and order
+# audit rows; a string elsewhere.
+_INTEGER_ID = {"backtest", "fill", "evaluation", "event", "snapshot", "order_audit"}
 _PARAMS = {
     "symbol": (
         {"type": "string"},
@@ -181,6 +182,7 @@ def _field_type(resource: str, field: str) -> str:
 _NON_NULL = {
     "id", "environment", "symbol", "time", "open_time", "close_time", "funding_time",
     "created_at", "first_seen_at", "evaluated_at", "started_at", "updated_at", "as_of",
+    "finished_at",
     "type", "trigger", "status", "side", "order_type", "backfilled", "passed", "allowed",
     "eligible", "open", "high", "low", "close", "volume", "quote_volume", "rate",
     "equity", "analysis_id", "run_id", "code_sha", "state", "snapshot", "diff", "grid",

@@ -122,7 +122,7 @@ def _build(rows, got_more, query, endpoint, key_of, id_of) -> Page:
 def paginate_queryset(qs, *, endpoint: str, key: str, query: Query) -> Page:
     """Page a queryset by ``(key, id)``.
 
-    ``key`` may be a related lookup path (``analysis__data_cutoff``) but must be
+    ``key`` may be a related lookup path (``analysis__finished_at``) but must be
     a forward FK or one-to-one path. Rows with a NULL key are excluded by the
     hold-back filter, so endpoints must choose non-null keys.
 

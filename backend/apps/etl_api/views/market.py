@@ -118,13 +118,15 @@ class FeaturesView(V1View):
     def get(self, request):
         query = parse_query(request)
         qs = CoinAnalysis.objects.filter(
-            analysis__status="succeeded", analysis__data_cutoff__isnull=False
+            analysis__status="succeeded",
+            analysis__data_cutoff__isnull=False,
+            analysis__finished_at__isnull=False,
         ).select_related("analysis", "coin")
         if query.symbols:
             qs = qs.filter(coin__binance_symbol__in=query.symbols)
         if query.timeframe:
             qs = qs.filter(analysis__params__interval=query.timeframe)
         page = paginate_queryset(
-            qs, endpoint="market-features", key="analysis__data_cutoff", query=query
+            qs, endpoint="market-features", key="analysis__finished_at", query=query
         )
         return envelope([features_out(r) for r in page.rows], meta=page_meta(page, query))

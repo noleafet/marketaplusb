@@ -44,7 +44,10 @@ FROZEN_FIELDS = {
         "volume", "quote_volume", "trades",
     ),
     "funding": ("symbol", "funding_time", "rate", "mark_price"),
-    "features": ("symbol", "timeframe", "as_of", "analysis_id", "strategy_version", "features"),
+    "features": (
+        "symbol", "timeframe", "as_of", "finished_at", "analysis_id", "strategy_version",
+        "features",
+    ),
     "metrics": METRICS,
     "backtest": (
         "id", "run_id", "environment", "symbol", "timeframe", "trigger", "mode", "scope",
@@ -64,7 +67,7 @@ FROZEN_FIELDS = {
         "closed_lots", "wins", "losses", "net_return", "grid", "stop_reason",
     ),
     "snapshot": (
-        "session_id", "time", "trigger", "state", "strategy_version", "config_version",
+        "id", "session_id", "time", "trigger", "state", "strategy_version", "config_version",
         "backfilled",
     ),
     "equity": ("time", "equity", "price", "position_qty", "drawdown"),
@@ -81,7 +84,7 @@ FROZEN_FIELDS = {
         "after", "strategy_version", "config_version", "backfilled",
     ),
     "order_audit": (
-        "created_at", "symbol", "side", "order_type", "qty", "price", "notional", "allowed",
+        "id", "created_at", "symbol", "side", "order_type", "qty", "price", "notional", "allowed",
         "reason",
     ),
     "health": (
@@ -126,6 +129,7 @@ class ContractBase(TestCase):
             status="succeeded",
             strategy_version=self.sv,
             data_cutoff=self.past,
+            finished_at=self.past,
             params={"interval": "1h", "config": {"holdout_days": 30}},
         )
         fold = {
@@ -338,6 +342,11 @@ class SchemaTests(ContractBase):
         self.assertTrue(schemas["features"]["properties"]["features"]["nullable"])
         self.assertTrue(schemas["event"]["properties"]["session_id"]["nullable"])
         self.assertTrue(schemas["strategy_version"]["properties"]["parent_id"]["nullable"])
+        for name in ("snapshot", "order_audit"):
+            spec = schemas[name]["properties"]["id"]
+            self.assertEqual(spec["type"], "integer", name)
+            self.assertFalse(spec.get("nullable"), name)
+        self.assertFalse(schemas["features"]["properties"]["finished_at"].get("nullable"))
         self.assertNotIn("nullable", schemas["candle"]["properties"]["open_time"])
         self.assertNotIn("nullable", schemas["fill"]["properties"]["session_id"])
 

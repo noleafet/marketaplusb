@@ -165,6 +165,9 @@ class SnapshotEvalTests(Base):
         d = r.json()["data"]
         self.assertEqual([x["trigger"] for x in d], ["start", "daily"])
         self.assertEqual(d[0]["session_id"], str(s.pk))
+        self.assertEqual(list(d[0])[0], "id")
+        expected_ids = SessionSnapshot.objects.filter(session=s).order_by("time")
+        self.assertEqual([x["id"] for x in d], [x.pk for x in expected_ids][:2])
         self.assertEqual(d[0]["state"], {"equity": 1.0})
         cur = r.json()["meta"]["next_cursor"]
         r = self.api.get(f"{SESSIONS}{s.pk}/snapshots/", {"page_size": 2, "cursor": cur})
@@ -302,6 +305,6 @@ class AuditTests(Base):
         self.assertNotIn("response", d)
         self.assertEqual(
             list(d),
-            ["created_at", "symbol", "side", "order_type", "qty", "price", "notional",
+            ["id", "created_at", "symbol", "side", "order_type", "qty", "price", "notional",
              "allowed", "reason"],
         )

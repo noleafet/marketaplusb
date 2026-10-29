@@ -70,6 +70,7 @@ def features_out(ca) -> dict:
         "symbol": ca.coin.binance_symbol,
         "timeframe": (run.params or {}).get("interval"),
         "as_of": iso(run.data_cutoff),
+        "finished_at": iso(run.finished_at),
         "analysis_id": str(run.id),
         "strategy_version": run.strategy_version_id,
         "features": features,
@@ -181,6 +182,7 @@ def session_out(s) -> dict:
 
 def snapshot_out(snap) -> dict:
     return {
+        "id": snap.pk,
         "session_id": str(snap.session_id),
         "time": iso(snap.time),
         "trigger": snap.trigger,
@@ -253,6 +255,7 @@ def event_out(e) -> dict:
 
 def order_audit_out(a) -> dict:
     return {
+        "id": a.pk,
         "created_at": iso(a.created_at),
         "symbol": a.symbol,
         "side": a.side,
@@ -277,7 +280,10 @@ RESOURCES: dict[str, tuple[str, ...]] = {
         "volume", "quote_volume", "trades",
     ),
     "funding": ("symbol", "funding_time", "rate", "mark_price"),
-    "features": ("symbol", "timeframe", "as_of", "analysis_id", "strategy_version", "features"),
+    "features": (
+        "symbol", "timeframe", "as_of", "finished_at", "analysis_id", "strategy_version",
+        "features",
+    ),
     "metrics": METRIC_FIELDS,
     "backtest": (
         "id", "run_id", "environment", "symbol", "timeframe", "trigger", "mode", "scope",
@@ -297,7 +303,7 @@ RESOURCES: dict[str, tuple[str, ...]] = {
         "closed_lots", "wins", "losses", "net_return", "grid", "stop_reason",
     ),
     "snapshot": (
-        "session_id", "time", "trigger", "state", "strategy_version", "config_version",
+        "id", "session_id", "time", "trigger", "state", "strategy_version", "config_version",
         "backfilled",
     ),
     "equity": ("time", "equity", "price", "position_qty", "drawdown"),
@@ -314,7 +320,7 @@ RESOURCES: dict[str, tuple[str, ...]] = {
         "after", "strategy_version", "config_version", "backfilled",
     ),
     "order_audit": (
-        "created_at", "symbol", "side", "order_type", "qty", "price", "notional", "allowed",
+        "id", "created_at", "symbol", "side", "order_type", "qty", "price", "notional", "allowed",
         "reason",
     ),
     "health": (

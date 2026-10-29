@@ -7,6 +7,11 @@ from ..serializers import config_version_out, strategy_version_out
 from .base import V1View, envelope
 
 
+def _code_sha_known(v) -> bool:
+    """current_code_sha() stores "unknown" when GIT_SHA is unset."""
+    return v.code_sha not in ("", "unknown")
+
+
 class StrategyVersionListView(V1View):
     def get(self, request):
         query = parse_query(request)
@@ -16,7 +21,7 @@ class StrategyVersionListView(V1View):
             key="first_seen_at",
             query=query,
         )
-        unknown = [v.id for v in page.rows if not v.code_sha]
+        unknown = [v.id for v in page.rows if not _code_sha_known(v)]
         return envelope(
             [strategy_version_out(v) for v in page.rows],
             meta=page_meta(page, query),
@@ -32,7 +37,7 @@ class StrategyVersionDetailView(V1View):
             v = StrategyVersion.objects.get(pk=pk)
         except StrategyVersion.DoesNotExist:
             raise NotFoundProblem("No such strategy version.")
-        return envelope(strategy_version_out(v), completeness={"code_sha_known": bool(v.code_sha)})
+        return envelope(strategy_version_out(v), completeness={"code_sha_known": _code_sha_known(v)})
 
 
 class ConfigVersionListView(V1View):

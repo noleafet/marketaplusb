@@ -139,10 +139,11 @@ class FeaturesTests(MarketBase):
         sv = StrategyVersion.objects.create(id="sv1", snapshot={}, code_sha="abc")
         cutoff = T0 + timedelta(hours=3)
         run = AnalysisRun.objects.create(
-            status="succeeded", data_cutoff=cutoff, params={"interval": "1h"}, strategy_version=sv
+            status="succeeded", data_cutoff=cutoff, finished_at=cutoff + timedelta(hours=1),
+            params={"interval": "1h"}, strategy_version=sv,
         )
         bad = AnalysisRun.objects.create(
-            status="failed", data_cutoff=cutoff, params={"interval": "1h"}
+            status="failed", data_cutoff=cutoff, finished_at=cutoff, params={"interval": "1h"}
         )
         coin = Coin.objects.create(coingecko_id="b", symbol="BTC", name="B", binance_symbol="BTCUSDT")
         coin2 = Coin.objects.create(coingecko_id="e", symbol="ETH", name="E", binance_symbol="ETHUSDT")
@@ -162,12 +163,36 @@ class FeaturesTests(MarketBase):
         self.assertIsNone(by["ETHUSDT"]["features"])
         self.assertEqual(
             list(data[0]),
-            ["symbol", "timeframe", "as_of", "analysis_id", "strategy_version", "features"],
+            [
+                "symbol", "timeframe", "as_of", "finished_at", "analysis_id",
+                "strategy_version", "features",
+            ],
         )
+        self.assertEqual(by["BTCUSDT"]["finished_at"], "2026-10-01T04:00:00Z")
         r = self.api.get(FEATURES + "?symbol=ETHUSDT&timeframe=1h")
         self.assertEqual(len(r.json()["data"]), 1)
         r = self.api.get(FEATURES + "?timeframe=4h")
         self.assertEqual(r.json()["data"], [])
+
+    def test_features_incremental_on_finished_at_not_cutoff(self):
+        """A run analysing old data that finished recently is still picked up."""
+        now = timezone.now()
+        coin = Coin.objects.create(coingecko_id="b", symbol="BTC", name="B", binance_symbol="BTCUSDT")
+        late = AnalysisRun.objects.create(
+            status="succeeded", data_cutoff=now - timedelta(days=2),
+            finished_at=now - timedelta(minutes=30), params={"interval": "1h"},
+        )
+        unfinished = AnalysisRun.objects.create(
+            status="succeeded", data_cutoff=now - timedelta(minutes=40), params={"interval": "1h"}
+        )
+        CoinAnalysis.objects.create(analysis=late, coin=coin, features={"adx": 1})
+        CoinAnalysis.objects.create(analysis=unfinished, coin=coin, features={"adx": 2})
+        since = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r = self.api.get(FEATURES, {"updated_since": since})
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        self.assertEqual([d["analysis_id"] for d in data], [str(late.id)])
+        self.assertEqual(data[0]["features"], {"adx": 1})
 
 
 class VersionTests(MarketBase):
@@ -176,7 +201,7 @@ class VersionTests(MarketBase):
             id="p1", snapshot={"a": 1}, code_sha="abc", first_seen_at=T0
         )
         StrategyVersion.objects.create(
-            id="c1", snapshot={"a": 2}, code_sha="", parent=p, diff={"a": [1, 2]},
+            id="c1", snapshot={"a": 2}, code_sha="unknown", parent=p, diff={"a": [1, 2]},
             first_seen_at=T0 + timedelta(hours=1), backfilled=True,
         )
         r = self.api.get("/api/v1/strategy-versions/")

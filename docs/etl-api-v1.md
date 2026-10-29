@@ -97,6 +97,12 @@ strategy's bar time and can be up to one signal interval older than the insert, 
 would let a watermark skip late-inserted rows. Fills expose both `time` and `created_at`; use
 `created_at` as the watermark and `time` for analysis.
 
+Equity points (`time`) and evaluations (`evaluated_at`) are stamped with the time captured once
+at the start of the paper tick, not at insert, so a row can land a little after a newer-looking
+watermark was handed out. Re-pull these two with a small overlap, e.g.
+`updated_since = watermark - 15 minutes`, and deduplicate on (`session_id`, `time`) for equity
+and on `id` for evaluations.
+
 A cursor is bound to the endpoint that issued it. Reusing it elsewhere gives 410 `cursor_expired`;
 a malformed cursor gives 400.
 
@@ -129,7 +135,8 @@ Errors are `application/problem+json` (RFC 7807):
 
 ## 6. Endpoints
 
-All GET, all under `/api/v1/`. "Key" is the incremental key used for `updated_since`, `start`,
+All GET, all under `/api/v1/`. Every URL ends with a trailing slash (`market/candles/`, not
+`market/candles`); without it you get 404 `not_found`. "Key" is the incremental key used for `updated_since`, `start`,
 `end` and the watermark. Common list parameters are `cursor`, `page_size`, `updated_since`,
 `start`, `end`; each row below lists only the extra filters.
 
@@ -139,7 +146,7 @@ All GET, all under `/api/v1/`. "Key" is the incremental key used for `updated_si
 | `config-versions/`, `config-versions/{id}/` | `first_seen_at` | `symbol` |
 | `market/candles/` | `open_time` | `symbol` and `timeframe` (both required, exactly one symbol) |
 | `market/funding/` | `funding_time` | `symbol` (required, exactly one) |
-| `market/features/` | analysis `data_cutoff` (`as_of`) | `symbol`, `timeframe` |
+| `market/features/` | analysis `finished_at` | `symbol`, `timeframe` |
 | `backtests/`, `backtests/{id}/` | `created_at` | `symbol`, `timeframe`, `environment`, `strategy_version`, `config_version` |
 | `backtests/{id}/folds/` | none (not paged) | |
 | `sessions/` | `updated_at` | `symbol`, `environment`, `strategy_version`, `config_version`, `session` |
@@ -182,9 +189,12 @@ boundary is not reported, so check across pages yourself if you need it.
 
 **Funding**: `symbol`, `funding_time`, `rate`, `mark_price`.
 
-**Features**: `symbol`, `timeframe`, `as_of`, `analysis_id`, `strategy_version`, `features`.
-Returns the features of every succeeded analysis (all history), keyed on `as_of`, which is that
-analysis's `data_cutoff`. `features` is `null` when the analysis flagged insufficient data.
+**Features**: `symbol`, `timeframe`, `as_of`, `finished_at`, `analysis_id`,
+`strategy_version`, `features`. Returns the features of every succeeded analysis (all history).
+`as_of` is that analysis's `data_cutoff` (the newest candle it saw); `finished_at` is when the
+run succeeded and its rows became visible, and is the incremental key. A run can analyse old
+data and finish much later, so page and watermark on `finished_at`, never `as_of`. `features` is
+`null` when the analysis flagged insufficient data.
 
 **MetricsBlock** (used by backtests, folds, evaluations): `net_return`, `annualized_return`,
 `max_drawdown`, `max_drawdown_duration_days`, `sharpe`, `sortino`, `calmar`, `profit_factor`,
@@ -216,7 +226,7 @@ fraction, e.g. 0.01 is 1 percent). Completeness: detail `{"is_partial": status =
 list `{"active_ids": [...]}` for the current page only. Sessions are mutated in place, so use
 snapshots for history.
 
-**SessionSnapshot**: `session_id`, `time`, `trigger` (`start`, `rebalance`, `pause`,
+**SessionSnapshot**: `id`, `session_id`, `time`, `trigger` (`start`, `rebalance`, `pause`,
 `resume`, `stop`, `retire`, `daily`), `state` (the session state as it was at `time`, as a nested
 object), `strategy_version`, `config_version`, `backfilled`.
 
@@ -234,7 +244,7 @@ object), `strategy_version`, `config_version`, `backfilled`.
 `after` hold the changed settings; `strategy_version` is the version in force after the change.
 `kill_switch` events carry environment `live`.
 
-**Live order audit**: `created_at`, `symbol`, `side`, `order_type`, `qty`, `price`, `notional`,
+**Live order audit**: `id`, `created_at`, `symbol`, `side`, `order_type`, `qty`, `price`, `notional`,
 `allowed`, `reason`. It holds gate attempts only (there is no live runner), and the raw exchange
 response is never exposed.
 
