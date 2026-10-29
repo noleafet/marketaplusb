@@ -1,8 +1,10 @@
+import importlib
 import os
 from datetime import datetime, timedelta, timezone as dt_timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import django.apps
 from django.conf import settings
 from django.db import IntegrityError
 from django.test import TestCase, override_settings
@@ -17,9 +19,9 @@ from apps.engine.versioning import (
     strategy_snapshot,
 )
 from apps.trading.events import record_event, session_state, snapshot_session
-from apps.engine.models import AnalysisRun
+from apps.engine.models import AnalysisRun, CoinAnalysis, log_decision
 from apps.trading.execution import set_kill_switch
-from apps.trading.models import GridEvent, PaperSession, StrategySettings
+from apps.trading.models import GridEvent, PaperFill, PaperSession, SessionSnapshot, StrategySettings
 from apps.trading.paper import (
     ensure_paper_sessions,
     retire_stale_sessions,
@@ -365,3 +367,93 @@ class CaptureTests(TestCase):
         with self.assertRaises(RuntimeError):
             handle_daily_analysis({}, JobRun.objects.create(job_type="daily_analysis"))
         self.assertEqual(SessionSnapshot.objects.filter(trigger="daily").count(), 0)
+
+
+def run_backfill():
+    module = importlib.import_module("apps.trading.migrations.0007_backfill_versions")
+    module.backfill(django.apps.apps, None)
+
+
+class BackfillTests(TestCase):
+    def setUp(self):
+        self.coin = Coin.objects.create(coingecko_id="btc", symbol="BTC", name="Bitcoin",
+                                        binance_symbol="BTCUSDT", analysis_eligible=True)
+        self.run = AnalysisRun.objects.create(params={"config": {"a": 1}})
+        self.session = PaperSession.objects.create(
+            coin=self.coin, analysis=self.run, params={"grid_levels": 10},
+            config={"fee": 0.1}, capital=1000.0, equity=1100.0,
+            grid_state={"range_low": 90.0, "range_high": 110.0, "levels": [90.0, 100.0]},
+        )
+        self.fill = PaperFill.objects.create(
+            session=self.session, time=datetime.now(dt_timezone.utc), side="buy",
+            qty=1.0, price=100.0, notional=100.0, fee=0.1,
+        )
+
+    def _rebalance_log(self, payload):
+        return log_decision("paper", "BTC grid rebalanced (drift).", payload=payload)
+
+    def test_backfill_stamps_legacy_rows(self):
+        analysis = CoinAnalysis.objects.create(analysis=self.run, coin=self.coin, params={"grid_levels": 8})
+        run_backfill()
+        s = PaperSession.objects.get(pk=self.session.pk)
+        self.assertTrue(StrategyVersion.objects.get(id=s.strategy_version_id).backfilled)
+        cv = ConfigVersion.objects.get(id=s.config_version_id)
+        self.assertEqual(cv.symbol, "BTCUSDT")
+        self.assertTrue(cv.backfilled)
+        self.assertEqual(
+            s.strategy_version_id,
+            digest({"snapshot": {"paper_config": {"fee": 0.1}}, "code_sha": "unknown"}),
+        )
+        self.assertEqual(set(s.fills.values_list("config_version_id", flat=True)), {s.config_version_id})
+        self.assertEqual(set(s.fills.values_list("strategy_version_id", flat=True)), {s.strategy_version_id})
+        snap = s.snapshots.get(trigger="start")
+        self.assertTrue(snap.backfilled)
+        self.assertEqual(snap.time, s.started_at)
+        self.assertAlmostEqual(snap.state["net_return"], 0.1)
+        self.assertEqual(snap.state["grid"]["range_low"], 90.0)
+        self.assertAlmostEqual(snap.state["grid"]["spacing"], 100.0 / 90.0 - 1)
+        analysis.refresh_from_db()
+        self.assertEqual(analysis.config_version_id, digest({"symbol": "BTCUSDT", "params": {"grid_levels": 8}}))
+        self.run.refresh_from_db()
+        self.assertEqual(
+            self.run.strategy_version_id,
+            digest({"snapshot": {"analysis_config": {"a": 1}}, "code_sha": "unknown"}),
+        )
+
+    def test_backfill_converts_complete_rebalance_logs_only(self):
+        self._rebalance_log({"session_id": str(self.session.id), "range_low": 1, "range_high": 2,
+                             "reason": "drift", "active_levels": 5})
+        self._rebalance_log({"session_id": str(self.session.id)})
+        run_backfill()
+        self.assertEqual(GridEvent.objects.filter(type="rebalance", backfilled=True).count(), 1)
+        ev = GridEvent.objects.get(type="rebalance")
+        self.assertEqual(ev.symbol, "BTCUSDT")
+        self.assertEqual(ev.reason, "drift")
+        self.assertEqual(ev.after, {"range_low": 1, "range_high": 2, "active_levels": 5})
+        self.assertEqual(ev.session_id, self.session.id)
+        self.assertEqual(ev.strategy_version_id, PaperSession.objects.get(pk=self.session.pk).strategy_version_id)
+
+    def test_backfill_converts_pause_resume_and_skips_unknown_session(self):
+        sid = {"session_id": str(self.session.id)}
+        log_decision("paper", "BTC paper session paused.", payload=sid)
+        log_decision("paper", "BTC paper session resumed.", payload=sid)
+        log_decision("paper", "BTC paper session paused.",
+                     payload={"session_id": "00000000-0000-0000-0000-000000000000"})
+        run_backfill()
+        self.assertEqual(
+            sorted(GridEvent.objects.values_list("type", flat=True)), ["pause", "resume"]
+        )
+
+    def test_backfill_is_idempotent(self):
+        self._rebalance_log({"session_id": str(self.session.id), "range_low": 1, "range_high": 2,
+                             "reason": "drift", "active_levels": 5})
+        log_decision("paper", "BTC paper session paused.", payload={"session_id": str(self.session.id)})
+        run_backfill()
+        events = GridEvent.objects.count()
+        snaps = SessionSnapshot.objects.count()
+        versions = (StrategyVersion.objects.count(), ConfigVersion.objects.count())
+        run_backfill()
+        self.assertEqual(events, 2)
+        self.assertEqual(GridEvent.objects.count(), events)
+        self.assertEqual(SessionSnapshot.objects.count(), snaps)
+        self.assertEqual((StrategyVersion.objects.count(), ConfigVersion.objects.count()), versions)
