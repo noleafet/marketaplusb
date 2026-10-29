@@ -1,4 +1,4 @@
-"""Django settings for the grid suitability engine."""
+"""Django settings for Marketa+b - marketa+ bot."""
 
 from pathlib import Path
 

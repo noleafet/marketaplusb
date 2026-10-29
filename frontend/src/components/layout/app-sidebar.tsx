@@ -27,17 +27,15 @@ export default function AppSidebar() {
           <SidebarMenuItem>
             <SidebarMenuButton
               size='lg'
-              tooltip='Grid Engine'
-              render={<Link href='/dashboard' aria-label='Grid Engine' />}
+              tooltip='Marketa+b - marketa+ bot'
+              render={<Link href='/dashboard' aria-label='Marketa+b - marketa+ bot' />}
             >
               <div className='bg-sidebar-primary text-sidebar-primary-foreground flex aspect-square size-8 shrink-0 items-center justify-center rounded-lg'>
                 <Icons.grid className='size-4' />
               </div>
               <div className='grid flex-1 text-left text-sm leading-tight group-data-[collapsible=icon]:hidden'>
-                <span className='truncate font-semibold'>Grid Engine</span>
-                <span className='text-muted-foreground truncate text-xs'>
-                  USDT-M futures research
-                </span>
+                <span className='truncate font-semibold'>Marketa+b</span>
+                <span className='text-muted-foreground truncate text-xs'>marketa+ bot</span>
               </div>
             </SidebarMenuButton>
           </SidebarMenuItem>

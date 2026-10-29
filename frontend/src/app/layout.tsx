@@ -24,8 +24,8 @@ const metadataBase = URL.canParse(process.env.NEXT_PUBLIC_APP_URL ?? '')
 export const metadata: Metadata = {
   ...(metadataBase ? { metadataBase } : {}),
   title: {
-    default: 'Marketa+b',
-    template: '%s | Grid Suitability Engine'
+    default: 'Marketa+b - marketa+ bot',
+    template: '%s | Marketa+b - marketa+ bot'
   },
   description:
     'Grid trading coin selection, walk-forward backtesting, paper trading, and risk monitoring for Binance USDⓈ-M futures.'

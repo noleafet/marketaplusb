@@ -1,4 +1,4 @@
-# Grid Suitability Engine
+# Marketa+b - marketa+ bot
 
 A staged grid-trading research and paper-trading system. A Django engine ingests the monthly
 top-100 crypto universe, backtests a long-only grid strategy against Binance USDⓈ-M public
