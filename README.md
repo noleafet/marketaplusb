@@ -322,7 +322,7 @@ equity point before the cutoff, guarding against look-ahead bias.
 | Signal interval | `1h` | Candles for both the daily backtest and paper trading. Changing it can queue a fresh analysis. |
 | Fill model | trade-through 2 bps | Used by backtest and paper; the other model is always reported |
 | Holdout | 90 days | Untouched final window (0 = off) |
-| Overbought guard | off | No backtest yet; when off, sessions it paused are resumed |
+| Overbought guard | on | RSI/MACD/VWAP/open-interest exit on overbought tops; not simulated by the backtest. When switched off, sessions it paused are resumed |
 | Book capital / max sessions | $8,000 / 8 | Each new session gets book ÷ sessions |
 | Exposure cap | 1.0× book | New buys stop above this total open notional |
 | Daily loss limit | 3% of book | Halts new buys until the next UTC day |

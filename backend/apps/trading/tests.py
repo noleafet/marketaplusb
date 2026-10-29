@@ -532,7 +532,7 @@ class OverboughtGuardExecutionTests(TestCase):
             rsi_prev=34.0,
             oi_values=[100.0, 100.0, 100.0, 100.0, 101.0],
         )
-        # The guard is off by default until a backtest supports it.
+        # Explicit, so the test does not depend on the settings default.
         guard = StrategySettings.load()
         guard.overbought_guard_enabled = True
         guard.save()

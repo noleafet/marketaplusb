@@ -583,7 +583,7 @@ def _tick_session(
         if funding_fetched:
             funding_until = now
 
-    # Overbought guard: off by default until a backtest shows it adds value.
+    # Overbought guard (on by default; admin switch).
     # A bearish session is already locked and holds no ladder to protect.
     risk_result = None
     if (

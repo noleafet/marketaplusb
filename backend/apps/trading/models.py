@@ -281,9 +281,10 @@ class StrategySettings(models.Model):
         max_length=16, choices=FillModel.choices, default=FillModel.TRADE_THROUGH
     )
     trade_through_bps = models.FloatField(default=2.0)
-    # The overbought guard has no backtest yet, so it stays off until one
-    # shows it adds value.
-    overbought_guard_enabled = models.BooleanField(default=False)
+    # RSI/MACD/VWAP/open-interest exit on overbought tops. On by default; it
+    # is not simulated by the backtest, so paper results with it on are not
+    # directly comparable to the walk-forward numbers.
+    overbought_guard_enabled = models.BooleanField(default=True)
     holdout_days = models.PositiveSmallIntegerField(default=90)
 
     book_capital = models.FloatField(default=8000.0)

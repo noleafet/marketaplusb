@@ -217,7 +217,7 @@ function SettingsForm({
               children={(field) => (
                 <field.SwitchField
                   label='Overbought guard'
-                  description='RSI/VWAP/open-interest pause in paper trading. Not backtested yet, so it stays off by default.'
+                  description='RSI/MACD/VWAP/open-interest exit on overbought tops in paper trading. On by default; not simulated by the backtest.'
                 />
               )}
             />

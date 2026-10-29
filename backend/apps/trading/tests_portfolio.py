@@ -28,7 +28,7 @@ class StrategySettingsTests(TestCase):
         row = StrategySettings.load()
         self.assertEqual(row.signal_interval, "1h")
         self.assertEqual(row.fill_model, "trade_through")
-        self.assertFalse(row.overbought_guard_enabled)
+        self.assertTrue(row.overbought_guard_enabled)
         self.assertEqual(row.holdout_days, 90)
         self.assertEqual(row.book_capital, 8000.0)
         self.assertEqual(row.max_sessions, 8)
@@ -162,6 +162,9 @@ class SessionAllocationTests(TestCase):
 
 class OverboughtGuardSwitchTests(TestCase):
     def test_disabled_guard_resumes_its_paused_sessions(self):
+        row = StrategySettings.load()
+        row.overbought_guard_enabled = False
+        row.save()
         session = make_session(
             make_coin(),
             status=PaperSession.Status.PAUSED,

@@ -537,10 +537,10 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           },
           {
             name: 'Overbought guard',
-            value: 'off by default',
+            value: 'on by default',
             tone: 'warn',
             detail:
-              'RSI ≥ 75 with fading MACD or a 5% open-interest drop arms a pause; RSI ≤ 35 clears it. It has no backtest yet, so it stays off until one shows it adds value (admin switch).'
+              'Arms when 15m RSI exceeds 75, then exits to USDT on a 6% drop from the peak, a shrinking MACD histogram with a close below VWAP, or a 5% open-interest flush near the high. Resumes once RSI is back above 35 and rising, price reclaims VWAP, and OI turns up. On by default (admin switch); not simulated by the backtest.'
           },
           {
             name: 'Support breakdown gate',
