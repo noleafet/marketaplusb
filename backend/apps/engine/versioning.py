@@ -26,6 +26,12 @@ SNAPSHOT_FIELDS = (
     "max_strategy_correlation",
 )
 
+# Deployment knobs that never change strategy results, so they stay out of the snapshot.
+OPERATIONAL_KEYS = {
+    "engine": ("WORKERS", "CANDLE_SYNC_TIMEOUT", "SYMBOL_LIMIT"),
+    "paper": ("TICK_MINUTES",),
+}
+
 
 def _normalise(obj: Any) -> Any:
     if isinstance(obj, bool):
@@ -59,8 +65,9 @@ def strategy_snapshot(settings_row=None) -> dict:
 
     row = settings_row or StrategySettings.load()
     snap = {name: getattr(row, name) for name in SNAPSHOT_FIELDS}
-    snap["engine"] = dict(settings.ENGINE)
-    snap["paper"] = dict(settings.PAPER)
+    for group, source in (("engine", settings.ENGINE), ("paper", settings.PAPER)):
+        skip = OPERATIONAL_KEYS[group]
+        snap[group] = {k: v for k, v in source.items() if k not in skip}
     return snap
 
 
@@ -104,7 +111,12 @@ def resolve_strategy_version(
     existing = StrategyVersion.objects.filter(id=vid).first()
     if existing is not None:
         return existing
-    parent = StrategyVersion.objects.order_by("-first_seen_at").first()
+    # Backfilled versions have synthetic snapshots; diffing against them is meaningless.
+    parent = (
+        StrategyVersion.objects.exclude(backfilled=True)
+        .order_by("-first_seen_at", "-id")
+        .first()
+    )
     diff = diff_snapshots(parent.snapshot, snap) if parent else {}
     if parent and parent.code_sha != sha:
         diff["code_sha"] = {"from": parent.code_sha, "to": sha}

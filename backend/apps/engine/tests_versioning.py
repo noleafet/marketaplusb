@@ -83,6 +83,35 @@ class StrategyVersionTests(TestCase):
         self.assertEqual(b.parent_id, a.id)
         self.assertEqual(b.diff["code_sha"], {"from": "abc", "to": "def"})
 
+    def test_first_live_version_ignores_backfilled_parents(self):
+        StrategyVersion.objects.create(
+            id="bf1", snapshot={"paper_config": {}}, code_sha="unknown", backfilled=True
+        )
+        StrategyVersion.objects.create(
+            id="bf2", snapshot={"analysis_config": {}}, code_sha="unknown", backfilled=True
+        )
+        v = resolve_strategy_version()
+        self.assertFalse(v.backfilled)
+        self.assertIsNone(v.parent_id)
+        self.assertEqual(v.diff, {})
+
+    def test_operational_settings_do_not_mint_versions(self):
+        base = resolve_strategy_version().id
+        cases = [
+            ("ENGINE", "WORKERS", 7),
+            ("ENGINE", "CANDLE_SYNC_TIMEOUT", 999),
+            ("ENGINE", "SYMBOL_LIMIT", 3),
+            ("PAPER", "TICK_MINUTES", 1),
+        ]
+        for group, key, value in cases:
+            with self.subTest(key=key), override_settings(
+                **{group: {**getattr(settings, group), key: value}}
+            ):
+                self.assertNotIn(key, strategy_snapshot()[group.lower()])
+                self.assertEqual(resolve_strategy_version().id, base)
+        with override_settings(ENGINE={**settings.ENGINE, "GRID_LEVELS": 99}):
+            self.assertNotEqual(resolve_strategy_version().id, base)
+
     def test_resolve_is_race_safe(self):
         # Lost race: the existence check misses, the other writer's row is
         # already committed, and our get_or_create hits the unique key.
