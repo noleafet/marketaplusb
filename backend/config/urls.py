@@ -15,6 +15,7 @@ def health(request):
 
 urlpatterns = [
     path("api/health/", health, name="health"),
+    path("api/v1/", include("apps.etl_api.urls")),
     path("api/", include("apps.coins.urls")),
     path("api/", include("apps.engine.urls")),
     path("api/", include("apps.trading.urls")),

@@ -32,6 +32,7 @@ INSTALLED_APPS = [
     "apps.engine",
     "apps.trading",
     "apps.jobs",
+    "apps.etl_api",
 ]
 
 MIDDLEWARE = [
