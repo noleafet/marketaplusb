@@ -51,6 +51,9 @@ def parse_query(
 ) -> Query:
     """Parse and validate ``request.query_params`` (a DRF Request); unknown keys are ignored."""
     params = request.query_params
+    for name in params:
+        if any("\x00" in v for v in params.getlist(name)):
+            raise _invalid(f"'{name}' contains an invalid character.", name, "invalid")
     query = Query(page_size=min(DEFAULT_PAGE_SIZE, max_page_size))
 
     query.symbols = [s.strip().upper() for s in params.getlist("symbol") if s.strip()]

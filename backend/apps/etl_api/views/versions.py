@@ -26,6 +26,8 @@ class StrategyVersionListView(V1View):
 
 class StrategyVersionDetailView(V1View):
     def get(self, request, pk):
+        if "\x00" in pk:
+            raise NotFoundProblem("No such version.")
         try:
             v = StrategyVersion.objects.get(pk=pk)
         except StrategyVersion.DoesNotExist:
@@ -45,6 +47,8 @@ class ConfigVersionListView(V1View):
 
 class ConfigVersionDetailView(V1View):
     def get(self, request, pk):
+        if "\x00" in pk:
+            raise NotFoundProblem("No such version.")
         try:
             v = ConfigVersion.objects.get(pk=pk)
         except ConfigVersion.DoesNotExist:

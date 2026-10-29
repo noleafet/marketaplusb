@@ -58,7 +58,12 @@ class CandlesView(V1View):
         interval_ms = INTERVAL_MS[timeframe]
         interval = timedelta(milliseconds=interval_ms)
         # A candle is served only once fully closed by min(end, now - HOLD_BACK).
-        upper = min(query.end or now, now - HOLD_BACK) - interval
+        try:
+            upper = min(query.end or now, now - HOLD_BACK) - interval
+        except OverflowError:
+            raise InvalidParameter(
+                "'end' is out of range.", errors=[{"field": "end", "code": "out_of_range"}]
+            )
         lower = _lower(query)
 
         def fetch(after_key, after_id, limit):
@@ -88,9 +93,7 @@ class CandlesView(V1View):
 
 class FundingView(V1View):
     def get(self, request):
-        query = parse_query(
-            request, required=("symbol",), max_page_size=5000, max_window_days=MAX_WINDOW_DAYS
-        )
+        query = parse_query(request, required=("symbol",), max_window_days=MAX_WINDOW_DAYS)
         symbol = _single_symbol(query)
         now = timezone.now()
         _check_open_window(query, now)

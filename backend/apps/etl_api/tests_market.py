@@ -212,3 +212,25 @@ class VersionTests(MarketBase):
             self.api.get("/api/v1/config-versions/a/").json()["data"]["symbol"], "BTCUSDT"
         )
         self.assertEqual(self.api.get("/api/v1/config-versions/zz/").status_code, 404)
+
+
+class HardeningTests(MarketBase):
+    def test_candles_far_past_end_is_400(self):
+        r = self.api.get(CANDLES + "?symbol=BTCUSDT&timeframe=1h&end=0001-01-01T00:00:00Z")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()["errors"][0], {"field": "end", "code": "out_of_range"})
+
+    def test_funding_page_size_capped_at_1000(self):
+        self.assertEqual(self.api.get(FUNDING + "?symbol=BTCUSDT&page_size=1001").status_code, 400)
+        self.assertEqual(self.api.get(FUNDING + "?symbol=BTCUSDT&page_size=1000").status_code, 200)
+
+    def test_nul_in_params_is_400(self):
+        r = self.api.get(CANDLES + "?symbol=%00&timeframe=1h")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()["errors"][0], {"field": "symbol", "code": "invalid"})
+
+    def test_nul_in_version_pk_is_404(self):
+        for route in ("strategy-versions", "config-versions"):
+            r = self.api.get(f"/api/v1/{route}/%00/")
+            self.assertEqual(r.status_code, 404)
+            self.assertEqual(r["Content-Type"], "application/problem+json")
