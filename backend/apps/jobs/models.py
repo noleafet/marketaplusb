@@ -95,6 +95,13 @@ class JobRun(models.Model):
                 ),
                 name="one_active_exclusive_job",
             ),
+            # No job may be queued twice: the same type with identical params
+            # waiting side by side would only run the same work twice.
+            models.UniqueConstraint(
+                fields=["job_type", "params"],
+                condition=models.Q(status="queued"),
+                name="no_duplicate_queued_job",
+            ),
         ]
 
     def __str__(self) -> str:

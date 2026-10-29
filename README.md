@@ -119,6 +119,11 @@ analysis itself holds a Postgres advisory lock so runs started outside the queue
 either. A refused API request returns HTTP 409 with the blocking job's id; a scheduled slot that
 finds one active is skipped and logged. Running analyses are only reaped as abandoned after 6 hours.
 
+No job is ever queued twice: a second job with the same type and identical params is refused while
+the first is still waiting (HTTP 409, enforced by a partial unique index). A schedule whose previous
+job has not started yet skips its slot instead of stacking another, so a stopped worker never builds
+a backlog of identical ticks.
+
 All jobs can be triggered manually from the Jobs page or the API. Coin ingestion never deletes
 rows: coins that leave the top 100 are kept with `in_top100=False`.
 

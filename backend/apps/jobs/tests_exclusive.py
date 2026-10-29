@@ -15,6 +15,7 @@ from apps.engine.analysis import ANALYSIS_LOCK_KEY, AnalysisAlreadyRunning, run_
 from apps.engine.models import DecisionLog
 from apps.jobs.models import JobRun, JobSchedule
 from apps.jobs.runner import (
+    DuplicateJobQueued,
     JobAlreadyActive,
     enqueue_due_schedules,
     enqueue_job,
@@ -50,8 +51,9 @@ class ExclusiveEnqueueTests(TestCase):
 
     def test_other_job_types_are_not_exclusive(self):
         enqueue_job("daily_analysis")
-        enqueue_job("paper_tick")
-        enqueue_job("paper_tick")
+        # Distinct params, so these are not duplicates of each other either.
+        enqueue_job("paper_tick", params={"session_ids": ["a"]})
+        enqueue_job("paper_tick", params={"session_ids": ["b"]})
         self.assertEqual(JobRun.objects.filter(job_type="paper_tick").count(), 2)
 
     def test_database_constraint_rejects_a_direct_second_insert(self):
@@ -219,9 +221,111 @@ class AnalysisLockTests(TransactionTestCase):
                     run_daily_analysis(trigger="manual")
             inner.assert_not_called()
         finally:
+            # Unlock explicitly: the server frees a closed session's locks
+            # asynchronously, which made the next assertion race the close.
+            other.execute("SELECT pg_advisory_unlock(%s)", [ANALYSIS_LOCK_KEY])
             other.close()
 
-        # Once the other session is gone the lock is free again.
+        # Once the other session has released it the lock is free again.
         with patch("apps.engine.analysis._run_daily_analysis", return_value="ran") as inner:
             self.assertEqual(run_daily_analysis(trigger="manual"), "ran")
         inner.assert_called_once()
+
+
+class DuplicateQueuedJobTests(TestCase):
+    def test_identical_queued_job_is_refused(self):
+        first = enqueue_job("paper_tick", params={"session_ids": ["a"]})
+        with self.assertRaises(DuplicateJobQueued) as raised:
+            enqueue_job("paper_tick", params={"session_ids": ["a"]})
+        self.assertEqual(raised.exception.active.id, first.id)
+        self.assertIn("already queued", raised.exception.message)
+        self.assertEqual(JobRun.objects.filter(job_type="paper_tick").count(), 1)
+
+    def test_empty_and_missing_params_are_the_same_job(self):
+        enqueue_job("paper_evaluate")
+        with self.assertRaises(DuplicateJobQueued):
+            enqueue_job("paper_evaluate", params={})
+
+    def test_different_params_or_types_are_not_duplicates(self):
+        enqueue_job("paper_tick")
+        enqueue_job("paper_tick", params={"session_ids": ["a"]})
+        enqueue_job("paper_tick", params={"session_ids": ["b"]})
+        enqueue_job("paper_evaluate")
+        self.assertEqual(JobRun.objects.filter(status=JobRun.Status.QUEUED).count(), 4)
+
+    def test_a_running_job_does_not_block_the_next_queued_one(self):
+        running = enqueue_job("paper_tick")
+        running.status = JobRun.Status.RUNNING
+        running.save()
+        self.assertEqual(enqueue_job("paper_tick").status, JobRun.Status.QUEUED)
+        # ...but a second identical one behind it is still a duplicate.
+        with self.assertRaises(DuplicateJobQueued):
+            enqueue_job("paper_tick")
+
+    def test_database_constraint_rejects_a_direct_duplicate(self):
+        JobRun.objects.create(job_type="paper_tick", status=JobRun.Status.QUEUED, params={"x": 1})
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            JobRun.objects.create(
+                job_type="paper_tick", status=JobRun.Status.QUEUED, params={"x": 1}
+            )
+
+    def test_race_past_the_pre_check_is_still_refused(self):
+        first = enqueue_job("paper_tick")
+        with patch("apps.jobs.runner.queued_duplicate", side_effect=[None, first]):
+            with self.assertRaises(DuplicateJobQueued):
+                enqueue_job("paper_tick")
+        self.assertEqual(JobRun.objects.filter(job_type="paper_tick").count(), 1)
+
+    def test_scheduler_does_not_stack_ticks_while_no_worker_runs(self):
+        ensure_schedules()
+        JobSchedule.objects.exclude(slug="paper-tick").update(enabled=False)
+        now = timezone.now()
+        JobSchedule.objects.filter(slug="paper-tick").update(next_run_at=now - timedelta(minutes=1))
+        self.assertEqual(len(enqueue_due_schedules(now=now)), 1)
+
+        later = now + timedelta(minutes=10)
+        JobSchedule.objects.filter(slug="paper-tick").update(next_run_at=later - timedelta(minutes=1))
+        logs_before = DecisionLog.objects.count()
+        self.assertEqual(enqueue_due_schedules(now=later), [])
+        self.assertEqual(JobRun.objects.filter(job_type="paper_tick").count(), 1)
+        # Routine skips are not written to the decision log.
+        self.assertEqual(DecisionLog.objects.count(), logs_before)
+        self.assertGreater(JobSchedule.objects.get(slug="paper-tick").next_run_at, later)
+
+    def test_migration_cancels_existing_duplicates_keeping_the_oldest(self):
+        from importlib import import_module
+
+        from django.apps import apps as global_apps
+
+        migration = import_module("apps.jobs.migrations.0003_no_duplicate_queued_job")
+        with connection.cursor() as cursor:
+            cursor.execute("ALTER TABLE jobs_jobrun DROP CONSTRAINT IF EXISTS no_duplicate_queued_job")
+            cursor.execute("DROP INDEX IF EXISTS no_duplicate_queued_job")
+        oldest = JobRun.objects.create(job_type="paper_tick", status=JobRun.Status.QUEUED)
+        newer = JobRun.objects.create(
+            job_type="paper_tick",
+            status=JobRun.Status.QUEUED,
+            enqueued_at=oldest.enqueued_at + timedelta(seconds=1),
+        )
+        migration.cancel_queued_duplicates(global_apps, None)
+        oldest.refresh_from_db()
+        newer.refresh_from_db()
+        self.assertEqual(oldest.status, JobRun.Status.QUEUED)
+        self.assertEqual(newer.status, JobRun.Status.CANCELLED)
+
+
+@override_settings(ENGINE_API_TOKEN=TOKEN, ENGINE_ALLOW_PUBLIC_READS=True)
+class DuplicateQueuedApiTests(TestCase):
+    def test_paper_tick_endpoints_return_conflict_for_a_duplicate(self):
+        client = APIClient()
+        first = client.post(
+            "/api/jobs/runs/run/", {"job_type": "paper_tick"}, format="json",
+            HTTP_X_ENGINE_TOKEN=TOKEN,
+        )
+        self.assertEqual(first.status_code, 202)
+        second = client.post(
+            "/api/paper/sessions/tick/", {}, format="json", HTTP_X_ENGINE_TOKEN=TOKEN
+        )
+        self.assertEqual(second.status_code, 409, second.content)
+        self.assertEqual(second.json()["active_job_id"], first.json()["id"])
+        self.assertIn("already queued", second.json()["detail"])

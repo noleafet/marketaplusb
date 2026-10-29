@@ -57,6 +57,38 @@ class JobAlreadyActive(APIException):
         self.message = message
 
 
+class DuplicateJobQueued(JobAlreadyActive):
+    """The same job type with identical params is already waiting in the queue."""
+
+    default_code = "duplicate_job_queued"
+
+    def __init__(self, active: JobRun):
+        self.active = active
+        message = (
+            f"An identical {active.job_type.replace('_', ' ')} job is already queued "
+            f"({str(active.id)[:8]}); it will run when a worker is free."
+        )
+        APIException.__init__(
+            self,
+            {
+                "detail": message,
+                "active_job_id": str(active.id),
+                "active_job_status": active.status,
+            },
+        )
+        self.message = message
+
+
+def queued_duplicate(job_type: str, params: dict[str, Any]) -> JobRun | None:
+    """An already-queued job of the same type with identical params, if any."""
+
+    return (
+        JobRun.objects.filter(job_type=job_type, status=JobRun.Status.QUEUED, params=params)
+        .order_by("enqueued_at")
+        .first()
+    )
+
+
 def active_exclusive_job(job_type: str) -> JobRun | None:
     if job_type not in EXCLUSIVE_JOB_TYPES:
         return None
@@ -67,25 +99,38 @@ def active_exclusive_job(job_type: str) -> JobRun | None:
     )
 
 
-def _create_job(job_type: str, **fields: Any) -> JobRun:
-    """Create a job row, refusing a second active job of an exclusive type.
-
-    The pre-check gives a clear error in the common case; the partial unique
-    index ``one_active_exclusive_job`` closes the race between two requests
-    that both pass the pre-check.
-    """
-
+def _conflict(job_type: str, fields: dict[str, Any]) -> JobAlreadyActive | None:
     active = active_exclusive_job(job_type)
     if active is not None:
-        raise JobAlreadyActive(active)
+        return JobAlreadyActive(active)
+    if fields.get("status") == JobRun.Status.QUEUED:
+        duplicate = queued_duplicate(job_type, fields.get("params") or {})
+        if duplicate is not None:
+            return DuplicateJobQueued(duplicate)
+    return None
+
+
+def _create_job(job_type: str, **fields: Any) -> JobRun:
+    """Create a job row unless it would overlap or duplicate another.
+
+    Refuses a second active job of an exclusive type and a second queued job
+    with the same type and params. The pre-check gives a clear error in the
+    common case; the partial unique indexes ``one_active_exclusive_job`` and
+    ``no_duplicate_queued_job`` close the race between two requests that both
+    pass it.
+    """
+
+    conflict = _conflict(job_type, fields)
+    if conflict is not None:
+        raise conflict
     try:
         with transaction.atomic():
             return JobRun.objects.create(job_type=job_type, **fields)
     except IntegrityError:
-        active = active_exclusive_job(job_type)
-        if active is None:
+        conflict = _conflict(job_type, fields)
+        if conflict is None:
             raise
-        raise JobAlreadyActive(active) from None
+        raise conflict from None
 
 
 def enqueue_job(
@@ -158,6 +203,13 @@ def enqueue_due_schedules(now=None) -> list[JobRun]:
                     params=schedule.params,
                     schedule=schedule,
                 )
+            except DuplicateJobQueued as exc:
+                # The previous slot's job is still waiting (no free worker):
+                # don't stack another identical one behind it.
+                schedule.next_run_at = next_run_for(schedule, now)
+                schedule.save(update_fields=["next_run_at"])
+                logger.info("Skipped schedule %s: %s", schedule.slug, exc.message)
+                continue
             except JobAlreadyActive as exc:
                 # Skip this slot rather than queueing behind the active job;
                 # the next slot is computed as usual.
