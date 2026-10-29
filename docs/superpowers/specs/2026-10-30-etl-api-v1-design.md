@@ -101,8 +101,10 @@ Model `apps.etl_api.models.ApiClient`:
 
 ### 3.2 Rate limiting
 
-A DRF throttle keyed by `ApiClient.id`, limit = `rate_limit_per_min`, backed by
-the default Django cache. Every response carries `X-RateLimit-Limit`,
+A DRF throttle keyed by `ApiClient.id`, limit = `rate_limit_per_min`, counted
+in a fixed one-minute window stored in the database (`RateWindow`), so the limit
+holds across gunicorn workers. (The default Django cache is per-process
+LocMem in this project.) Every response carries `X-RateLimit-Limit`,
 `X-RateLimit-Remaining`, `X-RateLimit-Reset` (epoch seconds). When the limit is
 exceeded: 429 with `Retry-After`.
 
@@ -373,8 +375,8 @@ A data migration:
 
 ## 6. Documentation deliverables
 
-- OpenAPI 3 schema served at `/api/v1/meta/schema/` (DRF's built-in generator,
-  so no new dependency).
+- OpenAPI 3 schema served at `/api/v1/meta/schema/`, built from the v1 route
+  and field registry (no new dependency).
 - `docs/etl-api-v1.md`: authentication and key management, envelope,
   pagination and the watermark algorithm, error catalogue, every endpoint with
   its fields, and worked curl examples for (1) a historical backfill of
