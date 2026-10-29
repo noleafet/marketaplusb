@@ -10,6 +10,10 @@ from .base import V1View, envelope
 
 
 def _get_or_404(pk):
+    # Detail and folds-by-id are exempt from the 5 s hold-back: it protects
+    # incremental list watermarks only.
+    if pk > 2**63 - 1:
+        raise NotFoundProblem("No such backtest.")
     try:
         return CoinAnalysis.objects.select_related("analysis", "coin").get(pk=pk)
     except CoinAnalysis.DoesNotExist:

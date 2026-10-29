@@ -165,6 +165,27 @@ class BacktestTests(BacktestBase):
         CoinAnalysis.objects.filter(pk=ca.pk).update(created_at=timezone.now())
         self.assertEqual(self.api.get(LIST).json()["data"], [])
 
+    def test_huge_id_is_404(self):
+        for suffix in ("", "folds/"):
+            r = self.api.get(f"{LIST}{10**30}/{suffix}")
+            self.assertEqual(r.status_code, 404)
+            self.assertIn("problem+json", r["Content-Type"])
+
+    def test_odd_params_give_null_holdout(self):
+        from apps.etl_api.serializers import backtest_out
+
+        ca = self.make()
+        for params in (
+            {"config": "x"},
+            {"config": None},
+            {"config": {"holdout_days": float("nan")}},
+            {"config": {"holdout_days": 10**30}},
+        ):
+            ca.analysis.params = params
+            self.assertIsNone(backtest_out(ca)["holdout_start"], params)
+        ca.analysis.params = ["not", "a", "dict"]
+        self.assertIsNone(backtest_out(ca)["holdout_start"])
+
     def test_unknown_detail_is_404(self):
         self.assertEqual(self.api.get(f"{LIST}999999/").status_code, 404)
         self.assertEqual(self.api.get(f"{LIST}999999/folds/").status_code, 404)
@@ -187,6 +208,19 @@ class FoldTests(BacktestBase):
         self.assertEqual(
             DecisionLog.objects.filter(category="etl_api", severity="warning").count(), 1
         )
+
+    def test_non_string_timestamps_drop_fold(self):
+        ca = self.make(
+            folds=[
+                GOOD_FOLD,
+                {**GOOD_FOLD, "fold": 5, "train_start": 123},
+                {**GOOD_FOLD, "fold": 6, "test_end": None},
+                "junk",
+            ]
+        )
+        r = self.api.get(f"{LIST}{ca.pk}/folds/")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual([f["fold"] for f in r.json()["data"]], [0])
 
     def test_no_warning_when_all_folds_valid(self):
         ca = self.make(folds=[GOOD_FOLD])

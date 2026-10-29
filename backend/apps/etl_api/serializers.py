@@ -91,13 +91,14 @@ def metrics_block(raw: dict | None) -> dict:
 
 def backtest_out(ca) -> dict:
     run = ca.analysis
-    params = run.params or {}
-    holdout_days = (params.get("config") or {}).get("holdout_days")
+    params = run.params if isinstance(run.params, dict) else {}
+    config = params.get("config")
+    holdout_days = config.get("holdout_days") if isinstance(config, dict) else None
     holdout_start = None
     if ca.data_end is not None and isinstance(holdout_days, (int, float)):
         try:
             holdout_start = iso(ca.data_end - timedelta(days=holdout_days))
-        except OverflowError:
+        except (OverflowError, ValueError, TypeError):
             holdout_start = None
     return {
         "id": ca.pk,
@@ -133,12 +134,12 @@ def fold_out(fold) -> dict | None:
 
     if not isinstance(fold, dict):
         return None
+    keys = ("train_start", "train_end", "test_start", "test_end")
+    if not all(isinstance(fold.get(k), str) for k in keys):
+        return None
     try:
-        ts = {
-            k: parse_datetime(fold[k], k)
-            for k in ("train_start", "train_end", "test_start", "test_end")
-        }
-    except (KeyError, TypeError, ValueError, InvalidParameter):
+        ts = {k: parse_datetime(fold[k], k) for k in keys}
+    except (KeyError, TypeError, ValueError, AttributeError, InvalidParameter):
         return None
     if ts["test_start"] < ts["train_end"]:
         return None
