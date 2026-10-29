@@ -15,11 +15,24 @@ import type {
   PaperFill,
   PaperSession,
   Report,
+  StrategySettings,
+  StrategySettingsValues,
+  StrategyValidation,
   TradingMode,
   TradingModeResponse
 } from './types';
 
 const BASE = '/api/engine';
+
+/** DRF validation errors arrive as { field: [messages] }. */
+function fieldErrors(payload: Record<string, unknown>): string {
+  return Object.entries(payload)
+    .map(([field, messages]) => {
+      const text = Array.isArray(messages) ? messages.join(' ') : String(messages);
+      return `${field.replace(/_/g, ' ')}: ${text}`;
+    })
+    .join(' · ');
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${BASE}/${path}`, {
@@ -46,7 +59,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
         ? String((payload as { detail: unknown }).detail)
         : typeof payload === 'string'
           ? payload
-          : `Request failed (${response.status})`;
+          : payload && typeof payload === 'object'
+            ? fieldErrors(payload as Record<string, unknown>) ||
+              `Request failed (${response.status})`
+            : `Request failed (${response.status})`;
     throw new Error(detail);
   }
   return payload as T;
@@ -140,6 +156,10 @@ export const engineApi = {
 
   live: () => request<LiveOverview>('live/status/'),
   tradingMode: () => request<TradingModeResponse>('live/status/mode/'),
+  strategySettings: () => request<StrategySettings>('strategy/settings/'),
+  setStrategySettings: (body: Partial<StrategySettingsValues> & { rerun_analysis?: boolean }) =>
+    post<StrategySettings>('strategy/settings/', body),
+  strategyValidation: () => request<StrategyValidation>('strategy/validation/'),
   setTradingMode: (body: { mode: TradingMode; adx_enabled?: boolean; confirm?: boolean }) =>
     post<TradingModeResponse>('live/status/mode/', body),
   requestApproval: (body: { paper_session: string; notes?: string; risk_acknowledged: boolean }) =>

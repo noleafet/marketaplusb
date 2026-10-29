@@ -10,7 +10,14 @@ from typing import Any
 
 import numpy as np
 
-from apps.engine.grid import GridParams, SimulationConfig, simulate_grid
+from apps.engine.grid import (
+    GridParams,
+    PreparedMarket,
+    SimulationConfig,
+    SimulationResult,
+    prepare_market,
+    simulate_grid,
+)
 from apps.engine.hybrid_gate import Gate
 from apps.engine.robustness import classify_regime, regime_summary
 
@@ -22,6 +29,8 @@ MIN_TEST_DAYS = 30
 STOP_ATR_MULTIPLES = (1.5, 2.5)
 TP_ATR_MULTIPLES = (1.5, 3.0)
 REBALANCE_MODES = ("fixed", "adaptive")
+DEFAULT_TRADE_THROUGH_BPS = 2.0
+MIN_HOLDOUT_DAYS = 14
 ADAPTIVE_KEYS = ("stop_atr_multiple", "tp_atr_multiple")
 
 
@@ -37,6 +46,10 @@ class WalkForwardResult:
     data_end: datetime | None
     error: str = ""
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    # Untouched final window evaluated once with the deployed parameters.
+    holdout_metrics: dict[str, Any] = field(default_factory=dict)
+    # Daily strategy returns (OOS folds + holdout) for strategy correlation.
+    strategy_returns: dict[str, float] = field(default_factory=dict)
 
 
 def parameter_grid(base: GridParams) -> list[GridParams]:
@@ -143,6 +156,42 @@ def _sensitivity_variants(params: GridParams) -> list[tuple[str, GridParams]]:
     return variants
 
 
+def _alternate_fill_config(config: SimulationConfig) -> tuple[str, SimulationConfig]:
+    """The other fill model, so every result shows how much it depends on fills."""
+
+    if config.trade_through_bps > 0:
+        return "touch", replace(config, trade_through_bps=0.0)
+    return "trade_through", replace(config, trade_through_bps=DEFAULT_TRADE_THROUGH_BPS)
+
+
+def daily_strategy_returns(
+    daily_equity: dict[str, float],
+    starting_equity: float,
+    end: datetime | None = None,
+) -> dict[str, float]:
+    """Day-over-day returns of one simulation's equity, keyed by ISO date.
+
+    A stopped simulation is flat afterwards, so the days up to ``end`` are
+    filled with zero returns instead of being dropped; dropping them would
+    make a stopped strategy look correlated only with its losing days.
+    """
+
+    returns: dict[str, float] = {}
+    previous = starting_equity
+    days = sorted(daily_equity)
+    for day in days:
+        value = float(daily_equity[day])
+        if previous > 0:
+            returns[day] = value / previous - 1.0
+        previous = value
+    if days and end is not None:
+        cursor = datetime.fromisoformat(days[-1]).date() + timedelta(days=1)
+        while cursor <= end.date():
+            returns[cursor.isoformat()] = 0.0
+            cursor += timedelta(days=1)
+    return returns
+
+
 def _fold_metrics_subset(metrics: dict[str, Any]) -> dict[str, Any]:
     keys = [
         "net_return",
@@ -150,6 +199,8 @@ def _fold_metrics_subset(metrics: dict[str, Any]) -> dict[str, Any]:
         "calmar",
         "sharpe",
         "profit_factor",
+        "gross_profit",
+        "gross_loss",
         "win_rate",
         "trades",
         "closed_lots",
@@ -242,14 +293,32 @@ def run_walk_forward(
     cost_stress_multiplier: float = 2.0,
     sensitivity: bool = True,
     gate: Gate | None = None,
+    holdout_days: int = 0,
 ) -> WalkForwardResult:
     if len(rows) < 200:
         return WalkForwardResult(
             {}, {}, [], {}, {}, [], None, None, error="insufficient candle history"
         )
 
-    rows = sorted(rows, key=lambda r: r["time"])
-    data_start = rows[0]["time"]
+    all_rows = sorted(rows, key=lambda r: r["time"])
+    data_start = all_rows[0]["time"]
+    full_end = all_rows[-1]["time"]
+    # The final ``holdout_days`` are never seen by parameter search, fold
+    # scoring, or ranking. They are simulated once, with the parameters that
+    # would be deployed, after everything else is fixed.
+    holdout_start: datetime | None = None
+    if holdout_days >= MIN_HOLDOUT_DAYS:
+        candidate = full_end - timedelta(days=holdout_days)
+        if (candidate - data_start).days >= 90 + 32:
+            holdout_start = candidate
+    rows = (
+        [row for row in all_rows if row["time"] < holdout_start]
+        if holdout_start is not None
+        else all_rows
+    )
+    prepared = prepare_market(
+        all_rows, funding_rows, base_params, config.bars_per_day
+    )
     data_end = rows[-1]["time"]
     analysis_start = max(data_start, data_end - timedelta(days=lookback_days))
     # Reserve warmup space for the largest range lookback in the grid.
@@ -281,6 +350,24 @@ def run_walk_forward(
         )
 
     params_candidates = parameter_grid(base_params)
+    alt_fill_name, alt_fill_config = _alternate_fill_config(config)
+
+    def run(
+        sim_rows: list[dict[str, Any]],
+        start: datetime,
+        candidate: GridParams,
+        sim_config: SimulationConfig = config,
+    ) -> SimulationResult:
+        return simulate_grid(
+            sim_rows,
+            funding_rows,
+            start,
+            candidate,
+            sim_config,
+            gate=gate,
+            prepared=prepared,
+        )
+
     completed: list[tuple[dict[str, Any], dict[str, Any]]] = []
     folds_out: list[dict[str, Any]] = []
     selected_param_dicts: list[dict[str, Any]] = []
@@ -293,9 +380,7 @@ def run_walk_forward(
         best_train_metrics: dict[str, Any] = {}
         best_objective = -1e9
         for candidate in params_candidates:
-            result = simulate_grid(
-                train_rows, funding_rows, train_start, candidate, config, gate=gate
-            )
+            result = run(train_rows, train_start, candidate)
             if result.error:
                 continue
             objective = _train_objective(result.metrics, min_trades)
@@ -307,9 +392,7 @@ def run_walk_forward(
             continue
 
         test_rows = _slice_until(rows, test_end)
-        test_result = simulate_grid(
-            test_rows, funding_rows, test_start, best_params, config, gate=gate
-        )
+        test_result = run(test_rows, test_start, best_params)
         if test_result.error:
             continue
 
@@ -317,14 +400,13 @@ def run_walk_forward(
             row for row in rows if test_start <= row["time"] <= test_end
         ]
         regime = classify_regime(test_window, interval=config.interval)
-        stress_result = simulate_grid(
+        stress_result = run(
             test_rows,
-            funding_rows,
             test_start,
             best_params,
             _stressed_config(config, cost_stress_multiplier),
-            gate=gate,
         )
+        alt_fill_result = run(test_rows, test_start, best_params, alt_fill_config)
         stress = (
             {
                 "net_return": stress_result.metrics.get("net_return"),
@@ -338,9 +420,7 @@ def run_walk_forward(
         sensitivity_runs: list[dict[str, Any]] = []
         if sensitivity:
             for label, variant in _sensitivity_variants(best_params):
-                variant_result = simulate_grid(
-                    test_rows, funding_rows, test_start, variant, config, gate=gate
-                )
+                variant_result = run(test_rows, test_start, variant)
                 if variant_result.error:
                     continue
                 sensitivity_runs.append(
@@ -363,6 +443,7 @@ def run_walk_forward(
                     "equity_curve": test_result.equity_curve,
                     "trades": test_result.trades,
                     "grid_levels": test_result.grid_levels,
+                    "daily_equity": test_result.daily_equity,
                 },
             )
         )
@@ -382,6 +463,14 @@ def run_walk_forward(
                 "test_metrics": _fold_metrics_subset(test_result.metrics),
                 "regime": regime,
                 "stress": stress,
+                "alt_fill": {
+                    "model": alt_fill_name,
+                    "net_return": (
+                        round(float(alt_fill_result.metrics.get("net_return") or 0.0), 6)
+                        if not alt_fill_result.error
+                        else None
+                    ),
+                },
                 "sensitivity": sensitivity_runs,
             }
         )
@@ -491,6 +580,22 @@ def run_walk_forward(
     )
     cycle_completion_ratio = closed_lots / max(1, buy_fills)
     regime_analysis = regime_summary(folds_out)
+    # Profit factor across all OOS trades. Averaging per-fold ratios lets a
+    # single loss-free fold (capped at 99) dominate the result.
+    gross_profit = sum(float(f["test_metrics"].get("gross_profit") or 0.0) for f in folds_out)
+    gross_loss = sum(float(f["test_metrics"].get("gross_loss") or 0.0) for f in folds_out)
+    if gross_loss > 1e-9:
+        aggregate_pf = gross_profit / gross_loss
+    else:
+        aggregate_pf = 99.0 if gross_profit > 0 else 0.0
+    alt_returns = [
+        float(f["alt_fill"]["net_return"])
+        for f in folds_out
+        if (f.get("alt_fill") or {}).get("net_return") is not None
+    ]
+    alt_combined = (
+        float(np.prod([1.0 + value for value in alt_returns]) - 1.0) if alt_returns else None
+    )
 
     eq = np.array([point["equity"] for point in curve], dtype=float)
     if eq.size > 2:
@@ -513,8 +618,10 @@ def run_walk_forward(
     calmar = annual_return / max_dd if max_dd > 1e-6 else 0.0
 
     param_counter = Counter(tuple(sorted(p.items())) for p in selected_param_dicts)
-    mode_key, mode_count = param_counter.most_common(1)[0]
-    recommended = dict(mode_key)
+    _, mode_count = param_counter.most_common(1)[0]
+    # Deploy the parameters chosen on the most recent training window. The
+    # modal set breaks ties by insertion order, which picked the oldest fold.
+    recommended = dict(selected_param_dicts[-1])
     parameter_stability = mode_count / len(selected_param_dicts)
 
     # Explicit record of how the adaptive stop / take-profit distances were
@@ -547,12 +654,9 @@ def run_walk_forward(
         "calmar": round(calmar, 4),
         "sharpe": round(sharpe, 4),
         "sortino": round(sortino, 4),
-        "profit_factor": round(
-            float(
-                np.mean([f["test_metrics"].get("profit_factor") or 0.0 for f in folds_out])
-            ),
-            4,
-        ),
+        "profit_factor": round(aggregate_pf, 4),
+        "gross_profit": round(gross_profit, 6),
+        "gross_loss": round(gross_loss, 6),
         "win_rate": round(
             float(np.mean([f["test_metrics"].get("win_rate") or 0.0 for f in folds_out])),
             6,
@@ -615,6 +719,12 @@ def run_walk_forward(
         "cost_stress_profitable": stress_profitable,
         "cost_stress_delta": round(stress_combined - combined_return, 6),
         "cost_stress_ratio": round(stress_ratio, 4) if stress_ratio is not None else None,
+        "fill_model": "trade_through" if config.trade_through_bps > 0 else "touch",
+        "alt_fill_model": alt_fill_name,
+        "alt_fill_return": round(alt_combined, 6) if alt_combined is not None else None,
+        "fill_model_delta": (
+            round(alt_combined - combined_return, 6) if alt_combined is not None else None
+        ),
         "parameter_sensitivity": parameter_sensitivity,
         "sensitivity_mean_return": sensitivity_mean,
         "sensitivity_worst_return": sensitivity_worst,
@@ -723,6 +833,65 @@ def run_walk_forward(
             "fold_return_std": round(fold_return_std, 6),
         },
     }
+    strategy_returns: dict[str, float] = {}
+    for fold, result in completed:
+        fold_end = next(
+            (
+                datetime.fromisoformat(item["test_end"])
+                for item in folds_out
+                if item["fold"] == fold["fold"]
+            ),
+            None,
+        )
+        strategy_returns.update(
+            daily_strategy_returns(
+                result.get("daily_equity") or {}, config.capital, fold_end
+            )
+        )
+
+    holdout_metrics: dict[str, Any] = {}
+    if holdout_start is not None:
+        deployed = GridParams.from_dict(recommended)
+        holdout_result = simulate_grid(
+            all_rows,
+            funding_rows,
+            holdout_start,
+            deployed,
+            config,
+            gate=gate,
+            prepared=prepared,
+        )
+        if not holdout_result.error:
+            alt_holdout = simulate_grid(
+                all_rows,
+                funding_rows,
+                holdout_start,
+                deployed,
+                alt_fill_config,
+                gate=gate,
+                prepared=prepared,
+            )
+            holdout_metrics = {
+                **_fold_metrics_subset(holdout_result.metrics),
+                "start": holdout_start.isoformat(),
+                "end": full_end.isoformat(),
+                "days": round((full_end - holdout_start).total_seconds() / 86400.0, 1),
+                "alt_fill_model": alt_fill_name,
+                "alt_fill_return": (
+                    round(float(alt_holdout.metrics.get("net_return") or 0.0), 6)
+                    if not alt_holdout.error
+                    else None
+                ),
+                "params": recommended,
+            }
+            strategy_returns.update(
+                daily_strategy_returns(holdout_result.daily_equity, config.capital, full_end)
+            )
+    oos_metrics["holdout_return"] = holdout_metrics.get("net_return")
+    oos_metrics["holdout_max_drawdown"] = holdout_metrics.get("max_drawdown")
+    oos_metrics["holdout_days"] = holdout_metrics.get("days")
+    diagnostics["holdout"] = holdout_metrics
+
     return WalkForwardResult(
         oos_metrics=oos_metrics,
         in_sample_metrics=in_sample_metrics,
@@ -733,4 +902,16 @@ def run_walk_forward(
         data_start=data_start,
         data_end=data_end,
         diagnostics=diagnostics,
+        holdout_metrics=holdout_metrics,
+        strategy_returns=strategy_returns,
     )
+
+
+def walk_forward_job(kwargs: dict[str, Any]) -> WalkForwardResult:
+    """Process-pool entry point.
+
+    Lives here, not in ``analysis``, because worker processes import the
+    function's module: this one is pure numpy and needs no Django setup.
+    """
+
+    return run_walk_forward(**kwargs)

@@ -25,6 +25,7 @@ from apps.trading.models import (
     PaperEvaluation,
     PaperFill,
     PaperSession,
+    StrategySettings,
 )
 from apps.trading.paper import (
     _apply_overbought_guard,
@@ -531,6 +532,10 @@ class OverboughtGuardExecutionTests(TestCase):
             rsi_prev=34.0,
             oi_values=[100.0, 100.0, 100.0, 100.0, 101.0],
         )
+        # The guard is off by default until a backtest supports it.
+        guard = StrategySettings.load()
+        guard.overbought_guard_enabled = True
+        guard.save()
 
         summary = run_risk_guard()
 
@@ -652,7 +657,10 @@ class AdaptiveStrategyTests(TestCase):
                 "momentum": -0.01,
             }
         )
-        strategy.orders = {0: {"side": "buy", "qty": 1.0}}
+        # Arm the ladder first so the audit plan holds active buy rungs.
+        strategy.allow_buys = True
+        strategy._rebuild_orders(100.0)
+        self.assertTrue(any(o["side"] == "buy" for o in strategy.orders.values()))
 
         strategy.process_bar(make_bar(109.0, 109.0, 109.0, 109.0))
 
@@ -733,6 +741,8 @@ class AdaptiveStrategyTests(TestCase):
                 "ctx_range_high": 110.0,
                 "trend_up": False,
                 "momentum": -0.01,
+                # Gates read the last completed close, as the backtest does.
+                "prev_close": 109.0,
             }
         )
         now = datetime(2025, 6, 1, tzinfo=dt_timezone.utc)

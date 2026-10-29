@@ -178,6 +178,25 @@ def load_equity_points(session_id: str, limit: int = 5000) -> list[dict[str, Any
         return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 
+def load_daily_equity(session_id: str, days: int = 120) -> dict[str, float]:
+    """Last equity point of each UTC day for one paper session."""
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT DISTINCT ON (day) day, equity
+            FROM (
+                SELECT (time AT TIME ZONE 'UTC')::date AS day, time, equity
+                FROM paper_equity_points
+                WHERE session_id = %s AND time >= NOW() - (%s || ' days')::interval
+            ) AS recent
+            ORDER BY day, time DESC
+            """,
+            [str(session_id), int(days)],
+        )
+        return {row[0].isoformat(): float(row[1]) for row in cursor.fetchall()}
+
+
 def expected_bars(interval: str, start: datetime, end: datetime) -> int:
     step = INTERVAL_MS[interval] / 1000
     return max(0, int((end - start).total_seconds() // step))

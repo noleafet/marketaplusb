@@ -197,6 +197,11 @@ def _pair_correlation(
         return None
     x = np.array([left[day] for day in dates], dtype=float)
     y = np.array([right[day] for day in dates], dtype=float)
+    # Strategy returns are exactly zero while a grid is flat (after a stop or
+    # a take-profit). Two mostly-flat series correlate near 1.0 on a handful of
+    # shared days, so require enough days on which both were actually trading.
+    if int(np.count_nonzero((x != 0.0) & (y != 0.0))) < 10:
+        return None
     if np.std(x, ddof=1) <= 1e-12 or np.std(y, ddof=1) <= 1e-12:
         return None
     return float(np.corrcoef(x, y)[0, 1])
@@ -207,34 +212,40 @@ def correlation_diagnostics(
     *,
     lookback_days: int = 60,
     max_corr: float = 0.85,
+    returns_key: str = "_daily_returns",
+    store_key: str = "_correlation",
+    eligible_only: bool = True,
 ) -> dict[str, Any]:
     """Attach rolling-return correlation diagnostics to each result.
 
-    Correlations use daily closes aligned on common dates. Only eligible coins
-    contribute, so an ineligible coin cannot change the ranking penalty.
+    ``returns_key`` selects the series: ``_daily_returns`` (coin prices) or
+    ``_strategy_returns`` (the grid's own daily OOS returns). Strategy returns
+    are what the book actually holds, so they drive diversification; price
+    correlation is kept for reference. Only eligible coins contribute, so an
+    ineligible coin cannot change the ranking penalty.
     """
 
     pool = [
         item
         for item in results
-        if item.get("eligible", True) and item.get("_daily_returns")
+        if (item.get("eligible", True) or not eligible_only) and item.get(returns_key)
     ]
     for item in results:
-        item["_correlation"] = {}
+        item[store_key] = {}
     pairs: list[dict[str, Any]] = []
     for index, left in enumerate(pool):
-        left_returns = left["_daily_returns"]
+        left_returns = left[returns_key]
         peers: dict[str, float] = {}
         for right in pool[index + 1 :]:
             corr = _pair_correlation(
-                left_returns, right["_daily_returns"], lookback_days
+                left_returns, right[returns_key], lookback_days
             )
             if corr is None:
                 continue
             left_symbol = left["coin"].symbol
             right_symbol = right["coin"].symbol
             peers[right_symbol] = corr
-            right["_correlation"].setdefault("peer_map", {})[left_symbol] = corr
+            right[store_key].setdefault("peer_map", {})[left_symbol] = corr
             pairs.append(
                 {
                     "a": left_symbol,
@@ -243,13 +254,13 @@ def correlation_diagnostics(
                 }
             )
         if peers:
-            left["_correlation"]["peer_map"] = peers
+            left[store_key].setdefault("peer_map", {}).update(peers)
 
     for item in pool:
-        peer_map = item["_correlation"].get("peer_map") or {}
+        peer_map = item[store_key].get("peer_map") or {}
         values = list(peer_map.values())
         top = sorted(peer_map.items(), key=lambda pair: pair[1], reverse=True)[:5]
-        item["_correlation"].update(
+        item[store_key].update(
             {
                 "avg_correlation": (
                     round(float(np.mean(values)), 4) if values else None
@@ -265,11 +276,12 @@ def correlation_diagnostics(
 
     pairs.sort(key=lambda pair: pair["correlation"], reverse=True)
     averages = [
-        item["_correlation"]["avg_correlation"]
+        item[store_key]["avg_correlation"]
         for item in pool
-        if item["_correlation"].get("avg_correlation") is not None
+        if item[store_key].get("avg_correlation") is not None
     ]
     return {
+        "basis": "strategy" if returns_key == "_strategy_returns" else "price",
         "coins": len(pool),
         "lookback_days": lookback_days,
         "threshold": max_corr,
@@ -302,22 +314,58 @@ def correlation_penalty(item: dict[str, Any], *, max_corr: float) -> tuple[float
     return round(points, 2), f"high correlation (peak {peak:.2f}, avg {avg or 0:.2f})"
 
 
+def market_exposure(
+    strategy_returns: dict[str, float],
+    market_returns: dict[str, float],
+    lookback: int = 365,
+) -> dict[str, Any]:
+    """Correlation and beta of a strategy's daily returns to a market series.
+
+    A long-only grid is structurally long the coin, so a high beta means the
+    "grid edge" is mostly market direction rather than range harvesting.
+    """
+
+    dates = sorted(set(strategy_returns) & set(market_returns))[-lookback:]
+    if len(dates) < 20:
+        return {"days": len(dates), "correlation": None, "beta": None}
+    x = np.array([market_returns[day] for day in dates], dtype=float)
+    y = np.array([strategy_returns[day] for day in dates], dtype=float)
+    var_x = float(np.var(x, ddof=1))
+    if var_x <= 1e-18 or float(np.std(y, ddof=1)) <= 1e-12:
+        return {"days": len(dates), "correlation": None, "beta": None}
+    cov = float(np.cov(x, y, ddof=1)[0, 1])
+    return {
+        "days": len(dates),
+        "correlation": round(float(np.corrcoef(x, y)[0, 1]), 4),
+        "beta": round(cov / var_x, 4),
+    }
+
+
 def select_diversified(
-    items: list[dict[str, Any]], *, max_corr: float, limit: int
+    items: list[dict[str, Any]],
+    *,
+    max_corr: float,
+    limit: int,
+    existing: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Greedy selection that refuses a coin highly correlated with one already picked."""
+    """Greedy selection that refuses a coin highly correlated with one already held.
+
+    ``existing`` lists symbols the book already trades; a candidate that is too
+    correlated with any of them is skipped as well.
+    """
 
     selected: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    held = [symbol for symbol in (existing or [])]
     for item in items:
         if len(selected) >= limit:
             break
         peers = (item.get("_correlation") or {}).get("peer_map") or {}
         conflict = next(
             (
-                existing["coin"].symbol
-                for existing in selected
-                if peers.get(existing["coin"].symbol, 0.0) >= max_corr
+                symbol
+                for symbol in held + [chosen["coin"].symbol for chosen in selected]
+                if peers.get(symbol, 0.0) >= max_corr
             ),
             None,
         )

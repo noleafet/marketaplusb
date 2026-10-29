@@ -39,6 +39,7 @@ class ExecutionAdapter(Protocol):
     position_qty: float
     avg_entry: float
     capital: float
+    peak_equity: float
 
     def equity(self, price: float) -> float: ...
     def max_buy_qty(self, price: float) -> float: ...
@@ -69,7 +70,14 @@ class PaperExecutionAdapter:
         self.fees_paid = float(session.fees_paid)
         self.funding_paid = float(session.funding_paid)
         self.mark_price = float(session.mark_price or 0.0)
+        # Buy fees and funding carried by open inventory; released pro rata
+        # on each sell so win/loss counts reconcile with net PnL.
+        self.carry_cost = float(getattr(session, "carry_cost", 0.0) or 0.0)
         self.fills: list[Fill] = []
+
+    @property
+    def peak_equity(self) -> float:
+        return float(self.session.peak_equity or self.capital)
 
     def equity(self, price: float) -> float:
         unreal = (price - self.avg_entry) * self.position_qty if self.position_qty > 0 else 0.0
@@ -112,6 +120,7 @@ class PaperExecutionAdapter:
         )
         self.position_qty = new_qty
         self.fees_paid += fee
+        self.carry_cost += fee
         fill = Fill(
             time=time,
             side="buy",
@@ -145,12 +154,16 @@ class PaperExecutionAdapter:
         )
         fee = notional * fee_rate
         pnl = (fill_price - self.avg_entry) * qty
+        share = qty / self.position_qty if self.position_qty > 1e-12 else 1.0
+        carried = self.carry_cost * min(1.0, share)
+        self.carry_cost -= carried
         self.realized_pnl += pnl
         self.fees_paid += fee
         self.position_qty -= qty
         if self.position_qty <= 1e-12:
             self.position_qty = 0.0
             self.avg_entry = 0.0
+            self.carry_cost = 0.0
         fill = Fill(
             time=time,
             side="sell",
@@ -163,7 +176,7 @@ class PaperExecutionAdapter:
             reason=reason,
         )
         self.fills.append(fill)
-        if pnl - fee >= 0:
+        if pnl - fee - carried >= 0:
             self.session.wins += 1
         else:
             self.session.losses += 1
@@ -180,6 +193,7 @@ class PaperExecutionAdapter:
             return 0.0
         cost = self.position_qty * mark_price * rate
         self.funding_paid += cost
+        self.carry_cost += cost
         self._sync()
         return cost
 
@@ -200,6 +214,7 @@ class PaperExecutionAdapter:
         self.session.realized_pnl = self.realized_pnl
 
     def _sync(self) -> None:
+        self.session.carry_cost = self.carry_cost
         self.session.position_qty = self.position_qty
         self.session.avg_entry = self.avg_entry
         self.session.realized_pnl = self.realized_pnl
@@ -207,6 +222,7 @@ class PaperExecutionAdapter:
         self.session.funding_paid = self.funding_paid
 
     def flush(self) -> None:
+        self.session.carry_cost = self.carry_cost
         self.session.position_qty = self.position_qty
         self.session.avg_entry = self.avg_entry
         self.session.realized_pnl = self.realized_pnl
@@ -344,9 +360,8 @@ class LiveExecutionAdapter:
         return payload
 
     def cancel_order(self, symbol: str, order_id: int) -> dict[str, Any]:
-        state = LiveTradingState.load()
-        if state.kill_switch:
-            raise LiveGateError(f"Kill switch engaged: {state.kill_reason}")
+        # Cancels only reduce risk, so they stay available while the kill
+        # switch is engaged; blocking them would strand resting orders.
         return self.client.signed(
             "DELETE", "/fapi/v1/order", {"symbol": symbol, "orderId": order_id}
         )

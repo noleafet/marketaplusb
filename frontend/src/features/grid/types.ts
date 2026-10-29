@@ -440,3 +440,157 @@ export interface LiveOverview {
   audits: LiveOrderAudit[];
   note: string;
 }
+
+export type SignalInterval = '1h' | '4h';
+export type FillModel = 'trade_through' | 'touch';
+
+export interface BookState {
+  day?: string;
+  halted?: boolean;
+  halted_at?: string | null;
+  updated_at?: string;
+  sessions?: number;
+  equity?: number;
+  notional?: number;
+  exposure?: number;
+  pnl_today?: number;
+  loss_today_pct?: number;
+}
+
+export interface StrategySettingsValues {
+  signal_interval: SignalInterval;
+  fill_model: FillModel;
+  trade_through_bps: number;
+  overbought_guard_enabled: boolean;
+  holdout_days: number;
+  book_capital: number;
+  max_sessions: number;
+  max_book_exposure: number;
+  daily_loss_limit_pct: number;
+  retire_after_failed_runs: number;
+  max_strategy_correlation: number;
+}
+
+export interface StrategySettings extends StrategySettingsValues {
+  session_capital: number;
+  effective_trade_through_bps: number;
+  book_state: BookState;
+  updated_at: string;
+  latest_analysis?: { id: string | null; interval: string | null; started_at: string | null };
+  analysis_stale?: boolean;
+  job?: JobRun;
+}
+
+export interface InformationCoefficient {
+  n: number;
+  ic: number | null;
+  t_stat: number | null;
+  significant: boolean;
+}
+
+export interface PooledIc {
+  runs: number;
+  mean_ic: number | null;
+  t_stat: number | null;
+  positive_share?: number;
+}
+
+export interface CorrelationPair {
+  a: string;
+  b: string;
+  correlation: number;
+}
+
+export interface ValidationFinding {
+  kind: 'strength' | 'weakness';
+  code: string;
+  title: string;
+  detail: string;
+}
+
+export interface PaperDriftRow {
+  symbol: string;
+  status: string;
+  days: number;
+  capital: number;
+  equity: number;
+  net_return: number;
+  exposure: number;
+  expected_daily: number | null;
+  actual_daily: number | null;
+  failed_runs: number;
+}
+
+export interface StrategyValidation {
+  analysis: {
+    id: string;
+    started_at: string;
+    interval: string | null;
+    fill_model: string | null;
+    holdout_days: number | null;
+    universe: number | null;
+    eligible: number | null;
+    paper_retired: string[];
+    paper_skipped_correlation: Array<{
+      symbol: string;
+      correlated_with: string;
+      correlation: number;
+    }>;
+  } | null;
+  score_validation: {
+    coins: number;
+    score: InformationCoefficient;
+    oos_return: InformationCoefficient;
+    factors: Record<string, InformationCoefficient>;
+    eligible_holdout_mean: number | null;
+    ineligible_holdout_mean: number | null;
+    eligible_holdout_positive: number | null;
+    top_tercile_holdout_mean: number | null;
+    bottom_tercile_holdout_mean: number | null;
+  } | null;
+  strategy_validation: {
+    eligible: number;
+    scope?: 'eligible' | 'universe';
+    coins?: number;
+    strategy_correlation: {
+      avg_pair: number | null;
+      max_pair: number | null;
+      threshold: number | null;
+      high_pairs: CorrelationPair[];
+      lookback_days: number | null;
+    };
+    price_correlation: { avg_pair: number | null; max_pair: number | null };
+    btc_beta_mean: number | null;
+    btc_correlation_mean: number | null;
+    oos_annualized_mean: number | null;
+    holdout_annualized_mean: number | null;
+    fill_model_delta_mean: number | null;
+    cost_stress_pass_rate: number | null;
+  } | null;
+  findings: ValidationFinding[];
+  pooled_ic: Record<string, PooledIc>;
+  ic_history: Array<{
+    analysis: string;
+    started_at: string;
+    ic: number | null;
+    coins: number | null;
+  }>;
+  backtest_correlation: {
+    basis?: string;
+    avg_pair_correlation: number | null;
+    max_pair_correlation: number | null;
+    threshold: number | null;
+    pairs: CorrelationPair[] | null;
+    lookback_days: number | null;
+  };
+  paper_correlation: {
+    symbols: string[];
+    pairs: CorrelationPair[];
+    avg_pair: number | null;
+    max_pair: number | null;
+    days: number;
+  };
+  paper_drift: PaperDriftRow[];
+  book: BookState;
+  settings: StrategySettings;
+}

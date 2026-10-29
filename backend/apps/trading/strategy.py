@@ -13,10 +13,13 @@ from apps.engine.grid import (
     GridParams,
     SimulationConfig,
     build_grid_levels,
+    buy_crosses,
     intrabar_path,
+    inventory_in_profit,
     market_context,
     max_position_notional,
     range_width_cap,
+    sell_crosses,
 )
 from apps.trading.execution import ExecutionAdapter
 from apps.trading.hybrid import TrendSignal
@@ -110,6 +113,9 @@ class IncrementalGridStrategy:
         self.trend_reason = str(state.get("trend_reason") or "")
         self.ema_100 = float(state.get("ema_100") or 0.0)
         self.adx_14 = float(state["adx_14"]) if state.get("adx_14") is not None else None
+        # Book-level risk (exposure cap or daily loss halt), set by the paper
+        # runner on every tick. It only ever blocks new buys.
+        self.portfolio_blocked = bool(state.get("portfolio_blocked"))
 
     @property
     def initialized(self) -> bool:
@@ -167,6 +173,7 @@ class IncrementalGridStrategy:
             "trend_reason": self.trend_reason,
             "ema_100": self.ema_100,
             "adx_14": self.adx_14,
+            "portfolio_blocked": self.portfolio_blocked,
         }
 
     # ------------------------------------------------------- adaptive inputs
@@ -228,7 +235,12 @@ class IncrementalGridStrategy:
         )
         cooldown = self.buy_blocked_until is not None and now < self.buy_blocked_until
         self.allow_buys = not (
-            cooldown or self.crowded or below_support or upper_risk or self.trend_blocked
+            cooldown
+            or self.crowded
+            or below_support
+            or upper_risk
+            or self.trend_blocked
+            or self.portfolio_blocked
         )
 
     def _reset_trailing(self) -> None:
@@ -310,7 +322,9 @@ class IncrementalGridStrategy:
             if self.adapter.position_qty > 0
             else structure_stop
         )
-        self._refresh_gates(price, now)
+        # Gates use the last completed close, as the backtest does; the live
+        # price only stands in on the very first initialisation.
+        self._refresh_gates(self.prev_close if self.prev_close > 0 else price, now)
         self.orders.clear()
         self._rebuild_orders(price)
         if reset_clock or self.prev_close <= 0:
@@ -493,6 +507,7 @@ class IncrementalGridStrategy:
         path = intrabar_path(
             float(bar["open"]), float(bar["high"]), float(bar["low"]), float(bar["close"])
         )
+        trade_through = self.config.trade_through
         pending = self.orders.copy()
         for p0, p1 in zip(path, path[1:]):
             if p1 < p0:
@@ -501,7 +516,7 @@ class IncrementalGridStrategy:
                     if not order or order["side"] != "buy":
                         continue
                     level = float(self.levels[idx])
-                    if p1 <= level <= p0:
+                    if buy_crosses(level, p0, p1, trade_through):
                         fill = self.adapter.buy(level, order["qty"], bar["time"], "grid", idx)
                         if fill:
                             remaining = order["qty"] - fill.qty
@@ -517,7 +532,7 @@ class IncrementalGridStrategy:
                     if not order or order["side"] != "sell":
                         continue
                     level = float(self.levels[idx])
-                    if p0 <= level <= p1:
+                    if sell_crosses(level, p0, p1, trade_through):
                         fill = self.adapter.sell(
                             level,
                             min(order["qty"], self.adapter.position_qty),
@@ -534,7 +549,87 @@ class IncrementalGridStrategy:
                             self._queue(queue, idx - 1, "buy", fill.qty)
                         pending.pop(idx, None)
 
+    def open_initial_inventory(self, price: float, now: datetime) -> None:
+        """Optional starting inventory, sized exactly like the backtest."""
+
+        if (
+            self.params.initial_inventory_pct <= 0
+            or self.adapter.position_qty > 0
+            or self.trend_blocked
+            or price <= 0
+        ):
+            return
+        budget = (
+            self.adapter.capital
+            * self.config.leverage
+            * self.params.max_utilization
+            * self.params.initial_inventory_pct
+        )
+        qty = budget / (price * (1.0 + self.config.slip))
+        self.adapter.buy(price, qty, now, "initial", None)
+
+    def begin_bar(self, bar: dict[str, Any]) -> bool:
+        """Evaluate the risk gates for ``bar`` from completed data.
+
+        Returns whether buys were allowed before this bar, which ``finish_bar``
+        needs to re-arm the ladder once the gates clear.
+        """
+
+        previous_allowed = self.allow_buys
+        self._refresh_gates(self.prev_close or float(bar["open"]), bar["time"])
+        if not self.allow_buys:
+            for idx in [key for key, order in self.orders.items() if order["side"] == "buy"]:
+                self.orders.pop(idx, None)
+            self.buy_blocks += 1
+            # Keep the audit trail in step with the cancelled buys. Sell rungs
+            # are untouched, exactly as in the backtest.
+            for item in self.level_plan:
+                if item.get("side") == "buy" and item.get("reason") == "active":
+                    item["reason"] = "risk_gate"
+                    item["qty"] = 0.0
+        return previous_allowed
+
+    def step(
+        self,
+        bar: dict[str, Any],
+        hist_before: list[dict[str, Any]],
+        *,
+        funding_z: float | None = None,
+    ) -> dict[str, Any]:
+        """Advance one completed candle exactly as ``simulate_grid`` does.
+
+        ``hist_before`` holds every completed candle strictly before ``bar``;
+        context, gates, and any rebalance are computed from it, so a bar can
+        never influence its own decisions.
+        """
+
+        if self.stopped:
+            return {"stopped": True, "reason": self.stop_reason}
+        bar_open = float(bar["open"])
+        if self.prev_close <= 0 and hist_before:
+            self.prev_close = float(hist_before[-1]["close"])
+        if hist_before:
+            self.refresh_context(hist_before, self.prev_close or None)
+        self.set_funding_context(funding_z)
+        if not self.initialized:
+            self.open_initial_inventory(bar_open, bar["time"])
+        previous_allowed = self.begin_bar(bar)
+        prev_close = self.prev_close
+        self.maybe_rebalance(bar["time"], bar_open, hist_before)
+        self.prev_close = prev_close
+        return self.finish_bar(bar, previous_allowed)
+
     def process_bar(self, bar: dict[str, Any]) -> dict[str, Any]:
+        """Advance one bar on the current ladder (no context refresh or rebalance)."""
+
+        if self.stopped:
+            return {"stopped": True, "reason": self.stop_reason}
+        if not self.initialized:
+            return {"stopped": False, "reason": ""}
+        previous_allowed = self.begin_bar(bar)
+        return self.finish_bar(bar, previous_allowed)
+
+    def finish_bar(self, bar: dict[str, Any], previous_allowed: bool) -> dict[str, Any]:
         if self.stopped:
             return {"stopped": True, "reason": self.stop_reason}
         if not self.initialized:
@@ -546,16 +641,6 @@ class IncrementalGridStrategy:
         bar_low = float(bar["low"])
         bar_close = float(bar["close"])
 
-        # Regime gates are evaluated from completed data before any fill.
-        previous_allowed = self.allow_buys
-        self._refresh_gates(self.prev_close or bar_open, bar_time)
-        if not self.allow_buys:
-            for idx in [key for key, order in self.orders.items() if order["side"] == "buy"]:
-                self.orders.pop(idx, None)
-            self.buy_blocks += 1
-            # Keep the persisted audit trail in step with the cancelled book.
-            self._rebuild_orders(self.prev_close or bar_open)
-
         queue: list[tuple[int, str, float]] = []
         self._apply_gap(bar, queue)
         self._process_path(bar, queue)
@@ -563,7 +648,8 @@ class IncrementalGridStrategy:
         self.last_bar_time = bar_time
         skip_queue = False
 
-        # 1. Hard stop: ATR distance plus support-backed grid floor.
+        # 1. Hard stop: ATR distance plus support-backed grid floor, the
+        #    capital stop, and the optional portfolio drawdown stop.
         if self.adapter.position_qty > 0:
             liq_price = self.adapter.avg_entry * (
                 1.0 - 1.0 / self.config.leverage + self.config.maintenance_margin_rate
@@ -571,8 +657,23 @@ class IncrementalGridStrategy:
             eq_low = self.adapter.equity(bar_low)
             stop_equity = self.adapter.capital * (1.0 - self.params.stop_loss_pct)
             price_stop = self.epoch_stop if self.epoch_stop > 0 else -math.inf
-            if bar_low <= liq_price or eq_low <= stop_equity or bar_low <= price_stop:
-                reason = "liquidation" if bar_low <= liq_price else "stop_loss"
+            drawdown_stop = False
+            if self.params.max_total_drawdown > 0:
+                peak = max(self.adapter.peak_equity, self.adapter.equity(bar_open))
+                drawdown_low = 1.0 - eq_low / peak if peak > 0 else 0.0
+                drawdown_stop = drawdown_low >= self.params.max_total_drawdown
+            if (
+                bar_low <= liq_price
+                or eq_low <= stop_equity
+                or bar_low <= price_stop
+                or drawdown_stop
+            ):
+                if bar_low <= liq_price:
+                    reason = "liquidation"
+                elif drawdown_stop:
+                    reason = "drawdown_stop"
+                else:
+                    reason = "stop_loss"
                 trigger = min(bar_low, liq_price) if reason == "liquidation" else bar_low
                 self.adapter.close_position(max(trigger, 1e-12), bar_time, reason)
                 self.adapter.mark(bar_close)
@@ -582,7 +683,7 @@ class IncrementalGridStrategy:
                 self._reset_trailing()
                 return {"stopped": True, "reason": reason}
 
-        # 2. Trailing take-profit: armed by net profit, exits on an ATR retrace.
+        # 2. Trailing take-profit: armed by inventory profit, exits on an ATR retrace.
         tp_triggered = False
         if (
             self.tp_active
@@ -630,14 +731,11 @@ class IncrementalGridStrategy:
                 self._rebuild_orders(bar_close)
                 skip_queue = True
 
-        # 4. Arm / update the trailing take-profit once net profit clears the bar.
+        # 4. Arm / update the trailing take-profit once inventory is in profit.
         if not tp_triggered:
             if self.adapter.position_qty > 0:
                 if not self.tp_active:
-                    eq_close = self.adapter.equity(bar_close)
-                    if eq_close >= self.adapter.capital * (
-                        1.0 + self.params.tp_activate_net_return
-                    ):
+                    if inventory_in_profit(bar_close, self.adapter.avg_entry, self.params):
                         self.tp_active = True
                         self.peak_price = bar_high
                 else:

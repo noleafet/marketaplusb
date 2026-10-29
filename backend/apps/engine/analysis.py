@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Any
 
@@ -19,26 +21,65 @@ from apps.engine.grid import GridParams, SimulationConfig
 from apps.engine.hybrid_gate import Gate, build_gate
 from apps.engine.models import AnalysisRun, CoinAnalysis, log_decision
 from apps.engine.reports import build_reports
-from apps.engine.robustness import daily_returns, select_diversified
+from apps.engine.robustness import (
+    correlation_diagnostics,
+    daily_returns,
+    market_exposure,
+    select_diversified,
+)
 from apps.engine.scoring import ranking_summary, score_results
 from apps.engine.timescale import load_candles, load_funding
-from apps.engine.walkforward import run_walk_forward
+from apps.engine.validation import (
+    MIN_SCOPE_COINS,
+    findings,
+    pooled_ic,
+    score_validation,
+    strategy_validation,
+)
+from apps.engine.walkforward import WalkForwardResult, walk_forward_job as _walk_forward_job
 
 logger = logging.getLogger("engine")
 
 HYBRID_WARMUP_DAYS = 10
+# Strategy returns exist only on walk-forward test days and the holdout, so
+# use all of them (~11 months) rather than a short price-style window.
+STRATEGY_CORR_LOOKBACK_DAYS = 365
 
 
-def engine_config() -> SimulationConfig:
+def _strategy_settings():
+    from apps.trading.models import StrategySettings
+
+    return StrategySettings.load()
+
+
+def engine_config(interval: str | None = None) -> SimulationConfig:
+    """Backtest configuration shared with paper trading.
+
+    The candle interval and fill model come from the admin strategy settings,
+    so the daily backtest always measures the strategy paper trading runs.
+    """
+
     cfg = settings.ENGINE
+    strategy = _strategy_settings()
     return SimulationConfig(
         capital=float(cfg["PAPER_CAPITAL"]),
         leverage=float(cfg["LEVERAGE"]),
         maker_fee_rate=float(cfg["MAKER_FEE_RATE"]),
         taker_fee_rate=float(cfg["TAKER_FEE_RATE"]),
         slippage_bps=float(cfg["SLIPPAGE_BPS"]),
-        interval=str(cfg["INTERVAL"]),
+        interval=str(interval or strategy.signal_interval or cfg["INTERVAL"]),
+        trade_through_bps=strategy.effective_trade_through_bps,
     )
+
+
+def analysis_workers() -> int:
+    """Process count for the per-coin walk-forward (1 = run in-process)."""
+
+    configured = int(settings.ENGINE.get("WORKERS", 0) or 0)
+    if configured > 0:
+        return configured
+    return max(1, min(6, (os.cpu_count() or 2) - 1))
+
 
 
 def base_grid_params(overrides: dict[str, Any] | None = None) -> GridParams:
@@ -114,7 +155,7 @@ def _analysis_params(params: dict[str, Any] | None) -> dict[str, Any]:
     cfg = settings.ENGINE
     result = {
         "lookback_days": int(cfg["LOOKBACK_DAYS"]),
-        "interval": cfg["INTERVAL"],
+        "interval": _strategy_settings().signal_interval or cfg["INTERVAL"],
         "symbols": [],
         "limit": int(cfg["SYMBOL_LIMIT"]),
         "force": False,
@@ -180,9 +221,13 @@ def run_daily_analysis(
     hybrid = trend_mode == AnalysisRun.Mode.HYBRID
     analysis_params = _analysis_params(params)
     cfg = settings.ENGINE
-    config = engine_config()
-    base_params = base_grid_params()
+    strategy_settings = _strategy_settings()
     interval = analysis_params["interval"]
+    config = engine_config(interval)
+    base_params = base_grid_params()
+    # The hybrid diagnostic replays only HYBRID_LOOKBACK_DAYS (180 by default);
+    # carving a 90-day holdout out of that leaves no room for a single fold.
+    holdout_days = 0 if hybrid else int(strategy_settings.holdout_days or 0)
     hybrid_days = max(120, int(cfg["HYBRID_LOOKBACK_DAYS"]))
     # Hybrid results only count bars inside the fetched 1h/15m coverage, so the
     # simulation window is clamped to the hybrid lookback.
@@ -214,6 +259,9 @@ def run_daily_analysis(
                 "maker_fee_rate": config.maker_fee_rate,
                 "taker_fee_rate": config.taker_fee_rate,
                 "slippage_bps": config.slippage_bps,
+                "trade_through_bps": config.trade_through_bps,
+                "fill_model": strategy_settings.fill_model,
+                "holdout_days": holdout_days,
                 "stop_loss_pct": base_params.stop_loss_pct,
                 "initial_inventory_pct": base_params.initial_inventory_pct,
                 "min_adv_usd": cfg["MIN_ADV_USD"],
@@ -273,147 +321,207 @@ def run_daily_analysis(
     data_start_floor = timezone.now() - timedelta(days=lookback_days + warmup_days)
     started_monotonic = time.monotonic()
 
-    for index, coin in enumerate(coin_list, start=1):
-        sync_info: dict[str, Any] = {}
-        # The hybrid run follows the normal run in the same job and reuses the
-        # 4h candles it just synced; only the 1h/15m gate inputs are fetched.
-        if not hybrid:
-            try:
-                sync_info = sync_coin_market_data(
-                    coin,
-                    client,
-                    lookback_days=lookback_days,
-                    interval=interval,
-                    warmup_days=warmup_days,
-                    force=bool(analysis_params["force"]),
-                )
-                if not sync_info.get("ok"):
-                    data_errors.append({"symbol": coin.symbol, "error": sync_info.get("error")})
-            except Exception as exc:  # keep going on per-coin failures
-                logger.warning("Market data sync failed for %s: %s", coin.symbol, exc)
-                data_errors.append({"symbol": coin.symbol, "error": str(exc)})
-                sync_info = {"ok": False, "error": str(exc)}
+    workers = analysis_workers()
+    executor = ProcessPoolExecutor(max_workers=workers) if workers > 1 else None
+    pending: dict[Future, dict[str, Any]] = {}
+    processed = 0
 
-        rows = load_candles(coin.binance_symbol, interval, data_start_floor, timezone.now())
-        funding = load_funding(coin.binance_symbol, data_start_floor, timezone.now())
-        if rows:
-            latest_cutoff = max(latest_cutoff or rows[-1]["time"], rows[-1]["time"])
-        features = compute_features(rows, funding, base_params, config) if len(rows) >= 50 else {
-            "insufficient_data": True,
-            "bars": len(rows),
-        }
+    def finish(job: dict[str, Any], wf: WalkForwardResult | None, error: str = "") -> None:
+        """Merge a walk-forward result into its item (runs in this process)."""
 
-        item: dict[str, Any] = {
-            "coin": coin,
-            "eligible": True,
-            "exclusion_reason": "",
-            "oos_metrics": {},
-            "in_sample_metrics": {},
-            "features": features,
-            "component_scores": {},
-            "params": base_params.to_dict(),
-            "folds": [],
-            "chart": {},
-            "trade_sample": [],
-            "diagnostics": {},
-            "_daily_returns": daily_returns(rows),
-            "data_start": rows[0]["time"] if rows else None,
-            "data_end": rows[-1]["time"] if rows else None,
-        }
-
-        gate: Gate | None = None
-        if hybrid and len(rows) >= 200:
-            try:
-                gate = _build_hybrid_gate(
+        nonlocal processed
+        item = job["item"]
+        coin = job["coin"]
+        gate = job["gate"]
+        if wf is None:
+            item["eligible"] = False
+            item["exclusion_reason"] = f"backtest error: {error}"
+        elif wf.error:
+            item["eligible"] = False
+            item["exclusion_reason"] = wf.error
+        else:
+            recommended = GridParams.from_dict(wf.params) if wf.params else base_params
+            features = {
+                **item["features"],
+                **compute_features(job["rows"], job["funding"], recommended, config),
+            }
+            item.update(
+                {
+                    "oos_metrics": wf.oos_metrics,
+                    "in_sample_metrics": wf.in_sample_metrics,
+                    "features": features,
+                    "params": wf.params,
+                    "folds": wf.folds,
+                    "chart": wf.chart,
+                    "trade_sample": wf.trade_sample,
+                    "data_start": wf.data_start,
+                    "data_end": wf.data_end,
+                    "_wf_diagnostics": wf.diagnostics,
+                    "_strategy_returns": wf.strategy_returns,
+                }
+            )
+            if cfg["ORDER_BOOK_ENABLED"]:
+                book = _order_book_features(
                     client,
                     coin.binance_symbol,
-                    rows,
-                    lookback_days=lookback_days,
-                    adx_enabled=hybrid_adx,
+                    capital=config.capital,
+                    leverage=config.leverage,
+                    max_utilization=recommended.max_utilization,
+                    grid_levels=recommended.grid_levels,
+                    band_bps=float(cfg["DEPTH_BAND_BPS"]),
                 )
-            except Exception as exc:  # noqa: BLE001 - keep the rest of the universe
-                logger.warning("Hybrid kline fetch failed for %s: %s", coin.symbol, exc)
-                data_errors.append({"symbol": coin.symbol, "error": str(exc)})
-
-        if len(rows) < 200:
-            item["eligible"] = False
-            item["exclusion_reason"] = (
-                f"insufficient candle history ({len(rows)} bars)"
-                + (f"; sync error: {sync_info.get('error')}" if sync_info.get("error") else "")
-            )
-        elif hybrid and gate is None:
-            item["eligible"] = False
-            item["exclusion_reason"] = "hybrid trend data unavailable"
-        else:
-            try:
-                wf = run_walk_forward(
-                    rows,
-                    funding,
-                    config=config,
-                    base_params=base_params,
-                    lookback_days=lookback_days,
-                    min_trades=int(cfg["MIN_OOS_TRADES"]),
-                    cost_stress_multiplier=float(cfg["COST_STRESS_MULTIPLIER"]),
-                    sensitivity=bool(cfg["WALKFORWARD_SENSITIVITY"]),
-                    gate=gate,
-                )
-            except Exception as exc:  # noqa: BLE001 - protect the rest of the universe
-                logger.exception("Backtest failed for %s", coin.symbol)
-                wf = None
-                item["eligible"] = False
-                item["exclusion_reason"] = f"backtest error: {exc}"
-            if wf is not None:
-                if wf.error:
-                    item["eligible"] = False
-                    item["exclusion_reason"] = wf.error
-                else:
-                    recommended = GridParams.from_dict(wf.params) if wf.params else base_params
-                    features = {
-                        **features,
-                        **compute_features(rows, funding, recommended, config),
-                    }
-                    item.update(
-                        {
-                            "oos_metrics": wf.oos_metrics,
-                            "in_sample_metrics": wf.in_sample_metrics,
-                            "features": features,
-                            "params": wf.params,
-                            "folds": wf.folds,
-                            "chart": wf.chart,
-                            "trade_sample": wf.trade_sample,
-                            "data_start": wf.data_start,
-                            "data_end": wf.data_end,
-                            "_wf_diagnostics": wf.diagnostics,
-                        }
-                    )
-                    if cfg["ORDER_BOOK_ENABLED"]:
-                        recommended = GridParams.from_dict(wf.params or {})
-                        book = _order_book_features(
-                            client,
-                            coin.binance_symbol,
-                            capital=config.capital,
-                            leverage=config.leverage,
-                            max_utilization=recommended.max_utilization,
-                            grid_levels=recommended.grid_levels,
-                            band_bps=float(cfg["DEPTH_BAND_BPS"]),
-                        )
-                        if book:
-                            item["features"] = {**features, **book}
-                    if gate is not None:
-                        item["features"] = {
-                            **item["features"],
-                            "hybrid_gate": gate.stats(),
-                        }
-        results.append(item)
-
-        if index % 10 == 0 or index == len(coin_list):
+                if book:
+                    item["features"] = {**item["features"], **book}
+            if gate is not None:
+                item["features"] = {**item["features"], "hybrid_gate": gate.stats()}
+        processed += 1
+        if processed % 10 == 0:
             logger.info(
                 "Analysis %s: %s/%s coins processed in %.1fs",
                 analysis.id,
-                index,
+                processed,
                 len(coin_list),
                 time.monotonic() - started_monotonic,
             )
+
+    def drain(block_until: int) -> None:
+        while len(pending) > block_until:
+            done, _ = wait(list(pending), return_when=FIRST_COMPLETED)
+            for future in done:
+                job = pending.pop(future)
+                try:
+                    finish(job, future.result())
+                except Exception as exc:  # noqa: BLE001 - protect the universe
+                    logger.exception("Backtest failed for %s", job["coin"].symbol)
+                    finish(job, None, str(exc))
+
+    try:
+        for coin in coin_list:
+            sync_info: dict[str, Any] = {}
+            # The hybrid run follows the normal run in the same job and reuses the
+            # candles it just synced; only the 1h/15m gate inputs are fetched.
+            if not hybrid:
+                try:
+                    sync_info = sync_coin_market_data(
+                        coin,
+                        client,
+                        lookback_days=lookback_days,
+                        interval=interval,
+                        warmup_days=warmup_days,
+                        force=bool(analysis_params["force"]),
+                    )
+                    if not sync_info.get("ok"):
+                        data_errors.append({"symbol": coin.symbol, "error": sync_info.get("error")})
+                except Exception as exc:  # keep going on per-coin failures
+                    logger.warning("Market data sync failed for %s: %s", coin.symbol, exc)
+                    data_errors.append({"symbol": coin.symbol, "error": str(exc)})
+                    sync_info = {"ok": False, "error": str(exc)}
+
+            rows = load_candles(coin.binance_symbol, interval, data_start_floor, timezone.now())
+            funding = load_funding(coin.binance_symbol, data_start_floor, timezone.now())
+            if rows:
+                latest_cutoff = max(latest_cutoff or rows[-1]["time"], rows[-1]["time"])
+            features = compute_features(rows, funding, base_params, config) if len(rows) >= 50 else {
+                "insufficient_data": True,
+                "bars": len(rows),
+            }
+
+            item: dict[str, Any] = {
+                "coin": coin,
+                "eligible": True,
+                "exclusion_reason": "",
+                "oos_metrics": {},
+                "in_sample_metrics": {},
+                "features": features,
+                "component_scores": {},
+                "params": base_params.to_dict(),
+                "folds": [],
+                "chart": {},
+                "trade_sample": [],
+                "diagnostics": {},
+                "_daily_returns": daily_returns(rows),
+                "data_start": rows[0]["time"] if rows else None,
+                "data_end": rows[-1]["time"] if rows else None,
+            }
+            results.append(item)
+            min_bars = 200
+
+            gate: Gate | None = None
+            if hybrid and len(rows) >= min_bars:
+                try:
+                    gate = _build_hybrid_gate(
+                        client,
+                        coin.binance_symbol,
+                        rows,
+                        lookback_days=lookback_days,
+                        adx_enabled=hybrid_adx,
+                    )
+                except Exception as exc:  # noqa: BLE001 - keep the rest of the universe
+                    logger.warning("Hybrid kline fetch failed for %s: %s", coin.symbol, exc)
+                    data_errors.append({"symbol": coin.symbol, "error": str(exc)})
+
+            if len(rows) < min_bars:
+                item["eligible"] = False
+                item["exclusion_reason"] = (
+                    f"insufficient candle history ({len(rows)} bars)"
+                    + (f"; sync error: {sync_info.get('error')}" if sync_info.get("error") else "")
+                )
+                continue
+            if hybrid and gate is None:
+                item["eligible"] = False
+                item["exclusion_reason"] = "hybrid trend data unavailable"
+                continue
+
+            job = {"coin": coin, "item": item, "rows": rows, "funding": funding, "gate": gate}
+            kwargs = {
+                "rows": rows,
+                "funding_rows": funding,
+                "config": config,
+                "base_params": base_params,
+                "lookback_days": lookback_days,
+                "min_trades": int(cfg["MIN_OOS_TRADES"]),
+                "cost_stress_multiplier": float(cfg["COST_STRESS_MULTIPLIER"]),
+                "sensitivity": bool(cfg["WALKFORWARD_SENSITIVITY"]),
+                "gate": gate,
+                "holdout_days": holdout_days,
+            }
+            if executor is None:
+                try:
+                    finish(job, _walk_forward_job(kwargs))
+                except Exception as exc:  # noqa: BLE001 - protect the rest of the universe
+                    logger.exception("Backtest failed for %s", coin.symbol)
+                    finish(job, None, str(exc))
+            else:
+                pending[executor.submit(_walk_forward_job, kwargs)] = job
+                # Bound memory: at most two coins of candles queued per worker.
+                drain(workers * 2)
+        drain(0)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    # BTC is the market reference for every strategy's beta.
+    btc_returns = next(
+        (
+            item["_daily_returns"]
+            for item in results
+            if item["coin"].binance_symbol == "BTCUSDT"
+        ),
+        None,
+    )
+    if btc_returns is None:
+        try:
+            btc_rows = load_candles("BTCUSDT", interval, data_start_floor, timezone.now())
+            btc_returns = daily_returns(btc_rows) if btc_rows else None
+        except Exception:  # noqa: BLE001 - beta is diagnostic only
+            btc_returns = None
+    for item in results:
+        strategy_returns = item.get("_strategy_returns") or {}
+        item["_market"] = (
+            market_exposure(strategy_returns, btc_returns)
+            if strategy_returns and btc_returns
+            else {}
+        )
 
     # Scoring runs the hard gates first, then correlates only the coins that
     # passed them, so an ineligible coin cannot change the diversification of
@@ -432,12 +540,43 @@ def run_daily_analysis(
         min_depth_cover=float(cfg["MIN_DEPTH_COVER"]),
         enforce_cost_stress=bool(cfg["ENFORCE_COST_STRESS"]),
         min_stressed_return=float(cfg["MIN_STRESSED_RETURN"]),
-        max_correlation=float(cfg["MAX_CORRELATION"]),
         max_top_trade_share=float(cfg["MAX_TOP_TRADE_SHARE"]),
         min_data_days=int(cfg["MIN_DATA_DAYS"]),
-        corr_lookback_days=int(cfg["CORR_LOOKBACK_DAYS"]),
+        # Diversification is measured on the strategies' own daily returns:
+        # that is the exposure the paper book actually holds.
+        max_correlation=float(strategy_settings.max_strategy_correlation),
+        corr_lookback_days=STRATEGY_CORR_LOOKBACK_DAYS,
         correlation_out=correlation_info,
+        correlation_returns_key="_strategy_returns",
     )
+    price_correlation = correlation_diagnostics(
+        ranked,
+        lookback_days=int(cfg["CORR_LOOKBACK_DAYS"]),
+        max_corr=float(cfg["MAX_CORRELATION"]),
+        returns_key="_daily_returns",
+        store_key="_price_correlation",
+        # Same scope as the strategy diagnostics below.
+        eligible_only=sum(1 for item in ranked if item.get("eligible")) >= MIN_SCOPE_COINS,
+    )
+    # Diagnostic only: strategy correlation across every analysed coin, so a
+    # run where nothing qualifies can still show how concentrated the
+    # strategies are. Stored under its own key; it never feeds the ranking.
+    universe_correlation = correlation_diagnostics(
+        ranked,
+        lookback_days=STRATEGY_CORR_LOOKBACK_DAYS,
+        max_corr=float(strategy_settings.max_strategy_correlation),
+        returns_key="_strategy_returns",
+        store_key="_universe_correlation",
+        eligible_only=False,
+    )
+    for item in ranked:
+        diagnostics = item.setdefault("diagnostics", {})
+        diagnostics["market"] = item.get("_market") or {}
+        diagnostics["price_correlation"] = {
+            key: value
+            for key, value in (item.get("_price_correlation") or {}).items()
+            if key != "peer_map"
+        }
 
     saved: list[CoinAnalysis] = []
     with transaction.atomic():
@@ -476,6 +615,14 @@ def run_daily_analysis(
             "interval": interval,
             "runtime_seconds": round(time.monotonic() - started_monotonic, 1),
             "correlation": correlation_info,
+            "universe_correlation": universe_correlation,
+            "price_correlation": {
+                key: value for key, value in price_correlation.items() if key != "pairs"
+            },
+            "workers": workers,
+            "holdout_days": holdout_days,
+            "fill_model": strategy_settings.fill_model,
+            "trade_through_bps": config.trade_through_bps,
             "thresholds": {
                 "min_adv_usd": cfg["MIN_ADV_USD"],
                 "min_oos_trades": cfg["MIN_OOS_TRADES"],
@@ -493,6 +640,31 @@ def run_daily_analysis(
             },
         }
     )
+    # Score validity and strategy correlation, judged on the untouched holdout.
+    scores_check = score_validation(ranked)
+    strategies_check = strategy_validation(
+        ranked, correlation_info, price_correlation, universe_correlation
+    )
+    history = list(
+        AnalysisRun.objects.filter(
+            status=AnalysisRun.Status.SUCCEEDED,
+            mode=trend_mode,
+            scope=AnalysisRun.Scope.UNIVERSE,
+        )
+        .exclude(id=analysis.id)
+        .order_by("-started_at")
+        .values_list("summary", flat=True)[:11]
+    )
+    pooled = pooled_ic([{"score_validation": scores_check}, *history])
+    analysis.summary["score_validation"] = scores_check
+    analysis.summary["strategy_validation"] = strategies_check
+    analysis.summary["validation_findings"] = findings(
+        scores_check,
+        strategies_check,
+        pooled=pooled,
+        max_strategy_correlation=float(strategy_settings.max_strategy_correlation),
+    )
+    analysis.summary["pooled_ic"] = pooled
     analysis.save(update_fields=["data_cutoff", "summary"])
 
     analysis.summary["mode"] = trend_mode
@@ -544,7 +716,8 @@ def run_daily_analysis(
 
     if not hybrid:
         try:
-            from apps.trading.paper import ensure_paper_sessions
+            from apps.trading.paper import ensure_paper_sessions, retire_stale_sessions
+            from apps.trading.portfolio import open_symbols
 
             candidates = [
                 item
@@ -552,10 +725,17 @@ def run_daily_analysis(
                 if item.get("eligible")
                 and item.get("suitability") in {"prime", "viable"}
             ]
+            if analysis.scope == AnalysisRun.Scope.UNIVERSE:
+                analysis.summary["paper_retired"] = retire_stale_sessions(
+                    analysis, candidates, strategy_settings
+                )
+            held = open_symbols()
+            slots = max(0, int(strategy_settings.max_sessions) - len(held))
             selected, skipped = select_diversified(
-                candidates,
-                max_corr=float(cfg["MAX_CORRELATION"]),
-                limit=int(cfg["TOP_N_PAPER"]),
+                [item for item in candidates if item["coin"].symbol not in held],
+                max_corr=float(strategy_settings.max_strategy_correlation),
+                limit=slots,
+                existing=held,
             )
             sessions = ensure_paper_sessions(analysis, selected)
             analysis.summary["paper_sessions_created"] = len(sessions)

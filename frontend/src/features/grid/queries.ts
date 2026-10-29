@@ -20,7 +20,9 @@ export const gridKeys = {
   paperFills: (id: string) => ['grid', 'paper', id, 'fills'] as const,
   paperEvaluations: (id: string) => ['grid', 'paper', id, 'evaluations'] as const,
   live: ['grid', 'live'] as const,
-  tradingMode: ['grid', 'trading-mode'] as const
+  tradingMode: ['grid', 'trading-mode'] as const,
+  strategySettings: ['grid', 'strategy-settings'] as const,
+  strategyValidation: ['grid', 'strategy-validation'] as const
 };
 
 export function useDashboard() {
@@ -164,6 +166,30 @@ export function useSetTradingMode() {
   return useMutation({
     mutationFn: engineApi.setTradingMode,
     onSuccess: refresh
+  });
+}
+
+export function useStrategySettings() {
+  return useQuery({
+    queryKey: gridKeys.strategySettings,
+    queryFn: engineApi.strategySettings,
+    refetchInterval: 60000
+  });
+}
+
+export function useSetStrategySettings() {
+  const refresh = useRefresh();
+  return useMutation({
+    mutationFn: engineApi.setStrategySettings,
+    onSuccess: refresh
+  });
+}
+
+export function useStrategyValidation() {
+  return useQuery({
+    queryKey: gridKeys.strategyValidation,
+    queryFn: engineApi.strategyValidation,
+    refetchInterval: 60000
   });
 }
 

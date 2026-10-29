@@ -15,6 +15,8 @@ import type { ReactNode } from 'react';
 import { COIN_SETTINGS_PATH, SECTION_PATHS, STRATEGY_SECTIONS, THRESHOLD_ROWS } from '../catalog';
 import type { CatalogStat, CatalogTone } from '../catalog';
 import { signedPercent, scoreTone, toNumber } from '../format';
+import StrategySettingsCard from './strategy-settings-card';
+import StrategyValidationCard from './strategy-validation-card';
 import TradingModeCard from './trading-mode-card';
 import {
   DistributionBar,
@@ -254,6 +256,10 @@ export default function StrategyOverview() {
       </Alert>
 
       <TradingModeCard />
+
+      <StrategySettingsCard />
+
+      <StrategyValidationCard />
 
       {dashboard.isError ? (
         <Alert variant='destructive'>

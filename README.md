@@ -266,7 +266,27 @@ correlation, slow recovery, and excessive inventory exposure. The legacy four-co
 is still computed as `baseline_score`, so `score_delta` shows what the enhanced ranking changed
 for each coin.
 
-**Correlation.** Daily closes aligned on common dates give pairwise correlations over
+**Final holdout.** The newest `holdout_days` (default 90, Admin → Strategies) never take part in
+parameter search, fold scoring, or ranking. After everything else is fixed, the deployed parameters
+(the most recent fold's selection) are simulated once over that window. Holdout returns are
+reported and drive score validation; they never change a rank.
+
+**Fill model.** `trade_through` (default, 2 bps) fills a resting order only when price trades
+through the level; `touch` fills on contact. Every coin reports both, and the dashboard flags coins
+that are profitable only under touch fills.
+
+**Score validation.** Each run computes the Spearman rank correlation (IC) between the score, each
+factor, and the holdout return, plus a pooled IC over the last runs. Admin → Strategies turns these
+and the strategy-correlation diagnostics into strengths and weaknesses.
+
+**Correlation.** Diversification is measured on the grid strategies' own daily returns (walk-forward
+test days plus the holdout, flat after a stop-out), not on coin prices: every long-only grid is
+partly long the market, so strategy returns are what the book holds. Each strategy's correlation
+and beta to BTC are reported, and price correlation is kept for reference. The admin
+`max_strategy_correlation` (default 0.70) drives the penalty and paper selection, which also
+rejects coins correlated with sessions already open.
+
+**Price correlation (reference).** Daily closes aligned on common dates give pairwise correlations over
 `ENGINE_CORR_LOOKBACK_DAYS`. Coins above `ENGINE_MAX_CORRELATION` with an eligible peer are
 flagged, penalized, and skipped when paper sessions are created, so the paper book is not a
 stack of the same trade. The greedy selector always keeps the first candidate.
@@ -281,6 +301,39 @@ trades, ADV, ATR%, and funding columns remain on the rankings table.
 
 The test suite includes a truncation test: truncating future bars does not change any trade or
 equity point before the cutoff, guarding against look-ahead bias.
+
+## Admin strategy settings
+
+`/admin/strategies` holds one `StrategySettings` row (`GET`/`POST /api/strategy/settings/`):
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| Signal interval | `1h` | Candles for both the daily backtest and paper trading. Changing it can queue a fresh analysis. |
+| Fill model | trade-through 2 bps | Used by backtest and paper; the other model is always reported |
+| Holdout | 90 days | Untouched final window (0 = off) |
+| Overbought guard | off | No backtest yet; when off, sessions it paused are resumed |
+| Book capital / max sessions | $8,000 / 8 | Each new session gets book ÷ sessions |
+| Exposure cap | 1.0× book | New buys stop above this total open notional |
+| Daily loss limit | 3% of book | Halts new buys until the next UTC day |
+| Retire after | 2 runs | Close a session whose coin fails to qualify this many analyses in a row |
+| Max strategy correlation | 0.70 | Correlation penalty and paper selection |
+
+Book limits only block new buys; stops and exits always run. `GET /api/strategy/validation/`
+returns the score ICs, strategy/paper correlation, BTC beta, paper-vs-holdout drift, and findings.
+
+**Backtest/paper parity.** Paper trading replays each completed candle through
+`IncrementalGridStrategy.step`, which rebuilds context from strictly earlier candles and applies
+gates, rebalancing, fills, stops, and exits in the same order as `simulate_grid`. A test suite
+asserts identical fills on 1h and 4h data, with adaptive rebalancing, initial inventory, and a
+breakdown. The daily analysis runs coins in `ENGINE_WORKERS` processes and caches indicator series
+across the 96 candidates, so a 1h run takes roughly 20 seconds of CPU per coin.
+
+**Interval-independent ATR.** Every ATR multiple (stop, take-profit trail, range pad, width caps,
+ATR% gate) was calibrated on 4h bars. Per-bar true range grows with about the square root of the
+bar length (measured 4h/1h ratio across the top-100 universe: 2.05), so ATR is converted to
+4h-equivalent units (`× √(bars_per_day / 6)`). Without this, switching to 1h halved every stop
+distance and 54 of 60 coins stopped out in all three folds. The hybrid diagnostic run skips the
+holdout because its 180-day window cannot hold both a holdout and a walk-forward fold.
 
 ## Trading stages
 
