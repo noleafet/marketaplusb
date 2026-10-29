@@ -305,6 +305,42 @@ class PaginateQuerysetTests(PagingBase):
         )
 
 
+class RobustnessTests(PagingBase):
+    def test_rows_str_id_with_int_type_invalid(self):
+        tok = b64({"e": "e", "k": "2026-01-01T00:00:00Z", "i": "abc"})
+        with self.assertRaises(InvalidParameter):
+            paginate_rows(
+                lambda *a: [], endpoint="e", key="ts", id_key="rid",
+                query=q(cursor=tok), id_type=int,
+            )
+
+    def test_rows_id_types(self):
+        u = uuid.uuid4()
+        seen = []
+        tok = encode_cursor("e", datetime(2026, 1, 1, tzinfo=UTC), u)
+        paginate_rows(lambda k, i, n: seen.append(i) or [], endpoint="e", key="ts",
+                      id_key="rid", query=q(cursor=tok), id_type=uuid.UUID)
+        tok = encode_cursor("e", datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 2, 1, tzinfo=UTC))
+        paginate_rows(lambda k, i, n: seen.append(i) or [], endpoint="e", key="ts",
+                      id_key="rid", query=q(cursor=tok), id_type=datetime)
+        self.assertEqual(seen, [u, datetime(2026, 2, 1, tzinfo=UTC)])
+
+    def test_overflow_date_param(self):
+        for v in ("9999-12-31T23:59:59-01:00", "0001-01-01T00:00:00+01:00"):
+            with self.assertRaises(InvalidParameter, msg=v):
+                q(start=v)
+
+    def test_overflow_date_in_cursor(self):
+        for v in ("9999-12-31T23:59:59-01:00", "0001-01-01T00:00:00+01:00"):
+            with self.assertRaises(InvalidParameter, msg=v):
+                decode_cursor("e", b64({"e": "e", "k": v, "i": 1}))
+
+    def test_huge_int_id(self):
+        tok = b64({"e": "fills", "k": "2026-01-01T00:00:00Z", "i": 10**30})
+        with self.assertRaises(InvalidParameter):
+            self.page(tok)
+
+
 class PaginateRowsTests(TestCase):
     def setUp(self):
         t = datetime(2026, 1, 1, tzinfo=UTC)

@@ -36,6 +36,8 @@ def _bad_cursor():
 
 
 def _json_id(value: Any):
+    if isinstance(value, datetime):
+        return iso(value)
     return value if isinstance(value, int) and not isinstance(value, bool) else str(value)
 
 
@@ -48,7 +50,7 @@ def encode_cursor(endpoint: str, key: datetime, id: Any) -> str:
 def decode_cursor(endpoint: str, token: str) -> tuple[datetime, Any]:
     try:
         data = json.loads(base64.urlsafe_b64decode(token.encode()))
-    except (ValueError, binascii.Error, UnicodeError):
+    except (ValueError, binascii.Error, UnicodeError, RecursionError):
         raise _bad_cursor()
     if not isinstance(data, dict):
         raise _bad_cursor()
@@ -72,16 +74,36 @@ def _row_value(row, path: str):
     return row
 
 
+INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
+
+
+def _coerce_value(typ, value):
+    """Coerce a decoded cursor id to ``typ`` (int, str, UUID or datetime)."""
+    try:
+        if typ is int:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError
+            if not INT64_MIN <= value <= INT64_MAX:
+                raise ValueError
+            return value
+        if typ is uuid.UUID:
+            return uuid.UUID(str(value))
+        if typ is datetime:
+            if not isinstance(value, str):
+                raise ValueError
+            return parse_datetime(value, "cursor")
+        return str(value)
+    except (ValueError, InvalidParameter):
+        raise _bad_cursor()
+
+
 def _coerce_id(model, value):
     """Convert a decoded cursor id to the type of the model's primary key."""
     pk = model._meta.pk
     if pk.get_internal_type() == "UUIDField":
-        try:
-            return uuid.UUID(str(value))
-        except ValueError:
-            raise _bad_cursor()
-    if isinstance(pk, (IntegerField,)) and not isinstance(value, int):
-        raise _bad_cursor()
+        return _coerce_value(uuid.UUID, value)
+    if isinstance(pk, IntegerField):
+        return _coerce_value(int, value)
     return value
 
 
@@ -100,7 +122,11 @@ def _build(rows, got_more, query, endpoint, key_of, id_of) -> Page:
 def paginate_queryset(qs, *, endpoint: str, key: str, query: Query) -> Page:
     """Page a queryset by ``(key, id)``.
 
-    ``key`` may be a related lookup path (``analysis__data_cutoff``). Filters
+    ``key`` may be a related lookup path (``analysis__data_cutoff``) but must be
+    a forward FK or one-to-one path. Rows with a NULL key are excluded by the
+    hold-back filter, so endpoints must choose non-null keys.
+
+ Filters
     applied to ``key``: ``updated_since`` (>=), ``start`` (>=) and ``end`` (<=)
     when set (an endpoint wanting different semantics should pre-filter ``qs``
     and leave those unset), the hold-back (<= now - HOLD_BACK), and the cursor.
@@ -134,16 +160,20 @@ def paginate_rows(
     key: str,
     id_key: str,
     query: Query,
+    id_type: type = int,
 ) -> Page:
     """Same contract for raw-SQL sources.
 
     ``fetch(after_key, after_id, limit)`` must return dict rows ordered by
     ``(key, id_key)`` strictly after the cursor (all rows when the cursor is
     absent), applying the endpoint's filters and the hold-back itself.
+    ``after_id`` is coerced with ``id_type`` (int, str, uuid.UUID or datetime);
+    a cursor id that does not fit gives an invalid-cursor 400.
     """
     after_key, after_id = (None, None)
     if query.cursor:
         after_key, after_id = decode_cursor(endpoint, query.cursor)
+        after_id = _coerce_value(id_type, after_id)
     rows = fetch(after_key, after_id, query.page_size + 1)
     return _build(
         rows, len(rows) > query.page_size, query, endpoint, lambda r: r[key], lambda r: r[id_key]

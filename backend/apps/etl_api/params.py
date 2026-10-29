@@ -34,11 +34,11 @@ def parse_datetime(value: str, name: str) -> datetime:
     """ISO-8601 (``Z`` accepted); naive is taken as UTC, offsets converted to UTC."""
     try:
         dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=dt_timezone.utc)
+        return dt.astimezone(dt_timezone.utc)
+    except (ValueError, OverflowError):
         raise _invalid(f"'{name}' is not a valid ISO-8601 datetime.", name, "invalid_datetime")
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=dt_timezone.utc)
-    return dt.astimezone(dt_timezone.utc)
 
 
 def parse_query(
