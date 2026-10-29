@@ -1,9 +1,10 @@
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+from django.db import IntegrityError
 from django.test import TestCase
 
-from apps.engine.models import StrategyVersion
+from apps.engine.models import ConfigVersion, StrategyVersion
 from apps.engine.versioning import (
     digest,
     resolve_config_version,
@@ -11,6 +12,9 @@ from apps.engine.versioning import (
     strategy_snapshot,
 )
 from apps.trading.models import StrategySettings
+
+_NO_MATCH = MagicMock()
+_NO_MATCH.first.return_value = None
 
 
 class CanonicalHashTests(TestCase):
@@ -50,15 +54,28 @@ class StrategyVersionTests(TestCase):
             b = resolve_strategy_version()
         self.assertNotEqual(a.id, b.id)
 
+    def test_git_sha_only_change_records_code_sha_diff(self):
+        with patch.dict(os.environ, {"GIT_SHA": "abc"}):
+            a = resolve_strategy_version()
+        with patch.dict(os.environ, {"GIT_SHA": "def"}):
+            b = resolve_strategy_version()
+        self.assertEqual(b.parent_id, a.id)
+        self.assertEqual(b.diff["code_sha"], {"from": "abc", "to": "def"})
+
     def test_resolve_is_race_safe(self):
-        # Simulate a concurrent writer inserting the row between lookup and create.
+        # Lost race: the existence check misses, the other writer's row is
+        # already committed, and our get_or_create hits the unique key.
         snap = strategy_snapshot()
-        StrategyVersion.objects.create(
-            id=digest({"snapshot": snap, "code_sha": "unknown"}),
-            snapshot=snap,
-            code_sha="unknown",
-        )
-        v = resolve_strategy_version(snapshot=snap, code_sha="unknown")
+        vid = digest({"snapshot": snap, "code_sha": "unknown"})
+        StrategyVersion.objects.create(id=vid, snapshot=snap, code_sha="unknown")
+        with patch.object(
+            StrategyVersion.objects, "filter", return_value=_NO_MATCH
+        ), patch(
+            "django.db.models.query.QuerySet.get_or_create",
+            side_effect=IntegrityError("duplicate key"),
+        ):
+            v = resolve_strategy_version(snapshot=snap, code_sha="unknown")
+        self.assertEqual(v.id, vid)
         self.assertEqual(StrategyVersion.objects.count(), 1)
         self.assertEqual(v.snapshot, snap)
 
@@ -74,3 +91,18 @@ class ConfigVersionTests(TestCase):
             resolve_config_version("BTCUSDT", p).id,
             resolve_config_version("ETHUSDT", p).id,
         )
+
+    def test_resolve_is_race_safe(self):
+        p = {"grid_levels": 12}
+        vid = digest({"symbol": "BTCUSDT", "params": p})
+
+        ConfigVersion.objects.create(id=vid, symbol="BTCUSDT", params=p)
+        with patch.object(
+            ConfigVersion.objects, "filter", return_value=_NO_MATCH
+        ), patch(
+            "django.db.models.query.QuerySet.get_or_create",
+            side_effect=IntegrityError("duplicate key"),
+        ):
+            v = resolve_config_version("BTCUSDT", p)
+        self.assertEqual(v.id, vid)
+        self.assertEqual(ConfigVersion.objects.count(), 1)
