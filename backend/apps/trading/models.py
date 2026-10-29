@@ -98,7 +98,11 @@ class PaperFill(models.Model):
 
     class Meta:
         ordering = ["-time", "-id"]
-        indexes = [models.Index(fields=["time", "id"])]
+        # (created_at, id) is the v1 fills paging key.
+        indexes = [
+            models.Index(fields=["time", "id"]),
+            models.Index(fields=["created_at", "id"]),
+        ]
 
     def __str__(self) -> str:
         return f"{self.session.coin.symbol} {self.side} {self.qty} @ {self.price}"

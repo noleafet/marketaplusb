@@ -95,6 +95,8 @@ class CoinAnalysis(models.Model):
         indexes = [
             models.Index(fields=["analysis", "rank"]),
             models.Index(fields=["coin", "-created_at"]),
+            # (created_at, id) is the v1 backtests paging key.
+            models.Index(fields=["created_at", "id"]),
         ]
 
     def __str__(self) -> str:
