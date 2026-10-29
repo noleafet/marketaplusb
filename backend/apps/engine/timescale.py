@@ -131,6 +131,69 @@ def load_funding(symbol: str, start: datetime, end: datetime) -> list[dict[str, 
     return rows
 
 
+def page_candles(
+    symbol: str,
+    interval: str,
+    lower: datetime | None,
+    upper: datetime,
+    after: datetime | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Ascending candles with ``lower <= time <= upper`` and ``time > after``."""
+    sql = [
+        "SELECT time, open, high, low, close, volume, quote_volume, trades",
+        "FROM market_candles WHERE symbol = %s AND interval = %s AND time <= %s",
+    ]
+    params: list[Any] = [symbol, interval, _aware(upper)]
+    if lower is not None:
+        sql.append("AND time >= %s")
+        params.append(_aware(lower))
+    if after is not None:
+        sql.append("AND time > %s")
+        params.append(_aware(after))
+    sql.append("ORDER BY time ASC LIMIT %s")
+    params.append(limit)
+    with connection.cursor() as cursor:
+        cursor.execute(" ".join(sql), params)
+        columns = [c[0] for c in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    for row in rows:
+        row["time"] = _aware(row["time"])
+        for key in ("open", "high", "low", "close", "volume", "quote_volume"):
+            row[key] = float(row[key])
+    return rows
+
+
+def page_funding(
+    symbol: str,
+    lower: datetime | None,
+    upper: datetime,
+    after: datetime | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Ascending funding rows with ``lower <= time <= upper`` and ``time > after``."""
+    sql = ["SELECT time, rate, mark_price FROM funding_rates WHERE symbol = %s AND time <= %s"]
+    params: list[Any] = [symbol, _aware(upper)]
+    if lower is not None:
+        sql.append("AND time >= %s")
+        params.append(_aware(lower))
+    if after is not None:
+        sql.append("AND time > %s")
+        params.append(_aware(after))
+    sql.append("ORDER BY time ASC LIMIT %s")
+    params.append(limit)
+    with connection.cursor() as cursor:
+        cursor.execute(" ".join(sql), params)
+        return [
+            {
+                "time": _aware(r[0]),
+                "rate": float(r[1]),
+                "mark_price": None if r[2] is None else float(r[2]),
+            }
+            for r in cursor.fetchall()
+        ]
+
+
 def insert_equity_points(rows: Iterable[dict[str, Any]]) -> int:
     values = [
         (
