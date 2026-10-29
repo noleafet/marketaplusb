@@ -152,3 +152,114 @@ def fold_out(fold) -> dict | None:
         "test_metrics": metrics_block(fold.get("test_metrics")),
         "regime": fold.get("regime"),
     }
+
+
+def _session_state(session) -> dict:
+    from apps.trading.events import session_state
+
+    try:
+        return session_state(session)
+    except (AttributeError, TypeError, ValueError):
+        # Odd stored grid_state (non-dict, non-numeric levels): serve the grid empty.
+        session.grid_state = {}
+        return session_state(session)
+
+
+def session_out(s) -> dict:
+    return {
+        "id": str(s.pk),
+        "environment": "paper",
+        "symbol": s.coin.binance_symbol,
+        "strategy_version": s.strategy_version_id,
+        "config_version": s.config_version_id,
+        "started_at": iso(s.started_at),
+        "last_tick_at": iso(s.last_tick_at),
+        "updated_at": iso(s.updated_at),
+        **_session_state(s),
+    }
+
+
+def snapshot_out(snap) -> dict:
+    return {
+        "session_id": str(snap.session_id),
+        "time": iso(snap.time),
+        "trigger": snap.trigger,
+        "state": snap.state if isinstance(snap.state, dict) else {},
+        "strategy_version": snap.strategy_version_id,
+        "config_version": snap.config_version_id,
+        "backfilled": snap.backfilled,
+    }
+
+
+def equity_out(row: dict) -> dict:
+    return {
+        "time": iso(row["time"]),
+        "equity": row["equity"],
+        "price": row["price"],
+        "position_qty": row["position_qty"],
+        "drawdown": row["drawdown"],
+    }
+
+
+def fill_out(f) -> dict:
+    return {
+        "id": f.pk,
+        "session_id": str(f.session_id),
+        "environment": "paper",
+        "symbol": f.session.coin.binance_symbol,
+        "time": iso(f.time),
+        "created_at": iso(f.created_at),
+        "side": f.side,
+        "price": f.price,
+        "qty": f.qty,
+        "notional": f.notional,
+        "fee": f.fee,
+        "realized_pnl": f.realized_pnl,
+        "level": f.level,
+        "reason": f.reason,
+        "strategy_version": f.strategy_version_id,
+        "config_version": f.config_version_id,
+    }
+
+
+def evaluation_out(e) -> dict:
+    return {
+        "id": e.pk,
+        "session_id": str(e.session_id),
+        "evaluated_at": iso(e.evaluated_at),
+        "passed": e.passed,
+        "metrics": metrics_block(e.metrics),
+        "failures": e.failures,
+        "thresholds": e.thresholds,
+    }
+
+
+def event_out(e) -> dict:
+    return {
+        "id": e.pk,
+        "time": iso(e.time),
+        "type": e.type,
+        "environment": e.environment,
+        "symbol": e.symbol,
+        "session_id": str(e.session_id) if e.session_id else None,
+        "reason": e.reason,
+        "before": e.before,
+        "after": e.after,
+        "strategy_version": e.strategy_version_id,
+        "config_version": e.config_version_id,
+        "backfilled": e.backfilled,
+    }
+
+
+def order_audit_out(a) -> dict:
+    return {
+        "created_at": iso(a.created_at),
+        "symbol": a.symbol,
+        "side": a.side,
+        "order_type": a.order_type,
+        "qty": a.qty,
+        "price": a.price,
+        "notional": a.notional,
+        "allowed": a.allowed,
+        "reason": a.reason,
+    }

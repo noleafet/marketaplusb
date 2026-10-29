@@ -194,6 +194,45 @@ def page_funding(
         ]
 
 
+def page_equity(
+    session_id: str,
+    lower: datetime | None,
+    upper: datetime,
+    after: datetime | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Ascending equity rows with ``lower <= time <= upper`` and ``time > after``."""
+    sql = [
+        "SELECT time, equity, price, position_qty, drawdown FROM paper_equity_points"
+        " WHERE session_id = %s AND time <= %s"
+    ]
+    params: list[Any] = [str(session_id), _aware(upper)]
+    if lower is not None:
+        sql.append("AND time >= %s")
+        params.append(_aware(lower))
+    if after is not None:
+        sql.append("AND time > %s")
+        params.append(_aware(after))
+    sql.append("ORDER BY time ASC LIMIT %s")
+    params.append(limit)
+
+    def _f(v):
+        return None if v is None else float(v)
+
+    with connection.cursor() as cursor:
+        cursor.execute(" ".join(sql), params)
+        return [
+            {
+                "time": _aware(r[0]),
+                "equity": _f(r[1]),
+                "price": _f(r[2]),
+                "position_qty": _f(r[3]),
+                "drawdown": _f(r[4]),
+            }
+            for r in cursor.fetchall()
+        ]
+
+
 def insert_equity_points(rows: Iterable[dict[str, Any]]) -> int:
     values = [
         (
