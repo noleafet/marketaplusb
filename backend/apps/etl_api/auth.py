@@ -1,3 +1,4 @@
+import secrets
 from datetime import timedelta
 
 from django.utils import timezone
@@ -20,8 +21,10 @@ class ApiKeyAuthentication(BaseAuthentication):
         token = token.strip()
         if scheme.lower() != "bearer" or not token.startswith("mpb_"):
             raise Unauthenticated("Malformed or unknown API key.")
-        client = ApiClient.objects.filter(key_hash=hash_key(token)).first()
-        if client is None:
+        client = ApiClient.objects.filter(key_prefix=token[:12]).first()
+        if client is None or not secrets.compare_digest(
+            client.key_hash, hash_key(token)
+        ):
             raise Unauthenticated("Malformed or unknown API key.")
         if client.revoked_at is not None:
             raise RevokedKey("This API key has been revoked.")

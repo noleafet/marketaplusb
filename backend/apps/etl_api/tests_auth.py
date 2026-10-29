@@ -1,4 +1,6 @@
+from datetime import datetime, timezone as dt_tz
 from io import StringIO
+from unittest import mock
 
 from django.core.management import call_command
 from django.test import TestCase, override_settings
@@ -87,8 +89,34 @@ class AuthTests(TestCase):
         self.assertEqual(self.client_row.last_used_at, first)
 
 
+    def test_bearer_edge_cases_401(self):
+        for header in ("Bearer", "Bearer ", "Bearer    "):
+            self.api.credentials(HTTP_AUTHORIZATION=header)
+            r = self.api.get(HEALTH)
+            self.assertEqual(r.status_code, 401, header)
+            self.assertTrue(r.json()["type"].endswith("unauthenticated"))
+
+    def test_valid_prefix_wrong_suffix_401(self):
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {self.key[:12]}WRONGSUFFIX")
+        r = self.api.get(HEALTH)
+        self.assertEqual(r.status_code, 401)
+        self.assertTrue(r.json()["type"].endswith("unauthenticated"))
+
+    def test_unknown_path_404_problem_json(self):
+        self.auth()
+        r = self.api.get("/api/v1/nope/")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r["Content-Type"], "application/problem+json")
+        self.assertTrue(r.json()["type"].endswith("not_found"))
+
+
+FIXED_NOW = datetime(2026, 10, 30, 12, 0, 30, tzinfo=dt_tz.utc)
+NEXT_MIN = int(datetime(2026, 10, 30, 12, 1, 0, tzinfo=dt_tz.utc).timestamp())
+
+
+@mock.patch("apps.etl_api.throttling._now", return_value=FIXED_NOW)
 class ThrottleTests(TestCase):
-    def test_limit_exceeded_429_retry_after(self):
+    def test_limit_exceeded_429_retry_after(self, _now):
         row, key = create_client("t", rate_limit_per_min=2)
         api = APIClient()
         api.credentials(HTTP_AUTHORIZATION=f"Bearer {key}")
@@ -96,10 +124,11 @@ class ThrottleTests(TestCase):
         api.get(HEALTH)
         r = api.get(HEALTH)
         self.assertEqual(r.status_code, 429)
-        self.assertTrue(1 <= int(r["Retry-After"]) <= 60)
+        self.assertEqual(r["Retry-After"], "30")
+        self.assertEqual(r["X-RateLimit-Reset"], str(NEXT_MIN))
         self.assertEqual(r.json()["type"].rsplit("/", 1)[1], "rate_limited")
 
-    def test_throttle_counts_in_database(self):
+    def test_throttle_counts_in_database(self, _now):
         row, key = create_client("t2")
         for _ in range(2):
             api = APIClient()

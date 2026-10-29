@@ -12,13 +12,17 @@ WINDOW_SECONDS = 60
 RETENTION = timedelta(hours=1)
 
 
+def _now():
+    return timezone.now()
+
+
 class ClientRateThrottle(BaseThrottle):
     """Fixed 60 s window per client, counted in the database (no cache configured)."""
 
     def allow_request(self, request, view) -> bool:
         client = request.user
         limit = client.rate_limit_per_min
-        now = timezone.now()
+        now = _now()
         epoch = int(now.timestamp())
         start_epoch = epoch - epoch % WINDOW_SECONDS
         reset_epoch = start_epoch + WINDOW_SECONDS

@@ -3,7 +3,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ..auth import ApiKeyAuthentication, HasReadScope
-from ..errors import problem_exception_handler
+from ..errors import NotFoundProblem, problem_exception_handler
 from ..serializers import iso
 from ..throttling import ClientRateThrottle
 
@@ -35,3 +35,10 @@ class V1View(APIView):
             response["X-RateLimit-Remaining"] = str(remaining)
             response["X-RateLimit-Reset"] = str(reset)
         return response
+
+
+class NotFoundView(V1View):
+    """Catch-all so unknown /api/v1/ paths return problem+json 404."""
+
+    def get(self, request, *args, **kwargs):
+        raise NotFoundProblem("No such endpoint.")
