@@ -13,6 +13,9 @@ RUN apt-get update \
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
+ARG GIT_SHA=unknown
+ENV GIT_SHA=$GIT_SHA
+
 COPY . .
 
 EXPOSE 8000

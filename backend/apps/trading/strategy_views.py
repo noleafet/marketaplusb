@@ -11,12 +11,14 @@ from apps.engine.analysis import latest_analysis
 from apps.engine.models import AnalysisRun, CoinAnalysis
 from apps.engine.robustness import _pair_correlation
 from apps.engine.timescale import load_daily_equity
+from apps.engine.versioning import diff_snapshots, resolve_strategy_version
 from apps.engine.validation import pooled_ic
 from apps.engine.scoring import FACTOR_WEIGHTS
 from apps.jobs.runner import JobAlreadyActive, enqueue_job
 from apps.jobs.models import JobRun
 from apps.jobs.serializers import JobRunSerializer
-from apps.trading.models import PaperSession, StrategySettings
+from apps.trading.events import record_event
+from apps.trading.models import GridEvent, PaperSession, StrategySettings
 from apps.trading.portfolio import open_sessions
 
 HISTORY_RUNS = 12
@@ -112,7 +114,19 @@ class StrategySettingsView(viewsets.ViewSet):
         row = StrategySettings.load()
         serializer = StrategySettingsSerializer(row, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
+        old_version = resolve_strategy_version(row)
         serializer.save()
+        new_version = resolve_strategy_version(row)
+        if new_version.id != old_version.id:
+            diff = diff_snapshots(old_version.snapshot, new_version.snapshot)
+            diff.pop("code_sha", None)
+            record_event(
+                GridEvent.Type.PARAM_CHANGE,
+                reason="settings_update",
+                before={k: d["from"] for k, d in diff.items()},
+                after={k: d["to"] for k, d in diff.items()},
+                strategy_version=new_version,
+            )
         payload = self._payload(row)
         if request.data.get("rerun_analysis") and payload["analysis_stale"]:
             try:

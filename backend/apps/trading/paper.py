@@ -14,11 +14,14 @@ from apps.common.binance import INTERVAL_MS, BinanceError, BinanceFuturesClient,
 from apps.engine.grid import GridParams, SimulationConfig, funding_zscore
 from apps.engine.models import AnalysisRun, DecisionLog, log_decision
 from apps.engine.timescale import insert_equity_points
+from apps.engine.versioning import resolve_config_version, resolve_strategy_version
 from apps.trading import portfolio, risk
 from apps.trading.execution import PaperExecutionAdapter
+from apps.trading.events import record_event, snapshot_session
 from apps.trading.hybrid import TrendSignal
 from apps.trading.hybrid import evaluate as evaluate_trend
 from apps.trading.models import (
+    GridEvent,
     LiveTradingState,
     PaperEvaluation,
     PaperFill,
@@ -93,6 +96,10 @@ def ensure_paper_sessions(
             analysis=analysis,
             status=PaperSession.Status.ACTIVE,
             params=item.get("params") or {},
+            strategy_version=resolve_strategy_version(settings_row),
+            config_version=resolve_config_version(
+                coin.binance_symbol, item.get("params") or {}
+            ),
             config=config,
             grid_state={},
             capital=config["capital"],
@@ -104,6 +111,7 @@ def ensure_paper_sessions(
             last_funding_at=now,
         )
         created.append(session)
+        snapshot_session(session, "start")
         log_decision(
             "paper",
             f"Paper session opened for {coin.symbol} from analysis {analysis.id}.",
@@ -159,6 +167,8 @@ def retire_stale_sessions(
                 [
                     PaperFill(
                         session=session,
+                        strategy_version_id=session.strategy_version_id,
+                        config_version_id=session.config_version_id,
                         time=fill.time,
                         side=fill.side,
                         price=fill.price,
@@ -179,6 +189,8 @@ def retire_stale_sessions(
         session.stop_reason = reason
         session.promotion_ready = False
         session.save()
+        record_event(GridEvent.Type.RETIRE, session=session, reason=reason)
+        snapshot_session(session, "retire")
         retired.append(session.coin.symbol)
         log_decision(
             "paper",
@@ -403,6 +415,7 @@ def _tick_session(
     if not symbol:
         return {"ok": False, "error": "no Binance symbol"}
 
+    rebalance_event: dict[str, Any] | None = None
     trading_state = LiveTradingState.load()
     hybrid = trading_state.mode == LiveTradingState.Mode.HYBRID
     # Book-level limits only ever block new buys.
@@ -551,12 +564,20 @@ def _tick_session(
             session.promotion_ready = False
 
         if strategy.rebalances > rebalances_before:
+            rebalance_payload = _grid_log_payload(session, strategy, last_price)
+            rebalance_event = {
+                "reason": strategy.last_rebalance_reason,
+                "after": {
+                    key: rebalance_payload[key]
+                    for key in ("range_low", "range_high", "active_levels")
+                },
+            }
             log_decision(
                 "paper",
                 f"{session.coin.symbol} grid rebalanced "
                 f"({strategy.last_rebalance_reason}).",
                 coin=session.coin,
-                payload=_grid_log_payload(session, strategy, last_price),
+                payload=rebalance_payload,
             )
 
         if funding_fetched:
@@ -582,6 +603,8 @@ def _tick_session(
             [
                 PaperFill(
                     session=session,
+                    strategy_version_id=session.strategy_version_id,
+                    config_version_id=session.config_version_id,
                     time=fill.time,
                     side=fill.side,
                     price=fill.price,
@@ -625,6 +648,15 @@ def _tick_session(
     if funding_fetched:
         session.last_funding_at = now
     session.save()
+
+    if rebalance_event is not None:
+        record_event(
+            GridEvent.Type.REBALANCE,
+            session=session,
+            reason=rebalance_event["reason"],
+            after=rebalance_event["after"],
+        )
+        snapshot_session(session, "rebalance")
 
     insert_equity_points(
         [
@@ -919,6 +951,8 @@ def pause_session(session: PaperSession) -> PaperSession:
     if session.status == PaperSession.Status.ACTIVE:
         session.status = PaperSession.Status.PAUSED
         session.save(update_fields=["status", "updated_at"])
+        record_event(GridEvent.Type.PAUSE, session=session)
+        snapshot_session(session, "pause")
         log_decision(
             "paper",
             f"{session.coin.symbol} paper session paused.",
@@ -936,6 +970,8 @@ def resume_session(session: PaperSession) -> PaperSession:
         # instead of replaying bars from before the pause.
         session.grid_state = {}
         session.save(update_fields=["status", "last_tick_at", "grid_state", "updated_at"])
+        record_event(GridEvent.Type.RESUME, session=session)
+        snapshot_session(session, "resume")
         log_decision(
             "paper",
             f"{session.coin.symbol} paper session resumed.",
@@ -951,6 +987,8 @@ def stop_session(session: PaperSession, reason: str = "manual_stop") -> PaperSes
         session.stop_reason = reason
         session.promotion_ready = False
         session.save(update_fields=["status", "stop_reason", "promotion_ready", "updated_at"])
+        record_event(GridEvent.Type.STOP, session=session, reason=reason)
+        snapshot_session(session, "stop")
         log_decision(
             "paper",
             f"{session.coin.symbol} paper session stopped: {reason}.",

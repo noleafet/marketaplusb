@@ -22,6 +22,7 @@ from apps.engine.grid import GridParams, SimulationConfig
 from apps.engine.hybrid_gate import Gate, build_gate
 from apps.engine.models import AnalysisRun, CoinAnalysis, log_decision
 from apps.engine.reports import build_reports
+from apps.engine.versioning import resolve_config_version, resolve_strategy_version
 from apps.engine.robustness import (
     correlation_diagnostics,
     daily_returns,
@@ -292,6 +293,7 @@ def _run_daily_analysis(
     warmup_days = int(cfg["WARMUP_BUFFER_DAYS"])
 
     analysis = AnalysisRun.objects.create(
+        strategy_version=resolve_strategy_version(),
         status=AnalysisRun.Status.RUNNING,
         trigger=trigger,
         mode=trend_mode,
@@ -636,6 +638,9 @@ def _run_daily_analysis(
         for item in ranked:
             saved.append(
                 CoinAnalysis.objects.create(
+                    config_version=resolve_config_version(
+                        item["coin"].binance_symbol, item.get("params") or {}
+                    ),
                     analysis=analysis,
                     coin=item["coin"],
                     rank=item.get("rank"),

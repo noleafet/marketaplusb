@@ -113,6 +113,8 @@ section 4.
    - Builder: **Dockerfile**
    - Dockerfile location: `/backend/Dockerfile`
    - Build context: `/backend`
+   - Build argument `GIT_SHA`: stamps the code revision into strategy versions. With Docker Compose use
+     `GIT_SHA=$(git rev-parse HEAD) docker compose build`; without it the SHA is `unknown`.
 4. Runtime:
    - Service type: **Web service**
    - Instance: `nf-compute-20` (0.2 vCPU / 512 MB)

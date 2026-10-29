@@ -17,7 +17,8 @@ from django.utils import timezone
 
 from apps.common.binance import BinanceFuturesClient
 from apps.engine.grid import GridParams, SimulationConfig, max_position_notional
-from apps.trading.models import LiveOrderAudit, LiveTradingState
+from apps.trading.events import record_event
+from apps.trading.models import GridEvent, LiveOrderAudit, LiveTradingState
 
 logger = logging.getLogger("engine")
 
@@ -375,6 +376,12 @@ def set_kill_switch(engaged: bool, reason: str = "") -> LiveTradingState:
     state.kill_switch = engaged
     state.kill_reason = reason or ("Manual kill switch" if engaged else "Released manually")
     state.save(update_fields=["kill_switch", "kill_reason", "updated_at"])
+    record_event(
+        GridEvent.Type.KILL_SWITCH,
+        environment="live",
+        reason=state.kill_reason,
+        after={"engaged": engaged},
+    )
     if engaged:
         logger.warning("LIVE KILL SWITCH ENGAGED: %s", state.kill_reason)
     return state
