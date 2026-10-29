@@ -1,5 +1,8 @@
 """Backfill version stamps, start snapshots and grid events for legacy rows."""
 
+import uuid
+from collections import defaultdict
+
 from django.db import migrations
 
 # Intentional: digest is the identity contract shared with the live resolvers.
@@ -19,6 +22,20 @@ def _grid_spacing(levels):
 _GRID_KEYS = ("range_low", "range_high", "levels")
 _PAUSED = "paper session paused."
 _RESUMED = "paper session resumed."
+_CHUNK = 1000
+
+
+def _chunks(items):
+    items = list(items)
+    for i in range(0, len(items), _CHUNK):
+        yield items[i:i + _CHUNK]
+
+
+def _stamp(model, field, groups):
+    """One UPDATE per version id (chunked): ``groups`` maps version id -> pks."""
+    for vid, pks in groups.items():
+        for chunk in _chunks(pks):
+            model.objects.filter(pk__in=chunk).update(**{field: vid})
 
 
 def _strategy_version(apps, snapshot, code_sha="unknown"):
@@ -76,22 +93,32 @@ def _backfill_sessions(apps):
     PaperSession = apps.get_model("trading", "PaperSession")
     PaperFill = apps.get_model("trading", "PaperFill")
     SessionSnapshot = apps.get_model("trading", "SessionSnapshot")
+    has_start = set(
+        SessionSnapshot.objects.filter(trigger="start").values_list("session_id", flat=True)
+    )
+    cv_groups, sv_groups = defaultdict(list), defaultdict(list)
+    fill_cv, fill_sv = defaultdict(list), defaultdict(list)
+    cv_ids, sv_ids = set(), set()
+    snapshots = []
     for session in PaperSession.objects.select_related("coin").iterator():
-        changed = []
         if session.config_version_id is None:
-            cv = _config_version(apps, session.coin.binance_symbol, session.params)
-            session.config_version_id = cv.id
-            changed.append("config_version")
+            symbol = session.coin.binance_symbol
+            vid = digest({"symbol": symbol, "params": session.params})
+            if vid not in cv_ids:
+                _config_version(apps, symbol, session.params)
+                cv_ids.add(vid)
+            session.config_version_id = vid
+            cv_groups[vid].append(session.pk)
         if session.strategy_version_id is None:
-            sv = _strategy_version(apps, {"paper_config": session.config})
-            session.strategy_version_id = sv.id
-            changed.append("strategy_version")
-        if changed:
-            PaperSession.objects.filter(pk=session.pk).update(
-                **{f"{name}_id": getattr(session, f"{name}_id") for name in changed}
-            )
-        if not SessionSnapshot.objects.filter(session_id=session.pk, trigger="start").exists():
-            SessionSnapshot.objects.create(
+            snap = {"paper_config": session.config}
+            vid = digest({"snapshot": snap, "code_sha": "unknown"})
+            if vid not in sv_ids:
+                _strategy_version(apps, snap)
+                sv_ids.add(vid)
+            session.strategy_version_id = vid
+            sv_groups[vid].append(session.pk)
+        if session.pk not in has_start:
+            snapshots.append(SessionSnapshot(
                 session_id=session.pk,
                 time=session.started_at,
                 trigger="start",
@@ -99,25 +126,51 @@ def _backfill_sessions(apps):
                 strategy_version_id=session.strategy_version_id,
                 config_version_id=session.config_version_id,
                 backfilled=True,
-            )
-        PaperFill.objects.filter(session_id=session.pk, strategy_version__isnull=True).update(
-            strategy_version_id=session.strategy_version_id
-        )
-        PaperFill.objects.filter(session_id=session.pk, config_version__isnull=True).update(
-            config_version_id=session.config_version_id
-        )
+            ))
+        fill_sv[session.strategy_version_id].append(session.pk)
+        fill_cv[session.config_version_id].append(session.pk)
+    _stamp(PaperSession, "config_version_id", cv_groups)
+    _stamp(PaperSession, "strategy_version_id", sv_groups)
+    SessionSnapshot.objects.bulk_create(snapshots, batch_size=_CHUNK)
+    for vid, session_ids in fill_sv.items():
+        for chunk in _chunks(session_ids):
+            PaperFill.objects.filter(
+                session_id__in=chunk, strategy_version__isnull=True
+            ).update(strategy_version_id=vid)
+    for vid, session_ids in fill_cv.items():
+        for chunk in _chunks(session_ids):
+            PaperFill.objects.filter(
+                session_id__in=chunk, config_version__isnull=True
+            ).update(config_version_id=vid)
 
 
 def _backfill_analyses(apps):
     CoinAnalysis = apps.get_model("engine", "CoinAnalysis")
     AnalysisRun = apps.get_model("engine", "AnalysisRun")
-    for row in CoinAnalysis.objects.filter(config_version__isnull=True).select_related("coin").iterator():
-        cv = _config_version(apps, row.coin.binance_symbol, row.params)
-        CoinAnalysis.objects.filter(pk=row.pk).update(config_version_id=cv.id)
-    for run in AnalysisRun.objects.filter(strategy_version__isnull=True).iterator():
-        params = run.params if isinstance(run.params, dict) else {}
-        sv = _strategy_version(apps, {"analysis_config": params.get("config", {})})
-        AnalysisRun.objects.filter(pk=run.pk).update(strategy_version_id=sv.id)
+    # values_list keeps the large chart/folds/trade_sample JSON out of memory.
+    groups, seen = defaultdict(list), set()
+    rows = CoinAnalysis.objects.filter(config_version__isnull=True).values_list(
+        "pk", "params", "coin__binance_symbol"
+    )
+    for pk, params, symbol in rows.iterator():
+        vid = digest({"symbol": symbol, "params": params})
+        if vid not in seen:
+            _config_version(apps, symbol, params)
+            seen.add(vid)
+        groups[vid].append(pk)
+    _stamp(CoinAnalysis, "config_version_id", groups)
+
+    groups, seen = defaultdict(list), set()
+    rows = AnalysisRun.objects.filter(strategy_version__isnull=True).values_list("pk", "params")
+    for pk, params in rows.iterator():
+        params = params if isinstance(params, dict) else {}
+        snap = {"analysis_config": params.get("config", {})}
+        vid = digest({"snapshot": snap, "code_sha": "unknown"})
+        if vid not in seen:
+            _strategy_version(apps, snap)
+            seen.add(vid)
+        groups[vid].append(pk)
+    _stamp(AnalysisRun, "strategy_version_id", groups)
 
 
 def _event_for(log, payload):
@@ -139,12 +192,24 @@ def _event_for(log, payload):
     return None
 
 
+def _session_uuid(raw_id):
+    try:
+        return uuid.UUID(str(raw_id))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 def _backfill_events(apps):
     DecisionLog = apps.get_model("engine", "DecisionLog")
     PaperSession = apps.get_model("trading", "PaperSession")
     GridEvent = apps.get_model("trading", "GridEvent")
-    sessions = {}
-    for log in DecisionLog.objects.filter(category="paper").order_by("created_at", "id").iterator():
+    candidates = []
+    logs = (
+        DecisionLog.objects.filter(category="paper")
+        .order_by("created_at", "id")
+        .only("created_at", "message", "payload")
+    )
+    for log in logs.iterator():
         payload = log.payload if isinstance(log.payload, dict) else {}
         raw_id = payload.get("session_id")
         if not raw_id:
@@ -152,20 +217,35 @@ def _backfill_events(apps):
         converted = _event_for(log, payload)
         if converted is None:
             continue
-        key = str(raw_id)
-        if key not in sessions:
-            try:
-                sessions[key] = PaperSession.objects.select_related("coin").filter(pk=key).first()
-            except (ValueError, TypeError):
-                sessions[key] = None
-        session = sessions[key]
+        sid = _session_uuid(raw_id)
+        if sid is None:
+            continue
+        candidates.append((log.created_at, sid, converted))
+    if not candidates:
+        return
+
+    # One query per 1000 sessions, and one for the events they already have.
+    sessions = {}
+    for chunk in _chunks({sid for _, sid, _ in candidates}):
+        for session in PaperSession.objects.select_related("coin").filter(pk__in=chunk):
+            sessions[session.pk] = session
+    existing = set()
+    for chunk in _chunks(sessions):
+        existing.update(
+            GridEvent.objects.filter(session_id__in=chunk).values_list("session_id", "time", "type")
+        )
+
+    events = []
+    for created_at, sid, (etype, reason, after) in candidates:
+        session = sessions.get(sid)
         if session is None:
             continue
-        etype, reason, after = converted
-        if GridEvent.objects.filter(session_id=session.pk, time=log.created_at, type=etype).exists():
+        key = (session.pk, created_at, etype)
+        if key in existing:
             continue
-        GridEvent.objects.create(
-            time=log.created_at,
+        existing.add(key)
+        events.append(GridEvent(
+            time=created_at,
             type=etype,
             environment="paper",
             symbol=session.coin.binance_symbol,
@@ -176,7 +256,8 @@ def _backfill_events(apps):
             strategy_version_id=session.strategy_version_id,
             config_version_id=session.config_version_id,
             backfilled=True,
-        )
+        ))
+    GridEvent.objects.bulk_create(events, batch_size=_CHUNK)
 
 
 def backfill(apps, schema_editor):
