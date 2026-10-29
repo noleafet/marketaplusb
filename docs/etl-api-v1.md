@@ -216,8 +216,8 @@ fraction, e.g. 0.01 is 1 percent). Completeness: detail `{"is_partial": status =
 list `{"active_ids": [...]}` for the current page only. Sessions are mutated in place, so use
 snapshots for history.
 
-**SessionSnapshot**: `session_id`, `time`, `trigger` (`start`, `rebalance`, `param_change`,
-`pause`, `resume`, `stop`, `daily`), `state` (the session state as it was at `time`, as a nested
+**SessionSnapshot**: `session_id`, `time`, `trigger` (`start`, `rebalance`, `pause`,
+`resume`, `stop`, `retire`, `daily`), `state` (the session state as it was at `time`, as a nested
 object), `strategy_version`, `config_version`, `backfilled`.
 
 **Equity point**: `time`, `equity`, `price`, `position_qty`, `drawdown`.
@@ -308,18 +308,29 @@ for id in $(jq -r '.id' backtests.ndjson); do
   auth "$API/backtests/$id/folds/" | jq -c '.data[]' >> folds.ndjson
 done
 
-# Fills across all sessions, paged on created_at. Keep the final watermark.
-auth "$API/fills/?page_size=1000" | tee page.json | jq -c '.data[]' >> fills.ndjson
-jq -r '.meta.watermark' page.json > fills.watermark     # after the last page
+# Fills across all sessions, paged on created_at: follow next_cursor to the end.
+base="$API/fills/?page_size=1000"
+url="$base"
+while [ -n "$url" ]; do
+  page=$(auth "$url")
+  echo "$page" | jq -c '.data[]' >> fills.ndjson
+  last=$(echo "$page" | jq -r '.meta.watermark // empty')
+  cursor=$(echo "$page" | jq -r '.meta.next_cursor // empty')
+  url=""
+  [ -n "$cursor" ] && url="$base&cursor=$cursor"
+done
+# Only the final page's watermark counts; skip the file if nothing came back.
+[ -n "$last" ] && echo "$last" > fills.watermark
 ```
 
-Repeat the fills call with `&cursor=...` until `next_cursor` is null; the watermark from the last
-page is your starting point for the incremental loop.
+The watermark from the last page is your starting point for the incremental loop. If no watermark
+file exists yet, the incremental loop simply does a full pull.
 
 ### 10.2 Incremental loop
 
 ```bash
-WM=$(cat fills.watermark 2>/dev/null)          # empty on the very first run
+WM=$(cat fills.watermark 2>/dev/null || true)  # missing file: empty, so a full pull
+[ "$WM" = "null" ] && WM=""                    # never send a literal "null"
 url="$API/fills/?page_size=1000${WM:+&updated_since=$WM}"
 while [ -n "$url" ]; do
   page=$(auth "$url")
@@ -351,7 +362,7 @@ auth "$API/strategy-versions/<after_version_id>/" | jq '.data | {parent_id, diff
 # 3. Compare fills before and after, split by strategy_version rather than by time alone.
 for v in <parent_id> <after_version_id>; do
   auth "$API/fills/?strategy_version=$v&page_size=1000" \
-    | jq --arg v "$v" '{version: $v, fills: (.data | length), realized_pnl: ([.data[].realized_pnl] | add)}'
+    | jq --arg v "$v" '{version: $v, fills: (.data | length), realized_pnl: ([.data[].realized_pnl] | add // 0)}'
 done
 
 # 4. Equity around the change for one session (the event's .session_id).

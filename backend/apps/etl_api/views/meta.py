@@ -171,10 +171,33 @@ _REQUIRED = {
 
 def _field_type(resource: str, field: str) -> str:
     if resource == "metrics":
-        return "number"
+        return "integer" if field in ("trades", "closed_lots", "rebalances") else "number"
     if field == "id" and resource in _INTEGER_ID:
         return "integer"
     return FIELD_TYPES.get(field, "string")
+
+
+# Fields guaranteed non-null; every other field may be null (see info.description).
+_NON_NULL = {
+    "id", "environment", "symbol", "time", "open_time", "close_time", "funding_time",
+    "created_at", "first_seen_at", "evaluated_at", "started_at", "updated_at", "as_of",
+    "type", "trigger", "status", "side", "order_type", "backfilled", "passed", "allowed",
+    "eligible", "open", "high", "low", "close", "volume", "quote_volume", "rate",
+    "equity", "analysis_id", "run_id", "code_sha", "state", "snapshot", "diff", "grid",
+    "market_candles", "funding_rates", "analysis_run", "paper_session_tick", "before",
+    "after", "metrics", "in_sample", "out_of_sample", "train_metrics", "test_metrics",
+    "reason",
+}
+# session_id is non-null everywhere except events.
+_NON_NULL_RESOURCE = {
+    ("snapshot", "session_id"), ("fill", "session_id"), ("evaluation", "session_id"),
+}
+
+
+def _nullable(resource: str, field: str) -> bool:
+    if resource == "metrics":
+        return True
+    return field not in _NON_NULL and (resource, field) not in _NON_NULL_RESOURCE
 
 
 def _ref(name: str) -> dict:
@@ -238,7 +261,13 @@ def build_schema() -> dict:
     schemas = {
         name: {
             "type": "object",
-            "properties": {f: {"type": _field_type(name, f)} for f in fields},
+            "properties": {
+                f: {
+                    "type": _field_type(name, f),
+                    **({"nullable": True} if _nullable(name, f) else {}),
+                }
+                for f in fields
+            },
         }
         for name, fields in RESOURCES.items()
     }
@@ -268,7 +297,10 @@ def build_schema() -> dict:
         "info": {
             "title": "Marketa+b ETL API",
             "version": "1",
-            "description": "Read-only ETL API. See docs/etl-api-v1.md.",
+            "description": (
+                "Read-only ETL API. See docs/etl-api-v1.md. Any field not marked otherwise "
+                "may be null; a metric the engine did not compute is null, never omitted."
+            ),
         },
         "servers": [{"url": "/api/v1"}],
         "security": [{"bearerAuth": []}],

@@ -328,6 +328,19 @@ class SchemaTests(ContractBase):
                     spec["type"], {"string", "number", "integer", "boolean", "object", "array"}
                 )
 
+    def test_nullability_and_metric_types(self):
+        schemas = self.schema()["components"]["schemas"]
+        self.assertIn("may be null", self.schema()["info"]["description"])
+        for f in METRICS:
+            self.assertTrue(schemas["metrics"]["properties"][f].get("nullable"), f)
+        for f in ("trades", "closed_lots", "rebalances"):
+            self.assertEqual(schemas["metrics"]["properties"][f]["type"], "integer")
+        self.assertTrue(schemas["features"]["properties"]["features"]["nullable"])
+        self.assertTrue(schemas["event"]["properties"]["session_id"]["nullable"])
+        self.assertTrue(schemas["strategy_version"]["properties"]["parent_id"]["nullable"])
+        self.assertNotIn("nullable", schemas["candle"]["properties"]["open_time"])
+        self.assertNotIn("nullable", schemas["fill"]["properties"]["session_id"])
+
     def test_every_route_has_a_registered_query_contract(self):
         by_path = {p: params for p, _, params in meta.ROUTES}
         self.assertEqual(
