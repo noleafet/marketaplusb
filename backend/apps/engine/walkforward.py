@@ -264,6 +264,7 @@ def _stitch_curves(
             max_dd = max(max_dd, dd)
             combined.append(
                 {
+                    "segment": "oos",
                     "t": point["t"],
                     "equity": round(equity, 4),
                     "price": point.get("price"),
@@ -273,12 +274,38 @@ def _stitch_curves(
                     "fold": fold["fold"],
                 }
             )
+        # A stopped fold is flat until its window ends; draw that explicitly
+        # so the gap is not mistaken for missing data or the next segment.
+        test_end = fold.get("test_end")
+        if (
+            result["metrics"].get("stopped")
+            and test_end
+            and combined
+            and combined[-1]["fold"] == fold["fold"]
+            and combined[-1]["t"] < test_end
+        ):
+            combined.append(
+                {
+                    **combined[-1],
+                    "t": test_end,
+                    "dd": round(1.0 - combined[-1]["equity"] / peak, 6) if peak > 0 else 0.0,
+                    "flat": True,
+                }
+            )
         fold_return = float(result["metrics"].get("net_return", 0.0))
         cumulative *= 1.0 + fold_return
 
     if len(combined) > max_points:
-        indices = np.linspace(0, len(combined) - 1, max_points).astype(int)
-        combined = [combined[i] for i in indices]
+        indices = set(np.linspace(0, len(combined) - 1, max_points).astype(int).tolist())
+        # Keep every fold's final point so stops and fold ends survive
+        # sampling, and the stop point in front of a flat extension, or the
+        # drop would be smeared across the flat stretch.
+        for index in range(len(combined)):
+            if index == len(combined) - 1 or combined[index + 1]["fold"] != combined[index]["fold"]:
+                indices.add(index)
+            if combined[index].get("flat") and index > 0:
+                indices.add(index - 1)
+        combined = [combined[i] for i in sorted(indices)]
     return combined, max_dd
 
 
@@ -437,7 +464,7 @@ def run_walk_forward(
 
         completed.append(
             (
-                {"fold": fold_no + 1},
+                {"fold": fold_no + 1, "test_end": test_end.isoformat()},
                 {
                     "metrics": test_result.metrics,
                     "equity_curve": test_result.equity_curve,
@@ -887,6 +914,46 @@ def run_walk_forward(
             strategy_returns.update(
                 daily_strategy_returns(holdout_result.daily_equity, config.capital, full_end)
             )
+            # Draw the holdout after the stitched folds, continuing from their
+            # final equity and tagged so the UI can set it apart. OOS metrics
+            # stay fold-only; the holdout keeps its own metrics below.
+            stitched_end = float(curve[-1]["equity"]) if curve else config.capital
+            holdout_curve = holdout_result.equity_curve or []
+            holdout_base = float(holdout_curve[0]["equity"]) if holdout_curve else 0.0
+            if holdout_base > 0:
+                chart["equity_curve"] = curve + [
+                    {
+                        "t": point["t"],
+                        "equity": round(stitched_end * float(point["equity"]) / holdout_base, 4),
+                        "price": point.get("price"),
+                        "low": point.get("low"),
+                        "high": point.get("high"),
+                        "dd": point.get("dd"),
+                        "segment": "holdout",
+                    }
+                    for point in holdout_curve
+                ]
+                if holdout_result.stopped and chart["equity_curve"][-1]["t"] < full_end.isoformat():
+                    # A stopped strategy sits flat until the data ends.
+                    chart["equity_curve"].append(
+                        {**chart["equity_curve"][-1], "t": full_end.isoformat(), "dd": None}
+                    )
+            chart["holdout"] = {
+                key: holdout_metrics.get(key)
+                for key in (
+                    "start",
+                    "end",
+                    "days",
+                    "net_return",
+                    "max_drawdown",
+                    "profit_factor",
+                    "trades",
+                    "alt_fill_model",
+                    "alt_fill_return",
+                    "stopped",
+                    "stop_reason",
+                )
+            }
     oos_metrics["holdout_return"] = holdout_metrics.get("net_return")
     oos_metrics["holdout_max_drawdown"] = holdout_metrics.get("max_drawdown")
     oos_metrics["holdout_days"] = holdout_metrics.get("days")
@@ -900,7 +967,9 @@ def run_walk_forward(
         chart=chart,
         trade_sample=trade_sample,
         data_start=data_start,
-        data_end=data_end,
+        # The true end of the data, holdout included; ``data_end`` above is
+        # only where the walk-forward folds stop.
+        data_end=full_end,
         diagnostics=diagnostics,
         holdout_metrics=holdout_metrics,
         strategy_returns=strategy_returns,

@@ -270,6 +270,21 @@ class WalkForwardHoldoutTests(SimpleTestCase):
         if gl > 0:
             self.assertAlmostEqual(result.oos_metrics["profit_factor"], round(gp / gl, 4), places=3)
         self.assertEqual(result.oos_metrics["alt_fill_model"], "touch")
+        # The reported data end includes the holdout, and the chart draws it
+        # after the folds as its own segment.
+        self.assertEqual(result.data_end, rows[-1]["time"])
+        segments = [point.get("segment") for point in result.chart["equity_curve"]]
+        self.assertIn("holdout", segments)
+        self.assertEqual(segments[-1], "holdout")
+        self.assertEqual(segments.index("holdout"), segments.count("oos"))
+        self.assertEqual(result.chart["holdout"]["start"], result.holdout_metrics["start"])
+        # Every stopped fold is drawn flat up to its test end.
+        for fold in result.folds:
+            if fold["test_metrics"].get("stopped"):
+                fold_points = [p for p in result.chart["equity_curve"] if p.get("fold") == fold["fold"]]
+                self.assertEqual(fold_points[-1]["t"], fold["test_end"])
+                # The stop itself is kept, so the flat stretch starts at the stop.
+                self.assertEqual(fold_points[-2]["equity"], fold_points[-1]["equity"])
         self.assertTrue(result.strategy_returns)
 
     def test_daily_strategy_returns_fill_flat_days_after_a_stop(self):

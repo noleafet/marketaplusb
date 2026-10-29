@@ -40,6 +40,23 @@ export interface EquityPoint {
   high?: number;
   dd?: number;
   fold?: number;
+  /** 'oos' for stitched walk-forward test windows, 'holdout' for the final window. */
+  segment?: 'oos' | 'holdout';
+}
+
+/** Untouched final window, simulated once with the deployed parameters. */
+export interface HoldoutSummary {
+  start?: string | null;
+  end?: string | null;
+  days?: number | null;
+  net_return?: number | null;
+  max_drawdown?: number | null;
+  profit_factor?: number | null;
+  trades?: number | null;
+  alt_fill_model?: string | null;
+  alt_fill_return?: number | null;
+  stopped?: boolean | null;
+  stop_reason?: string | null;
 }
 
 export interface ChartPayload {
@@ -47,6 +64,7 @@ export interface ChartPayload {
   grid_levels?: number[];
   folds?: Array<Record<string, unknown>>;
   recommended_params?: Record<string, unknown>;
+  holdout?: HoldoutSummary;
 }
 
 export interface Trade {
