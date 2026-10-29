@@ -433,6 +433,17 @@ class BackfillTests(TestCase):
         self.assertEqual(ev.session_id, self.session.id)
         self.assertEqual(ev.strategy_version_id, PaperSession.objects.get(pk=self.session.pk).strategy_version_id)
 
+    def test_backfill_ignores_grid_initialized_logs(self):
+        log_decision(
+            "paper", "BTC grid initialized with 12 levels (8 armed) over 90-110.",
+            payload={"session_id": str(self.session.id), "price": 100.0, "range_low": 90.0,
+                     "range_high": 110.0, "allow_buys": True, "reason": "initial",
+                     "active_levels": 8, "level_plan": [{"price": 95.0, "reason": "active"}],
+                     "locked": False},
+        )
+        run_backfill()
+        self.assertEqual(GridEvent.objects.count(), 0)
+
     def test_backfill_converts_pause_resume_and_skips_unknown_session(self):
         sid = {"session_id": str(self.session.id)}
         log_decision("paper", "BTC paper session paused.", payload=sid)

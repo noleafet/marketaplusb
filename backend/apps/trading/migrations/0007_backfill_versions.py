@@ -2,8 +2,19 @@
 
 from django.db import migrations
 
+# Intentional: digest is the identity contract shared with the live resolvers.
 from apps.engine.versioning import digest
-from apps.trading.events import _grid_spacing
+
+def _grid_spacing(levels):
+    """Mean fractional gap between adjacent levels (copy of the live helper)."""
+    if not levels or len(levels) < 2:
+        return None
+    ordered = sorted(levels)
+    if ordered[0] <= 0:
+        return None
+    gaps = [(b - a) / a for a, b in zip(ordered, ordered[1:])]
+    return sum(gaps) / len(gaps)
+
 
 _GRID_KEYS = ("range_low", "range_high", "levels")
 _PAUSED = "paper session paused."
@@ -111,7 +122,11 @@ def _backfill_analyses(apps):
 
 def _event_for(log, payload):
     """Return (type, reason, after) for a convertible log, else None."""
-    if all(k in payload for k in ("range_low", "range_high", "reason")):
+    # Retire logs are not backfilled: their payload carries no reason.
+    # Init logs share the rebalance payload shape, so match on the message.
+    if "grid rebalanced" in log.message and all(
+        k in payload for k in ("range_low", "range_high", "reason")
+    ):
         return "rebalance", str(payload["reason"])[:255], {
             "range_low": payload["range_low"],
             "range_high": payload["range_high"],
