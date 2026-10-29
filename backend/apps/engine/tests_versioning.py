@@ -1,5 +1,6 @@
 import os
 from datetime import datetime, timedelta, timezone as dt_timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from django.conf import settings
@@ -21,12 +22,15 @@ from apps.trading.execution import set_kill_switch
 from apps.trading.models import GridEvent, PaperSession, StrategySettings
 from apps.trading.paper import (
     ensure_paper_sessions,
+    retire_stale_sessions,
     pause_session,
     resume_session,
     stop_session,
     tick_paper_sessions,
 )
 from apps.trading.strategy import IncrementalGridStrategy
+from apps.jobs.handlers import handle_daily_analysis
+from apps.jobs.models import JobRun
 
 _NO_MATCH = MagicMock()
 _NO_MATCH.first.return_value = None
@@ -301,3 +305,63 @@ class CaptureTests(TestCase):
         self.assertEqual(ev.environment, "live")
         self.assertEqual(ev.type, "kill_switch")
         self.assertEqual(ev.after, {"engaged": True})
+
+    def test_retire_records_retire_event_snapshot_and_stamped_fills(self):
+        sv = resolve_strategy_version()
+        cv = resolve_config_version("BTCUSDT", {})
+        s = PaperSession.objects.create(
+            coin=self.coin, position_qty=2.0, avg_entry=100.0, mark_price=110.0,
+            capital=1000.0, equity=1000.0, peak_equity=1000.0, failed_runs=99,
+            strategy_version=sv, config_version=cv,
+        )
+        retired = retire_stale_sessions(
+            AnalysisRun.objects.create(), [], StrategySettings.load()
+        )
+        self.assertEqual(retired, ["BTC"])
+        ev = GridEvent.objects.get(type="retire")
+        self.assertIn("retired", ev.reason)
+        self.assertEqual(ev.session_id, s.id)
+        self.assertEqual(GridEvent.objects.filter(type="stop").count(), 0)
+        self.assertEqual(s.snapshots.filter(trigger="retire").count(), 1)
+        self.assertTrue(s.fills.exists())
+        for f in s.fills.all():
+            self.assertEqual(f.strategy_version_id, sv.id)
+            self.assertEqual(f.config_version_id, cv.id)
+
+    def _fake_analysis(self, hybrid_ok=True):
+        def fake(**kwargs):
+            normal = kwargs.get("trend_mode", AnalysisRun.Mode.NORMAL) == AnalysisRun.Mode.NORMAL
+            ok = normal or hybrid_ok
+            return SimpleNamespace(
+                id="run", Status=AnalysisRun.Status,
+                status=AnalysisRun.Status.SUCCEEDED if ok else AnalysisRun.Status.FAILED,
+                summary={}, duration_seconds=1.0, error="" if ok else "boom",
+            )
+        return fake
+
+    def _three_sessions(self):
+        for sym, status in (("AAA", "active"), ("BBB", "paused"), ("CCC", "stopped")):
+            coin = Coin.objects.create(coingecko_id=sym.lower(), symbol=sym, name=sym,
+                                       binance_symbol=sym + "USDT")
+            PaperSession.objects.create(coin=coin, status=status)
+
+    @patch("apps.jobs.handlers.run_daily_analysis")
+    def test_daily_job_snapshots_active_and_paused_only(self, run_daily):
+        from apps.trading.models import SessionSnapshot
+        self._three_sessions()
+        run_daily.side_effect = self._fake_analysis()
+        handle_daily_analysis({}, JobRun.objects.create(job_type="daily_analysis"))
+        snaps = SessionSnapshot.objects.filter(trigger="daily")
+        self.assertEqual(snaps.count(), 2)
+        self.assertEqual(
+            sorted(snaps.values_list("session__coin__symbol", flat=True)), ["AAA", "BBB"]
+        )
+
+    @patch("apps.jobs.handlers.run_daily_analysis")
+    def test_daily_job_hybrid_failure_writes_no_daily_snapshots(self, run_daily):
+        from apps.trading.models import SessionSnapshot
+        self._three_sessions()
+        run_daily.side_effect = self._fake_analysis(hybrid_ok=False)
+        with self.assertRaises(RuntimeError):
+            handle_daily_analysis({}, JobRun.objects.create(job_type="daily_analysis"))
+        self.assertEqual(SessionSnapshot.objects.filter(trigger="daily").count(), 0)
