@@ -15,10 +15,14 @@ const META_THEME_COLORS = {
   dark: '#09090b'
 };
 
+// An unset or malformed app URL (e.g. a redacted value from `vercel env pull`)
+// must not fail every build; metadata just falls back to relative URLs.
+const metadataBase = URL.canParse(process.env.NEXT_PUBLIC_APP_URL ?? '')
+  ? new URL(process.env.NEXT_PUBLIC_APP_URL as string)
+  : undefined;
+
 export const metadata: Metadata = {
-  ...(process.env.NEXT_PUBLIC_APP_URL
-    ? { metadataBase: new URL(process.env.NEXT_PUBLIC_APP_URL) }
-    : {}),
+  ...(metadataBase ? { metadataBase } : {}),
   title: {
     default: 'Marketa+b',
     template: '%s | Grid Suitability Engine'

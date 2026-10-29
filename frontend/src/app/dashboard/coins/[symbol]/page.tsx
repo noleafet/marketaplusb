@@ -121,7 +121,9 @@ export default function CoinDetailPage() {
       pageDescription={
         latest
           ? `Binance ${latest.coin.binance_symbol || 'perpetual'} · rank ${latest.coin.rank ?? '—'} · analyzed ${formatDate(latest.data_end)}`
-          : 'Loading the latest coin analysis.'
+          : history.isLoading
+            ? 'Loading the latest coin analysis.'
+            : 'Not analysed yet.'
       }
       pageHeaderAction={
         <Button

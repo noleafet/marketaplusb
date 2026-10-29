@@ -937,7 +937,7 @@ export const THRESHOLD_ROWS: Array<{
     format: 'multiplier',
     kind: 'gate'
   },
-  { key: 'max_correlation', label: 'Max peer correlation', format: 'number', kind: 'review' },
+  { key: 'max_correlation', label: 'Max strategy correlation', format: 'number', kind: 'review' },
   {
     key: 'max_top_trade_share',
     label: 'Max top-trade share',
@@ -960,7 +960,7 @@ export const PARAM_LABELS: Record<string, string> = {
   support_buffer_atr: 'Support buffer (ATR)',
   max_range_atr: 'Max range width (ATR)',
   trail_up_atr_multiple: 'Trail-up trigger (ATR)',
-  tp_activate_net_return: 'Trailing TP arm (net)',
+  tp_activate_net_return: 'Trailing TP arm (inventory gain)',
   tp_atr_multiple: 'Trailing TP distance (ATR)',
   range_position_days: 'Range-position window (days)',
   range_pos_high: 'Range-position high',

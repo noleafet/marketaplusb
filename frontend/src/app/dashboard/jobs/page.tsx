@@ -47,6 +47,11 @@ function RUN_LABEL(jobType: string): string {
   return jobType.replace(/_/g, ' ');
 }
 
+/** A schedule slot in the past means no scheduler process has claimed it. */
+function isOverdue(value: string | null | undefined): boolean {
+  return Boolean(value) && new Date(value as string).getTime() < Date.now();
+}
+
 export default function JobsPage() {
   const summary = useJobsSummary();
   const schedules = useSchedules();
@@ -182,7 +187,11 @@ export default function JobsPage() {
                     <div>
                       <div>Next run</div>
                       <div className='text-foreground font-medium'>
-                        {schedule.enabled ? relativeTime(schedule.next_run_at) : 'paused'}
+                        {!schedule.enabled
+                          ? 'paused'
+                          : isOverdue(schedule.next_run_at)
+                            ? `overdue · ${relativeTime(schedule.next_run_at)}`
+                            : relativeTime(schedule.next_run_at)}
                       </div>
                       <div>{formatDate(schedule.next_run_at)}</div>
                     </div>

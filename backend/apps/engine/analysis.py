@@ -275,7 +275,8 @@ def run_daily_analysis(
                 "cost_stress_multiplier": cfg["COST_STRESS_MULTIPLIER"],
                 "max_spread_bps": cfg["MAX_SPREAD_BPS"],
                 "min_depth_cover": cfg["MIN_DEPTH_COVER"],
-                "max_correlation": cfg["MAX_CORRELATION"],
+                "max_correlation": float(strategy_settings.max_strategy_correlation),
+                "max_price_correlation": cfg["MAX_CORRELATION"],
             },
         },
     )
@@ -635,7 +636,8 @@ def run_daily_analysis(
                 "cost_stress_multiplier": cfg["COST_STRESS_MULTIPLIER"],
                 "max_spread_bps": cfg["MAX_SPREAD_BPS"],
                 "min_depth_cover": cfg["MIN_DEPTH_COVER"],
-                "max_correlation": cfg["MAX_CORRELATION"],
+                "max_correlation": float(strategy_settings.max_strategy_correlation),
+                "max_price_correlation": cfg["MAX_CORRELATION"],
                 "max_top_trade_share": cfg["MAX_TOP_TRADE_SHARE"],
             },
         }
@@ -701,7 +703,8 @@ def run_daily_analysis(
         "cost_stress_multiplier": cfg["COST_STRESS_MULTIPLIER"],
         "max_spread_bps": cfg["MAX_SPREAD_BPS"],
         "min_depth_cover": cfg["MIN_DEPTH_COVER"],
-        "max_correlation": cfg["MAX_CORRELATION"],
+        "max_correlation": float(strategy_settings.max_strategy_correlation),
+        "max_price_correlation": cfg["MAX_CORRELATION"],
         "max_top_trade_share": cfg["MAX_TOP_TRADE_SHARE"],
     }
     # Solo runs must not displace the universe ranking/performance reports, and

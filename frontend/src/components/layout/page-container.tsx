@@ -57,15 +57,21 @@ export default function PageContainer({
   const hasHeader = pageTitle || pageHeaderAction;
 
   return (
-    <div className='flex flex-1 flex-col px-4 pt-2 pb-4 md:px-6 md:pt-4'>
+    // min-w-0 lets wide tables scroll inside their own container instead of
+    // stretching this flex child and the whole page horizontally.
+    <div className='flex min-w-0 flex-1 flex-col px-4 pt-2 pb-4 md:px-6 md:pt-4'>
       {hasHeader && (
-        <div className='mb-4 flex items-start justify-between gap-4'>
-          <Heading
-            title={pageTitle ?? ''}
-            description={pageDescription ?? ''}
-            infoContent={infoContent}
-          />
-          {pageHeaderAction && <div className='shrink-0'>{pageHeaderAction}</div>}
+        // Wraps on narrow screens: actions drop below the title and their own
+        // flex-wrap lays the buttons out instead of overflowing the page.
+        <div className='mb-4 flex flex-wrap items-start justify-between gap-4'>
+          <div className='min-w-0 flex-1 basis-72'>
+            <Heading
+              title={pageTitle ?? ''}
+              description={pageDescription ?? ''}
+              infoContent={infoContent}
+            />
+          </div>
+          {pageHeaderAction && <div className='max-w-full min-w-0'>{pageHeaderAction}</div>}
         </div>
       )}
       {content}

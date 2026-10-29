@@ -64,7 +64,7 @@ function GateList({ diagnostics }: { diagnostics: Diagnostics | null | undefined
             <ToneBadge tone={gate.passed ? 'good' : 'bad'}>
               {gate.passed ? 'pass' : 'fail'}
             </ToneBadge>
-            <span className='text-xs tabular-nums'>{formatGateValue(gate.value)}</span>
+            <span className='text-xs tabular-nums'>{formatGateValue(gate.value, gate.name)}</span>
           </span>
         </div>
       ))}

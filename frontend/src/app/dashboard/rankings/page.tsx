@@ -305,7 +305,7 @@ export default function RankingsPage() {
                           gate.passed ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600'
                         }`}
                       >
-                        {gate.passed ? 'pass' : 'fail'} · {formatGateValue(gate.value)}
+                        {gate.passed ? 'pass' : 'fail'} · {formatGateValue(gate.value, gate.name)}
                       </span>
                     </div>
                   ))}

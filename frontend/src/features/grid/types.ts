@@ -311,6 +311,8 @@ export interface Report {
 
 export interface PaperSession {
   id: string;
+  /** Detail endpoint only: configured hard drawdown stop (fraction). */
+  hard_stop_drawdown?: number;
   coin: Coin;
   analysis: string | null;
   status: 'active' | 'paused' | 'stopped';
