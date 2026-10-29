@@ -1,5 +1,6 @@
 from django.urls import path, re_path
 
+from .views.backtests import BacktestDetailView, BacktestFoldsView, BacktestListView
 from .views.base import NotFoundView
 from .views.market import CandlesView, FeaturesView, FundingView
 from .views.meta import HealthView
@@ -25,5 +26,8 @@ urlpatterns = [
     path("market/candles/", CandlesView.as_view(), name="etl-candles"),
     path("market/funding/", FundingView.as_view(), name="etl-funding"),
     path("market/features/", FeaturesView.as_view(), name="etl-features"),
+    path("backtests/", BacktestListView.as_view(), name="etl-backtests"),
+    path("backtests/<int:pk>/", BacktestDetailView.as_view(), name="etl-backtest"),
+    path("backtests/<int:pk>/folds/", BacktestFoldsView.as_view(), name="etl-backtest-folds"),
     re_path(r"^.*$", NotFoundView.as_view(), name="etl-not-found"),
 ]
