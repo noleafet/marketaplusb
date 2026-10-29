@@ -13,7 +13,7 @@ from apps.engine.robustness import _pair_correlation
 from apps.engine.timescale import load_daily_equity
 from apps.engine.validation import pooled_ic
 from apps.engine.scoring import FACTOR_WEIGHTS
-from apps.jobs.runner import enqueue_job
+from apps.jobs.runner import JobAlreadyActive, enqueue_job
 from apps.jobs.models import JobRun
 from apps.jobs.serializers import JobRunSerializer
 from apps.trading.models import PaperSession, StrategySettings
@@ -115,12 +115,16 @@ class StrategySettingsView(viewsets.ViewSet):
         serializer.save()
         payload = self._payload(row)
         if request.data.get("rerun_analysis") and payload["analysis_stale"]:
-            job = enqueue_job(
-                "daily_analysis",
-                trigger=JobRun.Trigger.MANUAL,
-                params={"interval": row.signal_interval},
-            )
-            payload["job"] = JobRunSerializer(job).data
+            try:
+                job = enqueue_job(
+                    "daily_analysis",
+                    trigger=JobRun.Trigger.MANUAL,
+                    params={"interval": row.signal_interval},
+                )
+                payload["job"] = JobRunSerializer(job).data
+            except JobAlreadyActive as exc:
+                # Settings are saved; only the re-run is refused.
+                payload["job_conflict"] = exc.message
         return Response(payload, status=status.HTTP_200_OK)
 
 

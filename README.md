@@ -113,6 +113,12 @@ with row locks, and stale running jobs are reaped after 60 minutes.
 | `paper-evaluate` | Every `PAPER_EVAL_INTERVAL_HOURS` (default 6) | Check promotion thresholds and hard stops |
 | `paper-risk` | Every `RISK_INTERVAL_SECONDS` (default 5 min) | Run the overbought guard and resume sessions whose recovery confirmed |
 
+Only one grid suitability analysis (`daily_analysis`) can be queued or running at a time. A
+partial unique index on the job table enforces it for every path (API, schedule, `runjob`), and the
+analysis itself holds a Postgres advisory lock so runs started outside the queue cannot overlap
+either. A refused API request returns HTTP 409 with the blocking job's id; a scheduled slot that
+finds one active is skipped and logged. Running analyses are only reaped as abandoned after 6 hours.
+
 All jobs can be triggered manually from the Jobs page or the API. Coin ingestion never deletes
 rows: coins that leave the top 100 are kept with `in_top100=False`.
 

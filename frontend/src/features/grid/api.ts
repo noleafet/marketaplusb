@@ -105,7 +105,8 @@ export const engineApi = {
     return request<Paginated<Coin>>(`coins/?${search.toString()}`);
   },
   addCoin: (body: { symbol: string; name?: string }) =>
-    post<{ coin: Coin; job: JobRun }>('coins/add/', body),
+    // ``job`` is null when an analysis is already running; ``detail`` says so.
+    post<{ coin: Coin; job: JobRun | null; detail?: string }>('coins/add/', body),
 
   reports: (kind?: string) =>
     request<Paginated<Report>>(`engine/reports/?limit=100${kind ? `&kind=${kind}` : ''}`),

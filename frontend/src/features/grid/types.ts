@@ -499,6 +499,8 @@ export interface StrategySettings extends StrategySettingsValues {
   latest_analysis?: { id: string | null; interval: string | null; started_at: string | null };
   analysis_stale?: boolean;
   job?: JobRun;
+  /** Set when a requested analysis re-run was refused because one is active. */
+  job_conflict?: string;
 }
 
 export interface InformationCoefficient {

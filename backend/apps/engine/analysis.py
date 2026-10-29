@@ -5,12 +5,13 @@ from __future__ import annotations
 import logging
 import os
 import time
+from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from datetime import datetime, timedelta, timezone as dt_timezone
 from typing import Any
 
 from django.conf import settings
-from django.db import transaction
+from django.db import connection, transaction
 from django.utils import timezone
 
 from apps.common.binance import INTERVAL_MS, BinanceFuturesClient
@@ -209,12 +210,63 @@ def _build_hybrid_gate(
     return gate if gate.allow else None
 
 
+# Arbitrary constant key for the Postgres advisory lock that serialises
+# analysis runs ("grid" in ASCII).
+ANALYSIS_LOCK_KEY = 0x67726964
+
+
+class AnalysisAlreadyRunning(RuntimeError):
+    pass
+
+
+@contextmanager
+def _analysis_lock():
+    """Hold a session advisory lock for the whole analysis run.
+
+    The job queue already allows one active ``daily_analysis`` job; this lock
+    also covers runs started outside the queue (a shell, a script, a job
+    whose row was reaped while its process lived on). It is released when the
+    run ends or, if the process dies, when its connection closes.
+    """
+
+    if connection.vendor != "postgresql":
+        yield
+        return
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_try_advisory_lock(%s)", [ANALYSIS_LOCK_KEY])
+        acquired = bool(cursor.fetchone()[0])
+    if not acquired:
+        raise AnalysisAlreadyRunning(
+            "Another grid suitability analysis is already running; this run was not started."
+        )
+    try:
+        yield
+    finally:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_unlock(%s)", [ANALYSIS_LOCK_KEY])
+
+
 def run_daily_analysis(
     *,
     trigger: str = "scheduled",
     params: dict[str, Any] | None = None,
     job_run_id=None,
     trend_mode: str = AnalysisRun.Mode.NORMAL,
+) -> AnalysisRun:
+    """Run one analysis; refuses to start while another one is running."""
+
+    with _analysis_lock():
+        return _run_daily_analysis(
+            trigger=trigger, params=params, job_run_id=job_run_id, trend_mode=trend_mode
+        )
+
+
+def _run_daily_analysis(
+    *,
+    trigger: str,
+    params: dict[str, Any] | None,
+    job_run_id,
+    trend_mode: str,
 ) -> AnalysisRun:
     if trend_mode not in AnalysisRun.Mode.values:
         raise ValueError(f"Unknown analysis mode: {trend_mode}")

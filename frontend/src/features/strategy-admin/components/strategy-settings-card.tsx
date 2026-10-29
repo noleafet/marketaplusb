@@ -320,7 +320,15 @@ function SettingsForm({
             {(mutation.error as Error).message}
           </ToneNote>
         ) : null}
-        {mutation.isSuccess ? (
+        {mutation.isSuccess && mutation.data?.job_conflict ? (
+          <ToneNote
+            tone='warn'
+            title='Settings saved, analysis not queued'
+            icon={<Icons.warning className='size-4' />}
+          >
+            {mutation.data.job_conflict}
+          </ToneNote>
+        ) : mutation.isSuccess ? (
           <ToneNote tone='good' title='Settings saved' icon={<Icons.check className='size-4' />}>
             {mutation.data?.job
               ? `Analysis queued on ${mutation.data.signal_interval} candles; paper sessions switch on their next tick.`
