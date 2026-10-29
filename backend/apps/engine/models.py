@@ -40,6 +40,9 @@ class AnalysisRun(models.Model):
     finished_at = models.DateTimeField(null=True, blank=True)
     data_cutoff = models.DateTimeField(null=True, blank=True)
     duration_seconds = models.FloatField(null=True, blank=True)
+    strategy_version = models.ForeignKey(
+        "engine.StrategyVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
 
     class Meta:
         ordering = ["-started_at"]
@@ -79,6 +82,9 @@ class CoinAnalysis(models.Model):
     diagnostics = models.JSONField(default=dict, blank=True)
     data_start = models.DateTimeField(null=True, blank=True)
     data_end = models.DateTimeField(null=True, blank=True)
+    config_version = models.ForeignKey(
+        "engine.ConfigVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
     created_at = models.DateTimeField(default=timezone.now)
 
     class Meta:

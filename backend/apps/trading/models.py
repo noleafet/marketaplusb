@@ -58,6 +58,12 @@ class PaperSession(models.Model):
     last_funding_at = models.DateTimeField(null=True, blank=True)
     last_evaluated_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
+    strategy_version = models.ForeignKey(
+        "engine.StrategyVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
+    config_version = models.ForeignKey(
+        "engine.ConfigVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
 
     class Meta:
         ordering = ["-started_at"]
@@ -83,12 +89,79 @@ class PaperFill(models.Model):
     level = models.IntegerField(null=True, blank=True)
     reason = models.CharField(max_length=32, default="grid")
     created_at = models.DateTimeField(default=timezone.now)
+    strategy_version = models.ForeignKey(
+        "engine.StrategyVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
+    config_version = models.ForeignKey(
+        "engine.ConfigVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
 
     class Meta:
         ordering = ["-time", "-id"]
+        indexes = [models.Index(fields=["time", "id"])]
 
     def __str__(self) -> str:
         return f"{self.session.coin.symbol} {self.side} {self.qty} @ {self.price}"
+
+
+class GridEvent(models.Model):
+    class Type(models.TextChoices):
+        REBALANCE = "rebalance", "Rebalance"
+        RECENTRE = "recentre", "Recentre"
+        PAUSE = "pause", "Pause"
+        RESUME = "resume", "Resume"
+        PARAM_CHANGE = "param_change", "Param change"
+        RETIRE = "retire", "Retire"
+        STOP = "stop", "Stop"
+        KILL_SWITCH = "kill_switch", "Kill switch"
+
+    time = models.DateTimeField(db_index=True)
+    type = models.CharField(max_length=16, choices=Type.choices)
+    environment = models.CharField(max_length=16, default="paper")
+    symbol = models.CharField(max_length=40, blank=True, default="")
+    session = models.ForeignKey(
+        PaperSession, on_delete=models.SET_NULL, null=True, blank=True, related_name="events"
+    )
+    reason = models.CharField(max_length=255, blank=True)
+    before = models.JSONField(default=dict)
+    after = models.JSONField(default=dict)
+    strategy_version = models.ForeignKey(
+        "engine.StrategyVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
+    config_version = models.ForeignKey(
+        "engine.ConfigVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
+    backfilled = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["time", "id"]
+        indexes = [
+            models.Index(fields=["time", "id"]),
+            models.Index(fields=["session", "time"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.type} {self.symbol} @ {self.time:%Y-%m-%d %H:%M}"
+
+
+class SessionSnapshot(models.Model):
+    session = models.ForeignKey(PaperSession, on_delete=models.CASCADE, related_name="snapshots")
+    time = models.DateTimeField()
+    trigger = models.CharField(max_length=16)
+    state = models.JSONField()
+    strategy_version = models.ForeignKey(
+        "engine.StrategyVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
+    config_version = models.ForeignKey(
+        "engine.ConfigVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
+    backfilled = models.BooleanField(default=False)
+
+    class Meta:
+        indexes = [models.Index(fields=["session", "time"])]
+
+    def __str__(self) -> str:
+        return f"{self.session_id} {self.trigger} @ {self.time:%Y-%m-%d %H:%M}"
 
 
 class PaperEvaluation(models.Model):

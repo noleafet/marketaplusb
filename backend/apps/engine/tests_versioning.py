@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 from django.db import IntegrityError
 from django.test import TestCase
 
+from apps.coins.models import Coin
 from apps.engine.models import ConfigVersion, StrategyVersion
 from apps.engine.versioning import (
     digest,
@@ -11,7 +12,8 @@ from apps.engine.versioning import (
     resolve_strategy_version,
     strategy_snapshot,
 )
-from apps.trading.models import StrategySettings
+from apps.trading.events import record_event, session_state, snapshot_session
+from apps.trading.models import GridEvent, PaperSession, StrategySettings
 
 _NO_MATCH = MagicMock()
 _NO_MATCH.first.return_value = None
@@ -106,3 +108,26 @@ class ConfigVersionTests(TestCase):
             v = resolve_config_version("BTCUSDT", p)
         self.assertEqual(v.id, vid)
         self.assertEqual(ConfigVersion.objects.count(), 1)
+
+
+class EventHelperTests(TestCase):
+    def setUp(self):
+        self.coin = Coin.objects.create(coingecko_id="btc", symbol="BTC", name="Bitcoin",
+                                        binance_symbol="BTCUSDT")
+        self.session = PaperSession.objects.create(coin=self.coin, position_qty=2,
+                                                   avg_entry=100, mark_price=110)
+
+    def test_session_state_unrealized_pnl(self):
+        self.assertEqual(session_state(self.session)["unrealized_pnl"], 20.0)
+
+    def test_record_event_defaults_symbol_and_versions_from_session(self):
+        sv = resolve_strategy_version()
+        self.session.strategy_version = sv
+        self.session.save()
+        ev = record_event(GridEvent.Type.PAUSE, session=self.session)
+        self.assertEqual(ev.symbol, "BTCUSDT")
+        self.assertEqual(ev.strategy_version_id, sv.id)
+
+    def test_snapshot_records_state(self):
+        snap = snapshot_session(self.session, "start")
+        self.assertEqual(snap.state["equity"], self.session.equity)
