@@ -78,9 +78,9 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
         rows: [
           {
             name: 'Candle interval',
-            value: '4h',
+            value: '1h / 4h',
             detail:
-              'Walk-forward simulation runs on completed 4-hour bars. Paper monitoring ticks every 5 minutes but acts on completed 1-hour candles (PAPER_SIGNAL_INTERVAL).'
+              'One admin switch sets the interval for both the walk-forward backtest and paper trading (default 1h), so both run the same strategy. ATR is converted to 4h-equivalent units (× √(bars per day ÷ 6), measured 4h/1h ratio 2.05), so every ATR multiple means the same distance on either interval. Paper ticks every 5 minutes but only acts on completed candles.'
           },
           {
             name: 'Analysis lookback',
@@ -178,7 +178,11 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
             '10%',
             'ADV 22% · cost-to-edge 18% · spread 14% · depth 16% · funding 10% · stressed return 20%'
           ],
-          ['Diversification', '5%', 'Average correlation to other eligible coins']
+          [
+            'Diversification',
+            '5%',
+            "Average correlation of the strategy's daily returns to other eligible strategies"
+          ]
         ]
       },
       {
@@ -197,20 +201,17 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           {
             name: 'Trending test',
             value: 'ADX ≥ 25',
-            detail:
-              'Also trending when trend R² ≥ 0.65 and absolute annualised slope ≥ 50%.'
+            detail: 'Also trending when trend R² ≥ 0.65 and absolute annualised slope ≥ 50%.'
           },
           {
             name: 'High volatility',
             value: '≥ 120% annual',
-            detail:
-              'Annualised standard deviation of log returns inside the test window.'
+            detail: 'Annualised standard deviation of log returns inside the test window.'
           },
           {
             name: 'Ranging test',
             value: '≥ 55% contained',
-            detail:
-              'Range containment at least 55% with ADX below 20.'
+            detail: 'Range containment at least 55% with ADX below 20.'
           },
           {
             name: 'Robustness score',
@@ -326,8 +327,7 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
             name: 'Recovery days',
             value: 'flag > 30d',
             tone: 'warn',
-            detail:
-              'Days from the worst drawdown trough back to the prior equity peak.'
+            detail: 'Days from the worst drawdown trough back to the prior equity peak.'
           },
           {
             name: 'Drawdown duration',
@@ -343,13 +343,21 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
       {
         kind: 'list',
         title: 'Correlation & diversification',
-        description: 'Correlations use aligned daily closes and only gate-eligible coins.',
+        description:
+          "Correlations use the grid strategies' own daily returns (walk-forward and holdout days), not coin prices, and only gate-eligible coins.",
         rows: [
           {
-            name: 'Correlation window',
-            value: '60 days',
+            name: 'Correlation basis',
+            value: 'strategy returns',
+            tone: 'info',
             detail:
-              'Rolling daily returns aligned on common dates (ENGINE_CORR_LOOKBACK_DAYS); at least 10 overlapping days are required.'
+              "Every long-only grid is partly long the market, so strategy returns are what the book really holds. Price correlation and each strategy's beta to BTC are reported alongside."
+          },
+          {
+            name: 'Correlation window',
+            value: '≥ 90 days',
+            detail:
+              'Daily strategy returns aligned on common dates; days after a stop-out count as flat. At least 10 overlapping days are required.'
           },
           {
             name: 'Peer set',
@@ -359,17 +367,17 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           },
           {
             name: 'Correlation ceiling',
-            value: '0.85',
+            value: '0.70',
             tone: 'warn',
             detail:
-              'Peak pairwise correlation above ENGINE_MAX_CORRELATION raises a flag and removes 2–14 score points.'
+              'Peak strategy correlation above the admin limit raises a flag and removes 2–14 score points.'
           },
           {
             name: 'Paper selection',
             value: 'greedy',
             tone: 'info',
             detail:
-              'Top paper candidates are selected in rank order and skipped when their peak correlation with an already selected coin exceeds the same limit.'
+              'Candidates are taken in rank order and skipped when their strategy returns correlate above the limit with a coin already selected or already open in the paper book.'
           }
         ]
       },
@@ -511,7 +519,7 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
             name: 'Trailing take-profit',
             value: '1.5 / 3.0 ATR',
             detail:
-              'Armed once net profit clears 2%. Inventory is closed when price retraces the selected ATR distance from the peak. Selection happens on train windows only.'
+              'Armed once the open inventory itself is 2% above its average entry (not account equity, which would leave it armed permanently after early gains). Inventory is closed when price retraces the selected ATR distance from the peak, using the ATR known before the bar.'
           },
           {
             name: 'Range-position gate',
@@ -529,15 +537,21 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           },
           {
             name: 'Overbought guard',
-            value: 'RSI 75 / 35',
+            value: 'off by default',
             tone: 'warn',
             detail:
-              'RSI ≥ 75 with fading MACD or a 5% open-interest drop arms a pause. RSI ≤ 35 clears it. Uses a 6% trailing stop, 24-hour arm timeout, and 30-minute recovery cooldown.'
+              'RSI ≥ 75 with fading MACD or a 5% open-interest drop arms a pause; RSI ≤ 35 clears it. It has no backtest yet, so it stays off until one shows it adds value (admin switch).'
+          },
+          {
+            name: 'Support breakdown gate',
+            tone: 'info',
+            detail:
+              "Buys pause when the last close falls below the 30-day support measured before that bar. Support previously included the bar's own low, so the gate could never fire."
           },
           {
             name: 'Regime gate',
             detail:
-              'Paper execution evaluates regime signals on completed 1-hour candles before any fill; the backtest applies the same overlays inside each bar.'
+              "Gates are computed from completed candles before any fill, identically in the backtest and in paper trading. When a gate clears, the buy side is re-armed at that bar's close instead of waiting for the next rebalance."
           }
         ]
       },
@@ -549,7 +563,8 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           {
             name: 'Fixed cadence',
             value: '7 / 14d',
-            detail: 'Rebuild the ladder on a fixed schedule. This is the default base configuration.'
+            detail:
+              'Rebuild the ladder on a fixed schedule. This is the default base configuration.'
           },
           {
             name: 'Adaptive cadence',
@@ -592,8 +607,7 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
             name: 'Per-position stop',
             value: '30%',
             tone: 'warn',
-            detail:
-              'Capital stop in addition to the ATR structural stop (ENGINE_STOP_LOSS_PCT).'
+            detail: 'Capital stop in addition to the ATR structural stop (ENGINE_STOP_LOSS_PCT).'
           },
           {
             name: 'Portfolio drawdown stop',
@@ -608,10 +622,22 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
               'Each paper session is isolated margin with its own capital. Liquidation is simulated with a 0.5% maintenance margin rate.'
           },
           {
-            name: 'Kill switch',
+            name: 'Book limits',
+            value: 'admin settings',
             tone: 'info',
             detail:
-              'A global live-trading disable that overrides approvals and scheduled jobs.'
+              'Book capital split across max sessions, an exposure cap on total open notional, and a 3% daily loss limit that halts new buys until the next UTC day. Limits never block stops or exits.'
+          },
+          {
+            name: 'Retirement',
+            value: '2 runs',
+            detail:
+              'A session is closed once its coin fails to qualify (eligible and prime/viable) for the configured number of consecutive analyses.'
+          },
+          {
+            name: 'Kill switch',
+            tone: 'info',
+            detail: 'A global live-trading disable that overrides approvals and scheduled jobs.'
           }
         ]
       },
@@ -623,7 +649,8 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
         fullWidth: true,
         columns: ['Assumption', 'Default', 'Configuration'],
         rows: [
-          ['Capital per session', '$1,000', 'ENGINE_PAPER_CAPITAL'],
+          ['Capital per session', '$1,000', 'Book capital ÷ max sessions (admin)'],
+          ['Fill model', 'Trade-through 2 bps', 'Admin setting; touch reported alongside'],
           ['Leverage', '2×', 'ENGINE_LEVERAGE'],
           ['Maker fee', '0.02%', 'ENGINE_MAKER_FEE_RATE'],
           ['Taker fee', '0.05%', 'ENGINE_TAKER_FEE_RATE'],
@@ -641,8 +668,16 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
         fullWidth: true,
         columns: ['Metric', 'Meaning', 'Flag / use'],
         rows: [
-          ['max_exposure_ratio', 'Peak base-asset notional as a multiple of equity', 'Flag above 1.5×'],
-          ['avg_exposure_ratio', 'Average deployed notional over test bars', 'Context for capital use'],
+          [
+            'max_exposure_ratio',
+            'Peak base-asset notional as a multiple of equity',
+            'Flag above 1.5×'
+          ],
+          [
+            'avg_exposure_ratio',
+            'Average deployed notional over test bars',
+            'Context for capital use'
+          ],
           [
             'max_unrealized_loss_pct',
             'Worst mark-to-market loss as a share of equity',
@@ -654,7 +689,11 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
             'Flag below 50% with enough fills'
           ],
           ['top_trade_share', 'Gross profit from the best trade', 'Flag above 60%'],
-          ['time_in_range', 'Share of bars with live price inside the ladder', 'Regime factor input'],
+          [
+            'time_in_range',
+            'Share of bars with live price inside the ladder',
+            'Regime factor input'
+          ],
           ['slippage_paid', 'Total slippage charged across test fills', 'Execution-cost audit'],
           ['funding_paid', 'Total funding charged on long inventory', 'Carry-cost audit'],
           ['recovery_days', 'Worst drawdown recovery time', 'Flag above 30 days'],
@@ -690,8 +729,19 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           ['Test window', 'Untouched out-of-sample evaluation', '18% of history, min 30 days'],
           ['Step', 'Advance by one test window', 'Equal to test length'],
           ['Selection', 'Best training objective per fold', '96 candidate ladders'],
-          ['Aggregation', 'Compound test returns; stitch equity curves', 'Fees, funding, slippage included'],
-          ['Look-ahead', 'No test bar is visible during selection', 'Enforced by window slicing']
+          ['Deployed parameters', "Most recent fold's selection", 'Previously the oldest on ties'],
+          [
+            'Aggregation',
+            'Compound test returns; stitch equity curves',
+            'Fees, funding, slippage included'
+          ],
+          [
+            'Final holdout',
+            'Newest window, never used for selection or ranking',
+            '90 days (admin)'
+          ],
+          ['Look-ahead', 'No test bar is visible during selection', 'Enforced by window slicing'],
+          ['Parity', 'Paper replays the same candles fill for fill', 'Enforced by tests']
         ]
       },
       {
@@ -815,8 +865,7 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           {
             name: 'Risk trailing stop',
             value: '6%',
-            detail:
-              'Independent of the grid ATR stop; checked on the 5-minute risk cadence.'
+            detail: 'Independent of the grid ATR stop; checked on the 5-minute risk cadence.'
           }
         ]
       },
@@ -827,10 +876,21 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
         fullWidth: true,
         columns: ['Metric', 'Definition'],
         rows: [
-          ['Net return', 'Compounded return across untouched test folds after fees, funding, and slippage'],
+          [
+            'Net return',
+            'Compounded return across untouched test folds after fees, funding, and slippage'
+          ],
           ['Annualised return', 'Net return scaled to a yearly rate over the combined test span'],
           ['Max drawdown', 'Largest peak-to-trough decline of the stitched equity curve'],
-          ['Profit factor', 'Mean fold gross profit divided by gross loss'],
+          [
+            'Profit factor',
+            'Gross profit ÷ gross loss across all test trades, each trade net of its sell fee plus the buy fees and funding its inventory carried'
+          ],
+          [
+            'Holdout return',
+            'Deployed parameters on the untouched final window; reported, never ranked'
+          ],
+          ['Score IC', 'Rank correlation between score and holdout return across coins'],
           ['Win rate', 'Mean share of closed lots with positive realised P&L'],
           ['Fold consistency', 'Share of test folds with positive net return'],
           ['Calmar', 'Annualised return divided by max drawdown'],
@@ -840,7 +900,10 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
           ['Parameter stability', 'Share of folds selecting the same full configuration'],
           ['Cost-stress delta', 'Stressed combined return minus base combined return'],
           ['Parameter sensitivity', 'Mean neighbour-return degradation versus the selected ladder'],
-          ['Regime robustness', 'Coverage and profitability across trending, high-volatility, and ranging folds']
+          [
+            'Regime robustness',
+            'Coverage and profitability across trending, high-volatility, and ranging folds'
+          ]
         ]
       }
     ]
@@ -874,7 +937,7 @@ export const THRESHOLD_ROWS: Array<{
     format: 'multiplier',
     kind: 'gate'
   },
-  { key: 'max_correlation', label: 'Max peer correlation', format: 'number', kind: 'review' },
+  { key: 'max_correlation', label: 'Max strategy correlation', format: 'number', kind: 'review' },
   {
     key: 'max_top_trade_share',
     label: 'Max top-trade share',
@@ -897,7 +960,7 @@ export const PARAM_LABELS: Record<string, string> = {
   support_buffer_atr: 'Support buffer (ATR)',
   max_range_atr: 'Max range width (ATR)',
   trail_up_atr_multiple: 'Trail-up trigger (ATR)',
-  tp_activate_net_return: 'Trailing TP arm (net)',
+  tp_activate_net_return: 'Trailing TP arm (inventory gain)',
   tp_atr_multiple: 'Trailing TP distance (ATR)',
   range_position_days: 'Range-position window (days)',
   range_pos_high: 'Range-position high',

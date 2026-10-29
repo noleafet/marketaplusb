@@ -8,7 +8,7 @@ from apps.coins.services.ingest import ensure_manual_coin
 from apps.coins.services.timescale import market_snapshots
 from apps.engine.models import log_decision
 from apps.jobs.models import JobRun
-from apps.jobs.runner import enqueue_job
+from apps.jobs.runner import JobAlreadyActive, enqueue_job
 from apps.jobs.serializers import JobRunSerializer
 
 
@@ -52,11 +52,32 @@ class CoinViewSet(viewsets.ReadOnlyModelViewSet):
         except ValueError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-        job = enqueue_job(
-            "daily_analysis",
-            trigger=JobRun.Trigger.MANUAL,
-            params={"symbols": [coin.symbol]},
-        )
+        try:
+            job = enqueue_job(
+                "daily_analysis",
+                trigger=JobRun.Trigger.MANUAL,
+                params={"symbols": [coin.symbol]},
+            )
+        except JobAlreadyActive as exc:
+            # The coin is stored either way; only its solo analysis waits.
+            log_decision(
+                "coins",
+                f"{coin.symbol} added manually; solo analysis not queued: {exc.message}",
+                severity="warning",
+                coin=coin,
+                job_run_id=exc.active.id,
+                payload={"symbol": coin.symbol, "active_job_id": str(exc.active.id)},
+            )
+            return Response(
+                {
+                    "coin": CoinSerializer(coin).data,
+                    "job": None,
+                    "detail": f"{coin.symbol} was added. {exc.message} "
+                    "Then run its analysis from the coin page or the job console.",
+                    "active_job_id": str(exc.active.id),
+                },
+                status=status.HTTP_202_ACCEPTED,
+            )
         log_decision(
             "coins",
             f"{coin.symbol} added manually; solo analysis queued.",

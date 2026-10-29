@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-from apps.engine.grid import BARS_PER_DAY, GridParams, SimulationConfig
+from apps.engine.grid import BARS_PER_DAY, GridParams, SimulationConfig, atr_scale
 
 
 def _clean(value: float | None, digits: int = 6) -> float | None:
@@ -173,7 +173,8 @@ def compute_features(
     downside_vol = (
         float(np.std(downside, ddof=1) * math.sqrt(ppy)) if downside.size > 2 else None
     )
-    atr_value = atr(h, low, c, 14 * bpd)
+    # 4h-equivalent, so the ATR% gate means the same thing on every interval.
+    atr_value = atr(h, low, c, 14 * bpd) * atr_scale(bpd)
     atr_pct = atr_value / price if price > 0 else None
 
     daily_windows = max(1, min(60, n // bpd))

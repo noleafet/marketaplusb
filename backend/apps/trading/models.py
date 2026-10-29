@@ -43,6 +43,10 @@ class PaperSession(models.Model):
     realized_pnl = models.FloatField(default=0.0)
     fees_paid = models.FloatField(default=0.0)
     funding_paid = models.FloatField(default=0.0)
+    # Buy fees and funding still carried by open inventory (see the adapter).
+    carry_cost = models.FloatField(default=0.0)
+    # Consecutive universe analyses in which the coin no longer qualified.
+    failed_runs = models.PositiveSmallIntegerField(default=0)
 
     fill_count = models.PositiveIntegerField(default=0)
     closed_lots = models.PositiveIntegerField(default=0)
@@ -54,6 +58,12 @@ class PaperSession(models.Model):
     last_funding_at = models.DateTimeField(null=True, blank=True)
     last_evaluated_at = models.DateTimeField(null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
+    strategy_version = models.ForeignKey(
+        "engine.StrategyVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
+    config_version = models.ForeignKey(
+        "engine.ConfigVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
 
     class Meta:
         ordering = ["-started_at"]
@@ -79,12 +89,83 @@ class PaperFill(models.Model):
     level = models.IntegerField(null=True, blank=True)
     reason = models.CharField(max_length=32, default="grid")
     created_at = models.DateTimeField(default=timezone.now)
+    strategy_version = models.ForeignKey(
+        "engine.StrategyVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
+    config_version = models.ForeignKey(
+        "engine.ConfigVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
 
     class Meta:
         ordering = ["-time", "-id"]
+        # (created_at, id) is the v1 fills paging key.
+        indexes = [
+            models.Index(fields=["time", "id"]),
+            models.Index(fields=["created_at", "id"]),
+        ]
 
     def __str__(self) -> str:
         return f"{self.session.coin.symbol} {self.side} {self.qty} @ {self.price}"
+
+
+class GridEvent(models.Model):
+    class Type(models.TextChoices):
+        REBALANCE = "rebalance", "Rebalance"
+        RECENTRE = "recentre", "Recentre"
+        PAUSE = "pause", "Pause"
+        RESUME = "resume", "Resume"
+        PARAM_CHANGE = "param_change", "Param change"
+        RETIRE = "retire", "Retire"
+        STOP = "stop", "Stop"
+        KILL_SWITCH = "kill_switch", "Kill switch"
+
+    time = models.DateTimeField(db_index=True)
+    type = models.CharField(max_length=16, choices=Type.choices)
+    environment = models.CharField(max_length=16, default="paper")
+    symbol = models.CharField(max_length=40, blank=True, default="")
+    session = models.ForeignKey(
+        PaperSession, on_delete=models.SET_NULL, null=True, blank=True, related_name="events"
+    )
+    reason = models.CharField(max_length=255, blank=True)
+    before = models.JSONField(default=dict)
+    after = models.JSONField(default=dict)
+    strategy_version = models.ForeignKey(
+        "engine.StrategyVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
+    config_version = models.ForeignKey(
+        "engine.ConfigVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
+    backfilled = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["time", "id"]
+        indexes = [
+            models.Index(fields=["time", "id"]),
+            models.Index(fields=["session", "time"]),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.type} {self.symbol} @ {self.time:%Y-%m-%d %H:%M}"
+
+
+class SessionSnapshot(models.Model):
+    session = models.ForeignKey(PaperSession, on_delete=models.CASCADE, related_name="snapshots")
+    time = models.DateTimeField()
+    trigger = models.CharField(max_length=16)
+    state = models.JSONField()
+    strategy_version = models.ForeignKey(
+        "engine.StrategyVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
+    config_version = models.ForeignKey(
+        "engine.ConfigVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
+    backfilled = models.BooleanField(default=False)
+
+    class Meta:
+        indexes = [models.Index(fields=["session", "time"])]
+
+    def __str__(self) -> str:
+        return f"{self.session_id} {self.trigger} @ {self.time:%Y-%m-%d %H:%M}"
 
 
 class PaperEvaluation(models.Model):
@@ -174,3 +255,64 @@ class LiveOrderAudit(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+
+
+class StrategySettings(models.Model):
+    """Operator-tunable strategy and portfolio settings (singleton).
+
+    The signal interval and fill model are shared by the daily backtest and
+    paper trading so both measure the same strategy. Portfolio limits apply to
+    the whole paper book rather than to a single session.
+    """
+
+    class Interval(models.TextChoices):
+        ONE_HOUR = "1h", "1 hour"
+        FOUR_HOURS = "4h", "4 hours"
+
+    class FillModel(models.TextChoices):
+        TRADE_THROUGH = "trade_through", "Trade-through"
+        TOUCH = "touch", "Touch"
+
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
+    signal_interval = models.CharField(
+        max_length=4, choices=Interval.choices, default=Interval.ONE_HOUR
+    )
+    fill_model = models.CharField(
+        max_length=16, choices=FillModel.choices, default=FillModel.TRADE_THROUGH
+    )
+    trade_through_bps = models.FloatField(default=2.0)
+    # The overbought guard has no backtest yet, so it stays off until one
+    # shows it adds value.
+    overbought_guard_enabled = models.BooleanField(default=False)
+    holdout_days = models.PositiveSmallIntegerField(default=90)
+
+    book_capital = models.FloatField(default=8000.0)
+    max_sessions = models.PositiveSmallIntegerField(default=8)
+    max_book_exposure = models.FloatField(default=1.0)
+    daily_loss_limit_pct = models.FloatField(default=0.03)
+    retire_after_failed_runs = models.PositiveSmallIntegerField(default=2)
+    max_strategy_correlation = models.FloatField(default=0.7)
+
+    book_state = models.JSONField(default=dict, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Strategy settings"
+
+    def __str__(self) -> str:
+        return f"Strategy settings ({self.signal_interval}, {self.fill_model})"
+
+    @classmethod
+    def load(cls) -> "StrategySettings":
+        settings_row, _ = cls.objects.get_or_create(id=1)
+        return settings_row
+
+    @property
+    def session_capital(self) -> float:
+        return self.book_capital / max(1, self.max_sessions)
+
+    @property
+    def effective_trade_through_bps(self) -> float:
+        if self.fill_model == self.FillModel.TOUCH:
+            return 0.0
+        return max(0.0, self.trade_through_bps)

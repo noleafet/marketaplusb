@@ -8,7 +8,7 @@ import type { Metadata } from 'next';
 import { cookies } from 'next/headers';
 
 export const metadata: Metadata = {
-  title: 'Grid Suitability Engine',
+  title: 'Dashboard',
   description: 'Grid trading coin selection, paper trading, and risk monitoring',
   robots: {
     index: false,

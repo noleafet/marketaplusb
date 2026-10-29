@@ -16,17 +16,22 @@ import {
 
 // Default/fallback data when no content is set
 const defaultData = {
-  title: 'Documentation',
+  title: 'Help',
   sections: [
     {
-      title: 'Getting Started',
-      description: 'Learn how to get started with this application.',
+      title: 'Daily workflow',
+      description:
+        'The daily analysis ranks coins and opens paper sessions for the ones that qualify. Jobs only run while the worker process is up.',
       links: [
-        {
-          title: 'Installation Guide',
-          url: '#'
-        }
+        { title: 'Coin rankings', url: '/dashboard/rankings' },
+        { title: 'Paper sessions', url: '/dashboard/paper' },
+        { title: 'Job console', url: '/dashboard/jobs' }
       ]
+    },
+    {
+      title: 'Strategy reference',
+      description: 'Settings, validation results, and how every gate, factor, and overlay works.',
+      links: [{ title: 'Strategies & metrics', url: '/admin/strategies' }]
     }
   ]
 };

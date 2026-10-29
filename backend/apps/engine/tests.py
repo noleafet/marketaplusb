@@ -240,9 +240,13 @@ class AdaptiveGridTests(TestCase):
         self.assertLess(tight.metrics["bars"], wide.metrics["bars"])
 
     def test_trailing_take_profit_is_tuned_by_atr_multiple(self):
-        rise = list(self.warmup[-1] * np.cumprod([1.0025] * 10))
+        # A wide range keeps part of the opening inventory unsold at the peak.
+        # The take-profit arms on that inventory's own profit, not on account
+        # equity, so it protects gains without firing on inventory under water.
+        warmup = [100.0 + 4.0 * math.sin(i / 9.0) for i in range(360)]
+        rise = list(warmup[-1] * np.cumprod([1.0025] * 10))
         fall = list(rise[-1] * np.cumprod([0.98] * 4))
-        rows = path_rows(self.warmup + rise + fall)
+        rows = path_rows(warmup + rise + fall)
         common = dict(
             grid_levels=10,
             range_lookback_days=14,
@@ -432,9 +436,10 @@ class RiskLimitTests(TestCase):
         result = simulate_grid(rows, [], start, params, self.config)
 
         self.assertEqual(result.error, "")
+        # The cap is a multiple of current equity (which grows with profits);
+        # slippage and fees land on top of the sized notional, so allow 0.1%.
         self.assertLessEqual(
-            result.metrics["max_position_notional"],
-            self.config.capital * params.max_inventory_pct + 1e-6,
+            result.metrics["max_exposure_ratio"], params.max_inventory_pct * 1.001
         )
 
     def test_leverage_liquidation_fires_before_the_equity_stop(self):

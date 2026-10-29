@@ -447,6 +447,7 @@ def score_results(
     min_data_days: int = 120,
     corr_lookback_days: int = 60,
     correlation_out: dict[str, Any] | None = None,
+    correlation_returns_key: str = "_daily_returns",
 ) -> list[dict[str, Any]]:
     """Assign hard gates, component scores, flags, and ranks.
 
@@ -477,7 +478,10 @@ def score_results(
     # Correlation is measured only across coins that passed the hard gates,
     # then feeds the diversification factor below.
     correlation_info = correlation_diagnostics(
-        results, lookback_days=corr_lookback_days, max_corr=max_correlation
+        results,
+        lookback_days=corr_lookback_days,
+        max_corr=max_correlation,
+        returns_key=correlation_returns_key,
     )
     if correlation_out is not None:
         correlation_out.update(correlation_info)
@@ -623,6 +627,25 @@ def score_results(
                 "warning",
                 "Daily returns are highly correlated with other eligible coins "
                 f"(peak {correlation.get('max_correlation'):.2f}).",
+            )
+        holdout_return = _numeric(oos.get("holdout_return"))
+        if holdout_return is not None and holdout_return < 0:
+            # Informational only: the holdout must never feed the ranking, or
+            # it stops being a holdout.
+            flag(
+                "holdout_negative",
+                "info",
+                f"Lost {abs(holdout_return):.2%} on the untouched "
+                f"{oos.get('holdout_days') or 0:.0f}-day holdout with the deployed parameters.",
+            )
+        fill_delta = _numeric(oos.get("fill_model_delta"))
+        alt_model = oos.get("alt_fill_model")
+        net_oos = _numeric(oos.get("net_return")) or 0.0
+        if alt_model == "touch" and fill_delta is not None and net_oos <= 0 < net_oos + fill_delta:
+            flag(
+                "fill_dependent",
+                "warning",
+                "Profitable only when grid orders fill on a touch; trade-through fills lose money.",
             )
         recovery = _numeric(oos.get("recovery_days"))
         if recovery is not None and recovery > 30:

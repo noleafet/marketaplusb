@@ -159,7 +159,14 @@ export default function PaperSessionDetailPage() {
             <Icons.chevronLeft />
             Paper book
           </Button>
-          <Button variant='outline' size='sm' disabled={pending} onClick={() => run('tick')}>
+          {/* The tick job only advances active sessions. */}
+          <Button
+            variant='outline'
+            size='sm'
+            disabled={pending || data.status !== 'active'}
+            title={data.status !== 'active' ? 'Only active sessions can be ticked' : undefined}
+            onClick={() => run('tick')}
+          >
             <Icons.activity />
             Tick now
           </Button>
@@ -229,7 +236,11 @@ export default function PaperSessionDetailPage() {
           <MetricCard
             title='Max drawdown'
             value={formatPercent(data.max_drawdown)}
-            hint={`Hard stop at 25% · leverage ${data.leverage.toFixed(1)}x`}
+            hint={`Hard stop at ${
+              data.hard_stop_drawdown !== undefined
+                ? formatPercent(data.hard_stop_drawdown, 0)
+                : '—'
+            } · leverage ${data.leverage.toFixed(1)}x`}
             icon={<Icons.trendingDown />}
           />
           <MetricCard

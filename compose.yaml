@@ -18,7 +18,10 @@ services:
     restart: unless-stopped
 
   api:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        GIT_SHA: "${GIT_SHA:-unknown}"
     container_name: grid-engine-api
     command: >
       sh -c "python manage.py migrate --noinput &&
@@ -39,7 +42,10 @@ services:
     restart: unless-stopped
 
   worker:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        GIT_SHA: "${GIT_SHA:-unknown}"
     container_name: grid-engine-worker
     command: python manage.py runworker
     env_file:
@@ -54,7 +60,10 @@ services:
     restart: unless-stopped
 
   scheduler:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        GIT_SHA: "${GIT_SHA:-unknown}"
     container_name: grid-engine-scheduler
     command: python manage.py runscheduler
     env_file:

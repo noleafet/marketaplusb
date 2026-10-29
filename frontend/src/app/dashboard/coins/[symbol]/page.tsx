@@ -105,6 +105,7 @@ export default function CoinDetailPage() {
   const metrics = latest?.oos_metrics ?? {};
   const features = latest?.features ?? {};
   const chart = latest?.chart;
+  const holdout = chart?.holdout;
   const folds = latest?.folds ?? [];
   const trades = latest?.trade_sample ?? [];
   const diagnostics = latest?.diagnostics;
@@ -120,7 +121,9 @@ export default function CoinDetailPage() {
       pageDescription={
         latest
           ? `Binance ${latest.coin.binance_symbol || 'perpetual'} · rank ${latest.coin.rank ?? '—'} · analyzed ${formatDate(latest.data_end)}`
-          : 'Loading the latest coin analysis.'
+          : history.isLoading
+            ? 'Loading the latest coin analysis.'
+            : 'Not analysed yet.'
       }
       pageHeaderAction={
         <Button
@@ -547,8 +550,9 @@ export default function CoinDetailPage() {
             <CardHeader>
               <CardTitle>Walk-forward out-of-sample equity</CardTitle>
               <CardDescription>
-                Stitched test windows. Starting capital {formatUsd(1000)}; folds never train on
-                their test window.
+                Stitched test windows, then the untouched holdout (dashed) run once with the
+                deployed parameters. Starting capital {formatUsd(1000)}; no window is used to pick
+                its own parameters.
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -641,7 +645,10 @@ export default function CoinDetailPage() {
             <Card>
               <CardHeader>
                 <CardTitle>Walk-forward folds</CardTitle>
-                <CardDescription>Test-window metrics per fold.</CardDescription>
+                <CardDescription>
+                  Test-window metrics per fold, then the holdout. Scores and ranks use the folds
+                  only.
+                </CardDescription>
               </CardHeader>
               <CardContent className='px-0'>
                 {folds.length === 0 ? (
@@ -693,6 +700,31 @@ export default function CoinDetailPage() {
                           </TableRow>
                         );
                       })}
+                      {holdout?.start ? (
+                        <TableRow className='bg-muted/40'>
+                          <TableCell className='text-xs font-medium'>Holdout</TableCell>
+                          <TableCell className='text-muted-foreground text-xs'>
+                            {formatDate(holdout.start)} — {formatDate(holdout.end ?? '')}
+                          </TableCell>
+                          <TableCell className='text-muted-foreground text-xs'>
+                            {holdout.stopped
+                              ? `Stopped (${(holdout.stop_reason ?? 'stop').replace(/_/g, ' ')})`
+                              : 'Untouched'}
+                          </TableCell>
+                          <TableCell className='text-right tabular-nums'>
+                            {formatPercent(holdout.net_return ?? null)}
+                          </TableCell>
+                          <TableCell className='text-muted-foreground text-right tabular-nums'>
+                            —
+                          </TableCell>
+                          <TableCell className='text-right tabular-nums'>
+                            {formatPercent(holdout.max_drawdown ?? null)}
+                          </TableCell>
+                          <TableCell className='text-right tabular-nums'>
+                            {holdout.trades ?? '—'}
+                          </TableCell>
+                        </TableRow>
+                      ) : null}
                     </TableBody>
                   </Table>
                 )}
@@ -757,7 +789,11 @@ export default function CoinDetailPage() {
           </div>
 
           <p className='text-muted-foreground text-xs'>
-            Data window {formatDate(latest.data_start)} — {formatDate(latest.data_end)}. Results are
+            Data window {formatDate(latest.data_start)} — {formatDate(latest.data_end)}
+            {holdout?.start
+              ? ` (walk-forward folds end before the holdout starts ${formatDate(holdout.start)})`
+              : ''}
+            . Results are
             historical simulations, not investment advice or a profitability guarantee.
           </p>
         </div>

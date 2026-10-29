@@ -3,6 +3,12 @@ import uuid
 from django.db import models
 from django.utils import timezone
 
+# Job types that must never overlap. A grid suitability analysis syncs market
+# data, rewrites rankings, opens/retires paper sessions, and saturates the CPU;
+# two at once would race on all of it.
+EXCLUSIVE_JOB_TYPES = ("daily_analysis",)
+ACTIVE_JOB_STATUSES = ("queued", "running")
+
 
 class JobSchedule(models.Model):
     class Kind(models.TextChoices):
@@ -77,6 +83,25 @@ class JobRun(models.Model):
         indexes = [
             models.Index(fields=["status", "enqueued_at"]),
             models.Index(fields=["job_type", "-enqueued_at"]),
+        ]
+        constraints = [
+            # Database-level guarantee: at most one queued-or-running job per
+            # exclusive type, whichever path (API, scheduler, CLI) creates it.
+            models.UniqueConstraint(
+                fields=["job_type"],
+                condition=models.Q(
+                    job_type__in=EXCLUSIVE_JOB_TYPES,
+                    status__in=ACTIVE_JOB_STATUSES,
+                ),
+                name="one_active_exclusive_job",
+            ),
+            # No job may be queued twice: the same type with identical params
+            # waiting side by side would only run the same work twice.
+            models.UniqueConstraint(
+                fields=["job_type", "params"],
+                condition=models.Q(status="queued"),
+                name="no_duplicate_queued_job",
+            ),
         ]
 
     def __str__(self) -> str:

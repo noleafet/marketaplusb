@@ -105,10 +105,29 @@ export default function CoinsPage() {
             action={<Button onClick={() => coins.refetch()}>Retry</Button>}
           />
         ) : rows.length === 0 ? (
-          <EmptyPanel
-            title='No coins stored'
-            description='Trigger the monthly coin refresh job to ingest the top 100.'
-          />
+          (coins.data?.results.length ?? 0) > 0 ? (
+            <EmptyPanel
+              title='No coins match these filters'
+              description='Clear the search or widen the eligibility and snapshot filters.'
+              action={
+                <Button
+                  variant='outline'
+                  onClick={() => {
+                    setSearch('');
+                    setEligibility('all');
+                    setMembership('all');
+                  }}
+                >
+                  Clear filters
+                </Button>
+              }
+            />
+          ) : (
+            <EmptyPanel
+              title='No coins stored'
+              description='Trigger the monthly coin refresh job to ingest the top 100.'
+            />
+          )
         ) : (
           <Card>
             <CardContent className='px-0'>

@@ -64,7 +64,7 @@ function GateList({ diagnostics }: { diagnostics: Diagnostics | null | undefined
             <ToneBadge tone={gate.passed ? 'good' : 'bad'}>
               {gate.passed ? 'pass' : 'fail'}
             </ToneBadge>
-            <span className='text-xs tabular-nums'>{formatGateValue(gate.value)}</span>
+            <span className='text-xs tabular-nums'>{formatGateValue(gate.value, gate.name)}</span>
           </span>
         </div>
       ))}
@@ -107,6 +107,7 @@ export default function CoinDetailDialog({
   const oos = full?.oos_metrics ?? result?.oos_metrics;
   const params = full?.params ?? result?.params ?? {};
   const folds = full?.folds ?? result?.folds ?? [];
+  const holdout = full?.chart?.holdout ?? result?.chart?.holdout;
   const regime = diagnostics?.regime;
   const costStress = diagnostics?.cost_stress;
   const sensitivity = diagnostics?.sensitivity;
@@ -535,6 +536,36 @@ export default function CoinDetailDialog({
                           </TableRow>
                         );
                       })}
+                      {holdout?.start ? (
+                        <TableRow className='bg-muted/40'>
+                          <TableCell className='text-sm font-medium'>Holdout</TableCell>
+                          <TableCell className='text-muted-foreground text-xs'>
+                            {holdout.start.slice(0, 10)} → {(holdout.end ?? '').slice(0, 10)}
+                          </TableCell>
+                          <TableCell className='text-muted-foreground text-sm'>
+                            {holdout.stopped
+                              ? `Stopped (${(holdout.stop_reason ?? 'stop').replace(/_/g, ' ')})`
+                              : 'Untouched'}
+                          </TableCell>
+                          <TableCell
+                            className={cn(
+                              'text-right text-sm tabular-nums',
+                              toneText[returnTone(toNumber(holdout.net_return))]
+                            )}
+                          >
+                            {formatPercent(holdout.net_return ?? null)}
+                          </TableCell>
+                          <TableCell
+                            className={cn(
+                              'text-right text-sm tabular-nums',
+                              toneText[drawdownTone(toNumber(holdout.max_drawdown), drawdownLimit)]
+                            )}
+                          >
+                            {formatPercent(holdout.max_drawdown ?? null)}
+                          </TableCell>
+                          <TableCell className='text-muted-foreground text-right text-sm'>—</TableCell>
+                        </TableRow>
+                      ) : null}
                     </TableBody>
                   </Table>
                 </div>

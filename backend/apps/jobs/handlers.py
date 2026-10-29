@@ -61,6 +61,14 @@ def handle_daily_analysis(params: dict[str, Any], job_run) -> dict[str, Any]:
     }
     if hybrid.status != hybrid.Status.SUCCEEDED:
         raise RuntimeError(hybrid.error or "hybrid analysis run failed")
+
+    from apps.trading.events import snapshot_session
+    from apps.trading.models import PaperSession
+
+    for open_session in PaperSession.objects.filter(
+        status__in=[PaperSession.Status.ACTIVE, PaperSession.Status.PAUSED]
+    ):
+        snapshot_session(open_session, "daily")
     return result
 
 

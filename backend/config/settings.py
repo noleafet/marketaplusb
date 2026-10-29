@@ -1,4 +1,4 @@
-"""Django settings for the grid suitability engine."""
+"""Django settings for Marketa+b - marketa+ bot."""
 
 from pathlib import Path
 
@@ -32,6 +32,7 @@ INSTALLED_APPS = [
     "apps.engine",
     "apps.trading",
     "apps.jobs",
+    "apps.etl_api",
 ]
 
 MIDDLEWARE = [
@@ -150,6 +151,9 @@ ENGINE = {
     # Hybrid analysis replays closed 1h and 15m trend filters over this trailing
     # window. Older bars sit outside the fetched klines and simulate ungated.
     "HYBRID_LOOKBACK_DAYS": env.int("ENGINE_HYBRID_LOOKBACK_DAYS", default=180),
+    # Worker processes for the per-coin walk-forward. 0 picks cpu_count - 1
+    # (capped at 6); 1 runs everything in-process.
+    "WORKERS": env.int("ENGINE_WORKERS", default=0),
 }
 
 PAPER = {

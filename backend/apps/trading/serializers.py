@@ -1,3 +1,4 @@
+from django.conf import settings
 from rest_framework import serializers
 
 from apps.coins.serializers import CoinSerializer
@@ -50,8 +51,17 @@ class PaperSessionListSerializer(serializers.ModelSerializer):
 
 
 class PaperSessionSerializer(PaperSessionListSerializer):
+    hard_stop_drawdown = serializers.SerializerMethodField()
+
     class Meta(PaperSessionListSerializer.Meta):
-        fields = PaperSessionListSerializer.Meta.fields + ["config", "grid_state"]
+        fields = PaperSessionListSerializer.Meta.fields + [
+            "config",
+            "grid_state",
+            "hard_stop_drawdown",
+        ]
+
+    def get_hard_stop_drawdown(self, obj) -> float:
+        return float(settings.PAPER["HARD_STOP_DRAWDOWN"])
 
 
 class PaperFillSerializer(serializers.ModelSerializer):

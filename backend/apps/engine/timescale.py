@@ -131,6 +131,108 @@ def load_funding(symbol: str, start: datetime, end: datetime) -> list[dict[str, 
     return rows
 
 
+def page_candles(
+    symbol: str,
+    interval: str,
+    lower: datetime | None,
+    upper: datetime,
+    after: datetime | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Ascending candles with ``lower <= time <= upper`` and ``time > after``."""
+    sql = [
+        "SELECT time, open, high, low, close, volume, quote_volume, trades",
+        "FROM market_candles WHERE symbol = %s AND interval = %s AND time <= %s",
+    ]
+    params: list[Any] = [symbol, interval, _aware(upper)]
+    if lower is not None:
+        sql.append("AND time >= %s")
+        params.append(_aware(lower))
+    if after is not None:
+        sql.append("AND time > %s")
+        params.append(_aware(after))
+    sql.append("ORDER BY time ASC LIMIT %s")
+    params.append(limit)
+    with connection.cursor() as cursor:
+        cursor.execute(" ".join(sql), params)
+        columns = [c[0] for c in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    for row in rows:
+        row["time"] = _aware(row["time"])
+        for key in ("open", "high", "low", "close", "volume", "quote_volume"):
+            row[key] = float(row[key])
+    return rows
+
+
+def page_funding(
+    symbol: str,
+    lower: datetime | None,
+    upper: datetime,
+    after: datetime | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Ascending funding rows with ``lower <= time <= upper`` and ``time > after``."""
+    sql = ["SELECT time, rate, mark_price FROM funding_rates WHERE symbol = %s AND time <= %s"]
+    params: list[Any] = [symbol, _aware(upper)]
+    if lower is not None:
+        sql.append("AND time >= %s")
+        params.append(_aware(lower))
+    if after is not None:
+        sql.append("AND time > %s")
+        params.append(_aware(after))
+    sql.append("ORDER BY time ASC LIMIT %s")
+    params.append(limit)
+    with connection.cursor() as cursor:
+        cursor.execute(" ".join(sql), params)
+        return [
+            {
+                "time": _aware(r[0]),
+                "rate": float(r[1]),
+                "mark_price": None if r[2] is None else float(r[2]),
+            }
+            for r in cursor.fetchall()
+        ]
+
+
+def page_equity(
+    session_id: str,
+    lower: datetime | None,
+    upper: datetime,
+    after: datetime | None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Ascending equity rows with ``lower <= time <= upper`` and ``time > after``."""
+    sql = [
+        "SELECT time, equity, price, position_qty, drawdown FROM paper_equity_points"
+        " WHERE session_id = %s AND time <= %s"
+    ]
+    params: list[Any] = [str(session_id), _aware(upper)]
+    if lower is not None:
+        sql.append("AND time >= %s")
+        params.append(_aware(lower))
+    if after is not None:
+        sql.append("AND time > %s")
+        params.append(_aware(after))
+    sql.append("ORDER BY time ASC LIMIT %s")
+    params.append(limit)
+
+    def _f(v):
+        return None if v is None else float(v)
+
+    with connection.cursor() as cursor:
+        cursor.execute(" ".join(sql), params)
+        return [
+            {
+                "time": _aware(r[0]),
+                "equity": _f(r[1]),
+                "price": _f(r[2]),
+                "position_qty": _f(r[3]),
+                "drawdown": _f(r[4]),
+            }
+            for r in cursor.fetchall()
+        ]
+
+
 def insert_equity_points(rows: Iterable[dict[str, Any]]) -> int:
     values = [
         (
@@ -176,6 +278,25 @@ def load_equity_points(session_id: str, limit: int = 5000) -> list[dict[str, Any
         )
         columns = [c[0] for c in cursor.description]
         return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def load_daily_equity(session_id: str, days: int = 120) -> dict[str, float]:
+    """Last equity point of each UTC day for one paper session."""
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT DISTINCT ON (day) day, equity
+            FROM (
+                SELECT (time AT TIME ZONE 'UTC')::date AS day, time, equity
+                FROM paper_equity_points
+                WHERE session_id = %s AND time >= NOW() - (%s || ' days')::interval
+            ) AS recent
+            ORDER BY day, time DESC
+            """,
+            [str(session_id), int(days)],
+        )
+        return {row[0].isoformat(): float(row[1]) for row in cursor.fetchall()}
 
 
 def expected_bars(interval: str, start: datetime, end: datetime) -> int:

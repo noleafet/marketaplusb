@@ -14,15 +14,19 @@ from apps.common.binance import INTERVAL_MS, BinanceError, BinanceFuturesClient,
 from apps.engine.grid import GridParams, SimulationConfig, funding_zscore
 from apps.engine.models import AnalysisRun, DecisionLog, log_decision
 from apps.engine.timescale import insert_equity_points
-from apps.trading import risk
+from apps.engine.versioning import resolve_config_version, resolve_strategy_version
+from apps.trading import portfolio, risk
 from apps.trading.execution import PaperExecutionAdapter
+from apps.trading.events import record_event, snapshot_session
 from apps.trading.hybrid import TrendSignal
 from apps.trading.hybrid import evaluate as evaluate_trend
 from apps.trading.models import (
+    GridEvent,
     LiveTradingState,
     PaperEvaluation,
     PaperFill,
     PaperSession,
+    StrategySettings,
 )
 from apps.trading.strategy import IncrementalGridStrategy
 
@@ -31,27 +35,41 @@ logger = logging.getLogger("engine")
 OPEN_STATUSES = (PaperSession.Status.ACTIVE,)
 
 
-def paper_config_snapshot() -> dict[str, Any]:
+def paper_config_snapshot(settings_row: StrategySettings | None = None) -> dict[str, Any]:
     cfg = settings.ENGINE
+    settings_row = settings_row or StrategySettings.load()
     return {
-        "capital": float(cfg["PAPER_CAPITAL"]),
+        "capital": float(settings_row.session_capital),
         "leverage": float(cfg["LEVERAGE"]),
         "maker_fee_rate": float(cfg["MAKER_FEE_RATE"]),
         "taker_fee_rate": float(cfg["TAKER_FEE_RATE"]),
         "slippage_bps": float(cfg["SLIPPAGE_BPS"]),
-        "interval": str(settings.PAPER.get("SIGNAL_INTERVAL", cfg["INTERVAL"])),
+        "interval": settings_row.signal_interval,
+        "fill_model": settings_row.fill_model,
+        "trade_through_bps": settings_row.effective_trade_through_bps,
     }
 
 
-def _sim_config(session: PaperSession) -> SimulationConfig:
+def _sim_config(
+    session: PaperSession, settings_row: StrategySettings | None = None
+) -> SimulationConfig:
+    """Session costs plus the live interval and fill model from the settings.
+
+    The interval and fill model follow the admin switch rather than the value
+    captured at session creation, so paper always runs what the daily backtest
+    measures.
+    """
+
     cfg = session.config or {}
+    settings_row = settings_row or StrategySettings.load()
     return SimulationConfig(
         capital=float(session.capital),
         leverage=float(session.leverage),
         maker_fee_rate=float(cfg.get("maker_fee_rate", settings.ENGINE["MAKER_FEE_RATE"])),
         taker_fee_rate=float(cfg.get("taker_fee_rate", settings.ENGINE["TAKER_FEE_RATE"])),
         slippage_bps=float(cfg.get("slippage_bps", settings.ENGINE["SLIPPAGE_BPS"])),
-        interval=str(cfg.get("interval", settings.ENGINE["INTERVAL"])),
+        interval=str(settings_row.signal_interval or cfg.get("interval") or settings.ENGINE["INTERVAL"]),
+        trade_through_bps=settings_row.effective_trade_through_bps,
     )
 
 
@@ -60,19 +78,28 @@ def ensure_paper_sessions(
 ) -> list[PaperSession]:
     created: list[PaperSession] = []
     now = timezone.now()
-    config = paper_config_snapshot()
+    settings_row = StrategySettings.load()
+    config = paper_config_snapshot(settings_row)
+    open_count = portfolio.open_sessions().count()
     for item in selected:
         coin = item["coin"]
+        if open_count >= int(settings_row.max_sessions):
+            break
         exists = PaperSession.objects.filter(
             coin=coin, status__in=[PaperSession.Status.ACTIVE, PaperSession.Status.PAUSED]
         ).exists()
         if exists:
             continue
+        open_count += 1
         session = PaperSession.objects.create(
             coin=coin,
             analysis=analysis,
             status=PaperSession.Status.ACTIVE,
             params=item.get("params") or {},
+            strategy_version=resolve_strategy_version(settings_row),
+            config_version=resolve_config_version(
+                coin.binance_symbol, item.get("params") or {}
+            ),
             config=config,
             grid_state={},
             capital=config["capital"],
@@ -84,6 +111,7 @@ def ensure_paper_sessions(
             last_funding_at=now,
         )
         created.append(session)
+        snapshot_session(session, "start")
         log_decision(
             "paper",
             f"Paper session opened for {coin.symbol} from analysis {analysis.id}.",
@@ -99,6 +127,82 @@ def ensure_paper_sessions(
     return created
 
 
+def retire_stale_sessions(
+    analysis: AnalysisRun,
+    qualifying: list[dict[str, Any]],
+    settings_row: StrategySettings,
+) -> list[str]:
+    """Stop sessions whose coin failed to qualify for N consecutive analyses.
+
+    A coin qualifies when it is eligible and rated prime or viable. Without
+    retirement the book only ever grows, and sessions keep trading coins the
+    engine itself no longer recommends.
+    """
+
+    qualifying_ids = {item["coin"].id for item in qualifying}
+    limit = max(1, int(settings_row.retire_after_failed_runs))
+    retired: list[str] = []
+    for session in portfolio.open_sessions():
+        if session.coin_id in qualifying_ids:
+            if session.failed_runs:
+                session.failed_runs = 0
+                session.save(update_fields=["failed_runs", "updated_at"])
+            continue
+        session.failed_runs += 1
+        if session.failed_runs < limit:
+            session.save(update_fields=["failed_runs", "updated_at"])
+            continue
+        params = GridParams.from_dict(session.params or {})
+        config = _sim_config(session, settings_row)
+        adapter = PaperExecutionAdapter(session, config=config, params=params)
+        strategy = IncrementalGridStrategy(params, config, adapter, session.grid_state or {})
+        price = float(session.mark_price or session.avg_entry or 0.0)
+        reason = f"retired: not qualified for {session.failed_runs} analyses"
+        if price > 0:
+            strategy.close(price, timezone.now(), "retired")
+            adapter.flush()
+        fills = adapter.fills
+        if fills:
+            PaperFill.objects.bulk_create(
+                [
+                    PaperFill(
+                        session=session,
+                        strategy_version_id=session.strategy_version_id,
+                        config_version_id=session.config_version_id,
+                        time=fill.time,
+                        side=fill.side,
+                        price=fill.price,
+                        qty=fill.qty,
+                        notional=fill.notional,
+                        fee=fill.fee,
+                        realized_pnl=fill.realized_pnl,
+                        level=fill.level,
+                        reason=fill.reason,
+                    )
+                    for fill in fills
+                ]
+            )
+            session.fill_count += len(fills)
+            session.closed_lots += sum(1 for fill in fills if fill.side == "sell")
+        session.grid_state = strategy.to_state()
+        session.status = PaperSession.Status.STOPPED
+        session.stop_reason = reason
+        session.promotion_ready = False
+        session.save()
+        record_event(GridEvent.Type.RETIRE, session=session, reason=reason)
+        snapshot_session(session, "retire")
+        retired.append(session.coin.symbol)
+        log_decision(
+            "paper",
+            f"{session.coin.symbol} paper session {reason}; position closed.",
+            severity="warning",
+            analysis=analysis,
+            coin=session.coin,
+            payload={"session_id": str(session.id), "failed_runs": session.failed_runs},
+        )
+    return retired
+
+
 def _fetch_hist(
     client: BinanceFuturesClient,
     symbol: str,
@@ -112,30 +216,6 @@ def _fetch_hist(
     start = now - timedelta(days=lookback_days)
     end = floor_to_interval(now, interval) - timedelta(milliseconds=1)
     return client.klines_range(symbol, interval, start, end, max_requests=10)
-
-
-def _funding_context(
-    client: BinanceFuturesClient, symbol: str, now: datetime, params: GridParams
-) -> float | None:
-    """Latest funding z-score from ~30 days of 8h funding prints."""
-
-    lookback_days = max(10, params.funding_z_lookback // 3 + 5)
-    try:
-        events = client.funding_rates(
-            symbol,
-            now - timedelta(days=lookback_days),
-            now,
-            max_requests=6,
-        )
-    except BinanceError as exc:
-        logger.warning("Funding context failed for %s: %s", symbol, exc)
-        return None
-    if not isinstance(events, list):
-        return None
-    try:
-        return funding_zscore(events, params.funding_z_lookback)
-    except (KeyError, TypeError, ValueError):
-        return None
 
 
 def _fetch_price(client: BinanceFuturesClient, symbol: str) -> float:
@@ -215,23 +295,6 @@ def _grid_log_payload(
     }
 
 
-def _apply_funding_events(
-    adapter: PaperExecutionAdapter,
-    events: list[dict[str, Any]],
-    start_idx: int,
-    up_to: datetime,
-    fallback_price: float,
-) -> tuple[int, float]:
-    idx = start_idx
-    paid = 0.0
-    while idx < len(events) and events[idx]["time"] <= up_to:
-        event = events[idx]
-        mark = event.get("mark_price") or fallback_price
-        paid += adapter.apply_funding(float(event["rate"]), float(mark), event["time"])
-        idx += 1
-    return idx, paid
-
-
 def _pause_for_overbought(
     session: PaperSession,
     strategy: IncrementalGridStrategy,
@@ -305,24 +368,61 @@ def _apply_overbought_guard(
     return {"action": decision.action, "reason": decision.reason}
 
 
+def _funding_window(
+    client: BinanceFuturesClient,
+    symbol: str,
+    since: datetime,
+    now: datetime,
+    params: GridParams,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Funding prints covering the z-score lookback and every uncharged event."""
+
+    history_days = max(10, params.funding_z_lookback // 3 + 5)
+    start = min(since, now - timedelta(days=history_days))
+    try:
+        events = client.funding_rates(symbol, start, now, max_requests=6)
+    except BinanceError as exc:
+        logger.warning("Funding sync failed for %s: %s", symbol, exc)
+        return [], False
+    if not isinstance(events, list):
+        return [], False
+    return sorted(events, key=lambda event: event["time"]), True
+
+
+def _funding_z_at(
+    events: list[dict[str, Any]], moment: datetime, params: GridParams
+) -> float | None:
+    upto = [event for event in events if event["time"] <= moment]
+    try:
+        return funding_zscore(upto, params.funding_z_lookback)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _tick_session(
     session: PaperSession,
     client: BinanceFuturesClient,
     now: datetime,
+    settings_row: StrategySettings | None = None,
+    portfolio_block: str = "",
 ) -> dict[str, Any]:
+    settings_row = settings_row or StrategySettings.load()
     params = GridParams.from_dict(session.params or {})
-    config = _sim_config(session)
+    config = _sim_config(session, settings_row)
     adapter = PaperExecutionAdapter(session, config=config, params=params)
     strategy = IncrementalGridStrategy(params, config, adapter, session.grid_state or {})
     symbol = session.coin.binance_symbol
     if not symbol:
         return {"ok": False, "error": "no Binance symbol"}
 
+    rebalance_event: dict[str, Any] | None = None
     trading_state = LiveTradingState.load()
     hybrid = trading_state.mode == LiveTradingState.Mode.HYBRID
+    # Book-level limits only ever block new buys.
+    strategy.portfolio_blocked = bool(portfolio_block)
 
     # A bearish tag keeps the session live for marking/funding but locks the
-    # grid: no new orders are armed and no fills are simulated.
+    # grid: no orders are armed and no fills are simulated.
     locked = session.bias == PaperSession.Bias.BEARISH
     if locked:
         strategy.orders.clear()
@@ -333,16 +433,20 @@ def _tick_session(
     funding_fetched = True
     last_price = 0.0
 
-    # Completed signal candles drive the adaptive overlays (ATR, support, 30d
-    # range, trend) even between grid rebalances.
+    # Completed signal candles: context for every bar is rebuilt from the
+    # candles strictly before it, exactly as in the backtest.
     hist: list[dict[str, Any]] = []
     try:
         hist = _fetch_hist(client, symbol, now, params, config.interval)
     except BinanceError as exc:
         logger.warning("Grid history sync failed for %s: %s", symbol, exc)
+    hist.sort(key=lambda row: row["time"])
 
-    if not locked:
-        strategy.set_funding_context(_funding_context(client, symbol, now, params))
+    # Funding is fetched on every tick, not only while a position is open:
+    # inventory opened during this tick still owes the prints that follow.
+    funding_events, funding_fetched = _funding_window(
+        client, symbol, funding_until, now, params
+    )
 
     # Hybrid mode only trades confirmed 1h uptrends. The gate is recomputed
     # from fully closed candles on every tick; normal mode clears any leftover
@@ -359,6 +463,11 @@ def _tick_session(
         last_price = price
         if trend_signal is not None:
             strategy.apply_trend_signal(trend_signal, price, now)
+        strategy.set_funding_context(_funding_z_at(funding_events, now, params))
+        if hist:
+            strategy.prev_close = float(hist[-1]["close"])
+        if not locked:
+            strategy.open_initial_inventory(price, now)
         strategy.initialize(hist, price, now)
         if locked:
             strategy.orders.clear()
@@ -375,52 +484,49 @@ def _tick_session(
             payload={**_grid_log_payload(session, strategy, price), "locked": locked},
         )
     else:
-        # Bring the adapter up to the session's current position.
         adapter.mark(session.mark_price or 0.0)
-        if hist:
-            strategy.refresh_context(hist, session.mark_price or None)
         start = strategy.last_bar_time or session.last_tick_at or session.started_at
-        end = floor_to_interval(now, config.interval) - timedelta(milliseconds=1)
-        bars: list[dict[str, Any]] = []
-        if start < end:
-            bars = client.klines_range(
-                symbol,
-                config.interval,
-                start + timedelta(seconds=1),
-                end,
-                max_requests=12,
-            )
+        bar_indices = [index for index, row in enumerate(hist) if row["time"] > start]
+        charge_from = funding_until
 
-        funding_events: list[dict[str, Any]] = []
-        if session.position_qty > 0:
-            try:
-                funding_events = client.funding_rates(symbol, funding_until, now)
-            except BinanceError as exc:
-                logger.warning("Funding sync failed for %s: %s", symbol, exc)
-                funding_fetched = False
-        funding_idx = 0
+        def charge_funding(up_to: datetime, fallback: float) -> float:
+            nonlocal charge_from
+            paid = 0.0
+            for event in funding_events:
+                if charge_from < event["time"] <= up_to:
+                    mark = event.get("mark_price") or fallback
+                    paid += adapter.apply_funding(float(event["rate"]), float(mark), event["time"])
+            charge_from = max(charge_from, up_to)
+            return paid
 
         stopped = False
         stop_reason = ""
-        for bar in bars:
-            funding_idx, paid = _apply_funding_events(
-                adapter, funding_events, funding_idx, bar["time"], float(bar["open"])
+        rebalances_before = strategy.rebalances
+        for index in bar_indices:
+            bar = hist[index]
+            funding_paid += charge_funding(bar["time"], float(bar["open"]))
+            if locked:
+                # Marked and charged funding, but the ladder stays disarmed.
+                strategy.prev_close = float(bar["close"])
+                strategy.last_bar_time = bar["time"]
+                adapter.mark(float(bar["close"]))
+                bars_processed += 1
+                continue
+            result = strategy.step(
+                bar,
+                hist[:index],
+                funding_z=_funding_z_at(funding_events, bar["time"], params),
             )
-            funding_paid += paid
-            result = strategy.process_bar(bar)
             bars_processed += 1
             if result.get("stopped"):
                 stopped = True
                 stop_reason = result.get("reason", "")
                 break
 
-        if not stopped and session.position_qty > 0:
-            funding_idx, paid = _apply_funding_events(
-                adapter, funding_events, funding_idx, now, session.mark_price or session.avg_entry
-            )
-            funding_paid += paid
+        if not stopped:
+            funding_paid += charge_funding(now, session.mark_price or session.avg_entry)
 
-        last_price = float(bars[-1]["close"]) if bars else 0.0
+        last_price = float(hist[bar_indices[-1]]["close"]) if bar_indices else 0.0
         if last_price <= 0:
             try:
                 last_price = _fetch_price(client, symbol)
@@ -457,30 +563,34 @@ def _tick_session(
             session.stop_reason = stop_reason
             session.promotion_ready = False
 
-        # Re-center after processing bars so new orders only apply to future data.
-        if (
-            session.status == PaperSession.Status.ACTIVE
-            and not locked
-            and hist
-            and last_price > 0
-        ):
-            if strategy.maybe_rebalance(now, last_price, hist):
-                adapter.mark(last_price)
-                log_decision(
-                    "paper",
-                    f"{session.coin.symbol} grid rebalanced "
-                    f"({strategy.last_rebalance_reason}).",
-                    coin=session.coin,
-                    payload=_grid_log_payload(session, strategy, last_price),
-                )
+        if strategy.rebalances > rebalances_before:
+            rebalance_payload = _grid_log_payload(session, strategy, last_price)
+            rebalance_event = {
+                "reason": strategy.last_rebalance_reason,
+                "after": {
+                    key: rebalance_payload[key]
+                    for key in ("range_low", "range_high", "active_levels")
+                },
+            }
+            log_decision(
+                "paper",
+                f"{session.coin.symbol} grid rebalanced "
+                f"({strategy.last_rebalance_reason}).",
+                coin=session.coin,
+                payload=rebalance_payload,
+            )
 
-        if funding_fetched and funding_events:
-            funding_until = funding_events[-1]["time"]
+        if funding_fetched:
+            funding_until = now
 
-    # Overbought guard: arm on RSI(15m) > threshold, pause on exhaustion.
+    # Overbought guard: off by default until a backtest shows it adds value.
     # A bearish session is already locked and holds no ladder to protect.
     risk_result = None
-    if session.status == PaperSession.Status.ACTIVE and not locked:
+    if (
+        session.status == PaperSession.Status.ACTIVE
+        and not locked
+        and settings_row.overbought_guard_enabled
+    ):
         risk_result = _apply_overbought_guard(
             session, strategy, adapter, client, now, last_price
         )
@@ -493,6 +603,8 @@ def _tick_session(
             [
                 PaperFill(
                     session=session,
+                    strategy_version_id=session.strategy_version_id,
+                    config_version_id=session.config_version_id,
                     time=fill.time,
                     side=fill.side,
                     price=fill.price,
@@ -536,6 +648,15 @@ def _tick_session(
     if funding_fetched:
         session.last_funding_at = now
     session.save()
+
+    if rebalance_event is not None:
+        record_event(
+            GridEvent.Type.REBALANCE,
+            session=session,
+            reason=rebalance_event["reason"],
+            after=rebalance_event["after"],
+        )
+        snapshot_session(session, "rebalance")
 
     insert_equity_points(
         [
@@ -647,12 +768,26 @@ def tick_paper_sessions(
         sessions = sessions.filter(id__in=session_ids)
     session_list = list(sessions)
     client = BinanceFuturesClient()
+    settings_row = StrategySettings.load()
+    book = portfolio.refresh_book_state(settings_row, now)
+    block = portfolio.buy_block_reason(book, settings_row)
     results: list[dict[str, Any]] = []
     errors = 0
     total_fills = 0
     for session in session_list:
         try:
-            result = _tick_session(session, client, now)
+            # Row lock: a manual tick and a scheduled tick must never replay
+            # the same candles for one session concurrently.
+            with transaction.atomic():
+                locked_session = (
+                    PaperSession.objects.select_for_update()
+                    .select_related("coin")
+                    .get(id=session.id)
+                )
+                if locked_session.status != PaperSession.Status.ACTIVE:
+                    continue
+                session = locked_session
+                result = _tick_session(session, client, now, settings_row, block)
         except Exception as exc:  # noqa: BLE001 - one session must not stop the tick
             logger.exception("Paper tick failed for %s", session.coin.symbol)
             errors += 1
@@ -669,6 +804,8 @@ def tick_paper_sessions(
         "sessions": len(session_list),
         "errors": errors,
         "fills": total_fills,
+        "book": {key: value for key, value in book.items() if key != "start"},
+        "buy_block": block,
         "results": results,
     }
     if errors:
@@ -690,8 +827,23 @@ def run_risk_guard(*, job_run_id=None) -> dict[str, Any]:
     are not ticked and would otherwise never see a recovery check.
     """
 
-    if not settings.RISK.get("ENABLED", True):
-        return {"ok": True, "enabled": False, "sessions": 0, "resumed": 0, "results": []}
+    if not settings.RISK.get("ENABLED", True) or not StrategySettings.load().overbought_guard_enabled:
+        # With the guard switched off, sessions it paused must not stay
+        # paused forever waiting for a recovery check that never runs.
+        resumed_ids = []
+        for session in PaperSession.objects.filter(status=PaperSession.Status.PAUSED):
+            if (session.risk_state or {}).get("phase") == "paused":
+                session.risk_state = {}
+                session.save(update_fields=["risk_state", "updated_at"])
+                resume_session(session)
+                resumed_ids.append(str(session.id))
+        return {
+            "ok": True,
+            "enabled": False,
+            "sessions": 0,
+            "resumed": len(resumed_ids),
+            "results": [],
+        }
     now = timezone.now()
     sessions = [
         session
@@ -799,6 +951,8 @@ def pause_session(session: PaperSession) -> PaperSession:
     if session.status == PaperSession.Status.ACTIVE:
         session.status = PaperSession.Status.PAUSED
         session.save(update_fields=["status", "updated_at"])
+        record_event(GridEvent.Type.PAUSE, session=session)
+        snapshot_session(session, "pause")
         log_decision(
             "paper",
             f"{session.coin.symbol} paper session paused.",
@@ -816,6 +970,8 @@ def resume_session(session: PaperSession) -> PaperSession:
         # instead of replaying bars from before the pause.
         session.grid_state = {}
         session.save(update_fields=["status", "last_tick_at", "grid_state", "updated_at"])
+        record_event(GridEvent.Type.RESUME, session=session)
+        snapshot_session(session, "resume")
         log_decision(
             "paper",
             f"{session.coin.symbol} paper session resumed.",
@@ -831,6 +987,8 @@ def stop_session(session: PaperSession, reason: str = "manual_stop") -> PaperSes
         session.stop_reason = reason
         session.promotion_ready = False
         session.save(update_fields=["status", "stop_reason", "promotion_ready", "updated_at"])
+        record_event(GridEvent.Type.STOP, session=session, reason=reason)
+        snapshot_session(session, "stop")
         log_decision(
             "paper",
             f"{session.coin.symbol} paper session stopped: {reason}.",

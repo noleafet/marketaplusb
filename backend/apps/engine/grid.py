@@ -20,6 +20,7 @@ Design notes
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -50,6 +51,11 @@ TREND_SLOW_DAYS = 50
 MOMENTUM_DAYS = 10
 MIN_FUNDING_HISTORY = 8
 TP_COOLDOWN_DAYS = 1.0
+# ATR multiples (stop, take-profit trail, range pad, widths) were calibrated on
+# 4h bars. Per-bar true range grows with roughly the square root of the bar
+# length (measured 4h/1h ratio across the top-100 universe: 2.05), so ATR is
+# expressed in 4h-equivalent units on every interval.
+REFERENCE_BARS_PER_DAY = 6
 
 
 @dataclass(frozen=True)
@@ -141,6 +147,10 @@ class SimulationConfig:
     slippage_bps: float = 1.0
     maintenance_margin_rate: float = 0.005
     interval: str = "4h"
+    # Fill model. Zero fills a resting limit order when the bar merely touches
+    # it; a positive value requires price to trade through the level by this
+    # many basis points, which approximates losing queue priority.
+    trade_through_bps: float = 0.0
 
     @property
     def bars_per_day(self) -> int:
@@ -153,6 +163,22 @@ class SimulationConfig:
     @property
     def slip(self) -> float:
         return self.slippage_bps / 10_000.0
+
+    @property
+    def trade_through(self) -> float:
+        return max(0.0, self.trade_through_bps) / 10_000.0
+
+
+def buy_crosses(level: float, p0: float, p1: float, trade_through: float) -> bool:
+    """A resting buy fills when the falling segment p0 -> p1 trades through it."""
+
+    return level <= p0 and p1 <= level * (1.0 - trade_through)
+
+
+def sell_crosses(level: float, p0: float, p1: float, trade_through: float) -> bool:
+    """A resting sell fills when the rising segment p0 -> p1 trades through it."""
+
+    return level >= p0 and p1 >= level * (1.0 + trade_through)
 
 
 def max_position_notional(
@@ -169,6 +195,12 @@ def max_position_notional(
     if params.max_inventory_pct > 0:
         cap = min(cap, equity * params.max_inventory_pct)
     return max(0.0, cap)
+
+
+def inventory_in_profit(price: float, avg_entry: float, params: GridParams) -> bool:
+    """Trailing take-profit arms once inventory is up ``tp_activate_net_return``."""
+
+    return avg_entry > 0 and price >= avg_entry * (1.0 + params.tp_activate_net_return)
 
 
 def range_width_cap(params: GridParams, atr: float) -> float:
@@ -193,6 +225,8 @@ class SimulationResult:
     liquidated: bool
     stop_reason: str = ""
     error: str = ""
+    # Last equity of each UTC day, used for strategy-return correlation.
+    daily_equity: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -236,7 +270,16 @@ class _State:
     hybrid_exits: int = 0
     rebalances: int = 0
     adaptive_rebalances: int = 0
+    # Buy fees and funding carried by open inventory. Each sell releases its
+    # pro-rata share, so per-trade results reconcile with net PnL.
+    carry_cost: float = 0.0
     trades: list[dict[str, Any]] = field(default_factory=list)
+
+
+def atr_scale(bars_per_day: int) -> float:
+    """Factor that converts a per-bar ATR into 4h-equivalent units."""
+
+    return math.sqrt(max(1, int(bars_per_day)) / REFERENCE_BARS_PER_DAY)
 
 
 def _true_range(high: np.ndarray, low: np.ndarray, close: np.ndarray) -> np.ndarray:
@@ -258,11 +301,9 @@ def _rolling_mean(values: np.ndarray, window: int) -> np.ndarray:
     if values.size == 0:
         return values.copy()
     cumulative = np.concatenate(([0.0], np.cumsum(values)))
-    out = np.empty_like(values)
-    for i in range(values.size):
-        start = max(0, i - window + 1)
-        out[i] = (cumulative[i + 1] - cumulative[start]) / (i + 1 - start)
-    return out
+    ends = np.arange(1, values.size + 1)
+    starts = np.maximum(0, ends - window)
+    return (cumulative[ends] - cumulative[starts]) / (ends - starts)
 
 
 def _rolling_extreme(values: np.ndarray, window: int, want_max: bool) -> np.ndarray:
@@ -326,9 +367,17 @@ def _indicator_series(
         momentum[momentum_bars:] = (
             closes[momentum_bars:] / np.maximum(closes[:-momentum_bars], 1e-12) - 1.0
         )
+    support = _rolling_extreme(lows, _window(bars_per_day, params.support_lookback_days), False)
+    # Support measured before the latest bar. A close can never sit below a
+    # minimum that includes its own low, so the breakdown test must compare the
+    # close against the support that existed before that bar printed.
+    support_prior = (
+        np.concatenate(([support[0]], support[:-1])) if support.size else support.copy()
+    )
     return {
-        "atr": _rolling_mean(tr, _window(bars_per_day, ATR_DAYS)),
-        "support": _rolling_extreme(lows, _window(bars_per_day, params.support_lookback_days), False),
+        "atr": _rolling_mean(tr, _window(bars_per_day, ATR_DAYS)) * atr_scale(bars_per_day),
+        "support": support,
+        "support_prior": support_prior,
         "range_high": _rolling_extreme(highs, _window(bars_per_day, params.range_position_days), True),
         "range_low": _rolling_extreme(lows, _window(bars_per_day, params.range_position_days), False),
         "trend_up": ((fast > slow) & (fast >= slow_lag)).astype(bool),
@@ -361,7 +410,7 @@ def market_context(
     range_low = float(series["range_low"][last])
     return MarketContext(
         atr=float(series["atr"][last]),
-        support=float(series["support"][last]),
+        support=float(series["support_prior"][last]),
         range_high=range_high,
         range_low=range_low,
         range_pos=_range_position(price, range_low, range_high),
@@ -374,12 +423,26 @@ def _funding_z_series(rates: np.ndarray, lookback: int) -> np.ndarray:
     """Causal z-score of each funding print versus the previous ``lookback``."""
 
     z = np.zeros(rates.size)
-    for k in range(rates.size):
-        history = rates[max(0, k - lookback) : k]
-        if history.size < MIN_FUNDING_HISTORY:
-            continue
-        std = float(np.std(history, ddof=1))
-        z[k] = 0.0 if std <= 1e-12 else (rates[k] - float(np.mean(history))) / std
+    if rates.size == 0:
+        return z
+    lookback = max(1, int(lookback))
+    # Rolling sums over the ``lookback`` prints strictly before each index.
+    sums = np.concatenate(([0.0], np.cumsum(rates)))
+    squares = np.concatenate(([0.0], np.cumsum(rates * rates)))
+    ends = np.arange(rates.size)
+    starts = np.maximum(0, ends - lookback)
+    counts = ends - starts
+    valid = counts >= MIN_FUNDING_HISTORY
+    if not np.any(valid):
+        return z
+    n = counts[valid].astype(float)
+    total = sums[ends[valid]] - sums[starts[valid]]
+    total_sq = squares[ends[valid]] - squares[starts[valid]]
+    mean = total / n
+    variance = np.maximum(0.0, (total_sq - n * mean * mean) / (n - 1.0))
+    std = np.sqrt(variance)
+    scores = np.where(std <= 1e-12, 0.0, (rates[valid] - mean) / np.where(std <= 1e-12, 1.0, std))
+    z[valid] = scores
     return z
 
 
@@ -390,6 +453,71 @@ def funding_zscore(events: list[dict[str, Any]], lookback: int) -> float | None:
     if rates.size < MIN_FUNDING_HISTORY + 1:
         return None
     return float(_funding_z_series(rates, lookback)[-1])
+
+
+def _series_key(params: GridParams) -> tuple[int, int, int]:
+    return (
+        int(params.support_lookback_days),
+        int(params.range_position_days),
+        int(params.funding_z_lookback),
+    )
+
+
+@dataclass
+class PreparedMarket:
+    """Price arrays and causal indicator series shared by many simulations.
+
+    Every indicator is causal, so a series computed over the full history is
+    identical to one computed over any prefix of it. Walk-forward candidates
+    therefore slice these arrays instead of recomputing them, which removes
+    most of the per-simulation overhead on 1h data.
+    """
+
+    times: list[datetime]
+    open: np.ndarray
+    high: np.ndarray
+    low: np.ndarray
+    close: np.ndarray
+    series: dict[str, np.ndarray]
+    funding_rows: list[dict[str, Any]]
+    funding_z: np.ndarray
+    key: tuple[int, int, int]
+    bars_per_day: int
+
+    def covers(self, rows: list[dict[str, Any]], params: GridParams, bars_per_day: int) -> bool:
+        count = len(rows)
+        return (
+            self.key == _series_key(params)
+            and self.bars_per_day == bars_per_day
+            and 0 < count <= len(self.times)
+            and rows[-1]["time"] == self.times[count - 1]
+        )
+
+
+def prepare_market(
+    rows: list[dict[str, Any]],
+    funding_rows: list[dict[str, Any]],
+    params: GridParams,
+    bars_per_day: int,
+) -> PreparedMarket:
+    times = [row["time"] for row in rows]
+    high = np.array([row["high"] for row in rows], dtype=float)
+    low = np.array([row["low"] for row in rows], dtype=float)
+    close = np.array([row["close"] for row in rows], dtype=float)
+    ordered_funding = sorted(funding_rows, key=lambda r: r["time"])
+    rates = np.array([float(event["rate"]) for event in ordered_funding], dtype=float)
+    return PreparedMarket(
+        times=times,
+        open=np.array([row["open"] for row in rows], dtype=float),
+        high=high,
+        low=low,
+        close=close,
+        series=_indicator_series(high, low, close, params, bars_per_day),
+        funding_rows=ordered_funding,
+        funding_z=_funding_z_series(rates, params.funding_z_lookback),
+        key=_series_key(params),
+        bars_per_day=bars_per_day,
+    )
 
 
 def _build_grid(
@@ -407,7 +535,7 @@ def _build_grid(
 
     tr = _true_range(highs, lows, closes)
     atr_window = min(len(tr), ATR_DAYS * bars_per_day)
-    atr = _mean(tr[-atr_window:])
+    atr = _mean(tr[-atr_window:]) * atr_scale(bars_per_day)
 
     support = 0.0
     if hist_low.size:
@@ -589,28 +717,38 @@ def simulate_grid(
     config: SimulationConfig,
     *,
     gate: Gate | None = None,
+    prepared: PreparedMarket | None = None,
 ) -> SimulationResult:
     """Run a single grid path from ``trade_start`` through the end of ``rows``.
 
     ``gate`` optionally applies the hybrid trend filter: new buys are disarmed
     on blocked bars and inventory is flattened at the open of a bar that
     follows a confirmed exit.
+
+    ``prepared`` may hold arrays and indicators for a longer history of which
+    ``rows`` is a prefix (see ``prepare_market``); it is only an optimisation
+    and never changes the result.
     """
 
     if len(rows) < 10:
         return SimulationResult({}, [], [], [], False, False, error="insufficient candles")
 
-    times = [row["time"] for row in rows]
-    o = np.array([row["open"] for row in rows], dtype=float)
-    h = np.array([row["high"] for row in rows], dtype=float)
-    low = np.array([row["low"] for row in rows], dtype=float)
-    c = np.array([row["close"] for row in rows], dtype=float)
+    bpd = config.bars_per_day
+    if prepared is None or not prepared.covers(rows, params, bpd):
+        prepared = prepare_market(rows, funding_rows, params, bpd)
+    count = len(rows)
+    times = prepared.times[:count]
+    o = prepared.open[:count]
+    h = prepared.high[:count]
+    low = prepared.low[:count]
+    c = prepared.close[:count]
 
-    start_idx = next((i for i, t in enumerate(times) if t >= trade_start), None)
+    start_idx = bisect_left(times, trade_start)
+    if start_idx >= count:
+        start_idx = None
     if start_idx is None or start_idx < 20:
         return SimulationResult({}, [], [], [], False, False, error="not enough warmup data")
 
-    bpd = config.bars_per_day
     warmup = max(params.range_lookback_days * bpd, ATR_DAYS * bpd)
     if start_idx < min(warmup // 2, 20):
         return SimulationResult({}, [], [], [], False, False, error="warmup window too short")
@@ -631,15 +769,23 @@ def simulate_grid(
     curve_low: list[float] = []
     curve_high: list[float] = []
     funding_idx = 0
-    funding_rows = sorted(funding_rows, key=lambda r: r["time"])
-    funding_rates = np.array(
-        [float(event["rate"]) for event in funding_rows], dtype=float
-    )
-    funding_z = _funding_z_series(funding_rates, params.funding_z_lookback)
+    funding_rows = prepared.funding_rows
+    funding_z = prepared.funding_z
     current_funding_z = 0.0
-    prev_close = c[start_idx - 1] if start_idx > 0 else o[start_idx]
+    prev_close = float(c[start_idx - 1]) if start_idx > 0 else float(o[start_idx])
+    trade_through = config.trade_through
 
-    series = _indicator_series(h, low, c, params, bpd)
+    series = prepared.series
+    atr_series = series["atr"].tolist()
+    support_series = series["support_prior"].tolist()
+    range_high_series = series["range_high"].tolist()
+    range_low_series = series["range_low"].tolist()
+    trend_series = series["trend_up"].tolist()
+    momentum_series = series["momentum"].tolist()
+    o_list = o.tolist()
+    h_list = h.tolist()
+    low_list = low.tolist()
+    c_list = c.tolist()
     buy_scale = 1.0
     allow_buys = True
     buy_blocked_until = -1
@@ -688,29 +834,43 @@ def simulate_grid(
         curve_low.append(active_low)
         curve_high.append(active_high)
 
-    def close_all(price: float, timestamp: datetime, reason: str) -> None:
-        nonlocal prev_close
-        qty = state.position_qty
-        if qty <= 0:
-            return
-        fill = price * (1.0 - slip)
-        fee = fill * qty * config.taker_fee_rate
+    def release_sell(
+        qty: float,
+        fill: float,
+        fee_rate: float,
+        timestamp: datetime,
+        level: int | None,
+        reason: str,
+    ) -> None:
+        """Book a sell of ``qty`` at ``fill`` and its share of carried costs."""
+
+        notional = fill * qty
+        fee = notional * fee_rate
         pnl = (fill - state.avg_entry) * qty
+        share = qty / state.position_qty if state.position_qty > 1e-12 else 1.0
+        carried = state.carry_cost * min(1.0, share)
+        state.carry_cost -= carried
         state.realized_pnl += pnl
         state.fees_paid += fee
-        state.turnover += fill * qty
-        state.slippage_paid += fill * qty * slip
+        state.turnover += notional
+        state.slippage_paid += notional * slip
         state.sell_fills += 1
-        state.position_qty = 0.0
-        state.avg_entry = 0.0
+        state.position_qty -= qty
+        if state.position_qty <= 1e-12:
+            state.position_qty = 0.0
+            state.avg_entry = 0.0
+            state.carry_cost = 0.0
         state.total_fills += 1
         state.closed_lots += 1
-        if pnl - fee >= 0:
+        # Trade result includes the sell fee plus the buy fees and funding the
+        # sold inventory carried, so gross profit - gross loss equals net PnL.
+        net = pnl - fee - carried
+        if net >= 0:
             state.wins += 1
-            state.gross_profit += max(0.0, pnl - fee)
+            state.gross_profit += net
         else:
             state.losses += 1
-            state.gross_loss += abs(min(0.0, pnl - fee))
+            state.gross_loss += -net
         state.trades.append(
             {
                 "t": timestamp.isoformat(),
@@ -719,15 +879,24 @@ def simulate_grid(
                 "qty": round(qty, 8),
                 "fee": round(fee, 6),
                 "realized_pnl": round(pnl - fee, 6),
-                "level": None,
+                "net_pnl": round(net, 6),
+                "level": level,
                 "reason": reason,
             }
         )
+
+    def close_all(price: float, timestamp: datetime, reason: str) -> None:
+        qty = state.position_qty
+        if qty <= 0:
+            return
+        release_sell(qty, price * (1.0 - slip), config.taker_fee_rate, timestamp, None, reason)
 
     def position_notional(price: float) -> float:
         return state.position_qty * price
 
     def max_buy_qty(price: float) -> float:
+        # Mirrors PaperExecutionAdapter.max_buy_qty: the funding-crowding scale
+        # is applied once, when the ladder is sized, not again per fill.
         eq = equity_at(price, state.position_qty, state.avg_entry)
         used_margin = position_notional(price) / config.leverage
         free_margin = max(0.0, eq - used_margin)
@@ -736,7 +905,7 @@ def simulate_grid(
             max_notional - position_notional(price),
             free_margin * config.leverage * 0.98,
         )
-        return max(0.0, budget / price) * buy_scale, max(0.0, budget) * buy_scale
+        return max(0.0, budget / price) if price > 0 else 0.0
 
     def execute_buy(level_idx: int | None, price: float, timestamp: datetime, reason: str) -> bool:
         if not allow_buys:
@@ -745,11 +914,10 @@ def simulate_grid(
         qty = order["qty"] if order else 0.0
         if qty <= 0:
             return False
-        fill = price * (1.0 + slip)
-        max_qty, _ = max_buy_qty(fill)
-        qty = min(qty, max_qty)
+        qty = min(qty, max_buy_qty(price))
         if qty <= 1e-12:
             return False
+        fill = price * (1.0 + slip)
         notional = fill * qty
         fee = notional * (
             config.maker_fee_rate if reason in {"grid", "gap"} else config.taker_fee_rate
@@ -760,11 +928,12 @@ def simulate_grid(
         )
         state.position_qty = new_qty
         state.fees_paid += fee
+        state.carry_cost += fee
         state.turnover += notional
         state.slippage_paid += notional * slip
         state.buy_fills += 1
         state.total_fills += 1
-        state.max_position_notional = max(state.max_position_notional, notional + position_notional(fill) - notional)
+        state.max_position_notional = max(state.max_position_notional, position_notional(fill))
         state.trades.append(
             {
                 "t": timestamp.isoformat(),
@@ -789,39 +958,7 @@ def simulate_grid(
         qty = min(order["qty"], state.position_qty) if order else 0.0
         if qty <= 1e-12:
             return False
-        fill = price * (1.0 - slip)
-        notional = fill * qty
-        fee = notional * config.maker_fee_rate
-        pnl = (fill - state.avg_entry) * qty
-        state.realized_pnl += pnl
-        state.fees_paid += fee
-        state.turnover += notional
-        state.slippage_paid += notional * slip
-        state.sell_fills += 1
-        state.position_qty -= qty
-        if state.position_qty <= 1e-12:
-            state.position_qty = 0.0
-            state.avg_entry = 0.0
-        state.total_fills += 1
-        state.closed_lots += 1
-        if pnl - fee >= 0:
-            state.wins += 1
-            state.gross_profit += max(0.0, pnl - fee)
-        else:
-            state.losses += 1
-            state.gross_loss += abs(min(0.0, pnl - fee))
-        state.trades.append(
-            {
-                "t": timestamp.isoformat(),
-                "side": "sell",
-                "price": round(fill, 8),
-                "qty": round(qty, 8),
-                "fee": round(fee, 6),
-                "realized_pnl": round(pnl - fee, 6),
-                "level": level_idx,
-                "reason": reason,
-            }
-        )
+        release_sell(qty, price * (1.0 - slip), config.maker_fee_rate, timestamp, level_idx, reason)
         if order["qty"] - qty <= 1e-12:
             orders.pop(level_idx, None)
         else:
@@ -834,39 +971,7 @@ def simulate_grid(
         qty = min(qty, state.position_qty)
         if qty <= 1e-12:
             return
-        fill = price * (1.0 - slip)
-        notional = fill * qty
-        fee = notional * config.taker_fee_rate
-        pnl = (fill - state.avg_entry) * qty
-        state.realized_pnl += pnl
-        state.fees_paid += fee
-        state.turnover += notional
-        state.slippage_paid += notional * slip
-        state.sell_fills += 1
-        state.position_qty -= qty
-        if state.position_qty <= 1e-12:
-            state.position_qty = 0.0
-            state.avg_entry = 0.0
-        state.total_fills += 1
-        state.closed_lots += 1
-        if pnl - fee >= 0:
-            state.wins += 1
-            state.gross_profit += max(0.0, pnl - fee)
-        else:
-            state.losses += 1
-            state.gross_loss += abs(min(0.0, pnl - fee))
-        state.trades.append(
-            {
-                "t": timestamp.isoformat(),
-                "side": "sell",
-                "price": round(fill, 8),
-                "qty": round(qty, 8),
-                "fee": round(fee, 6),
-                "realized_pnl": round(pnl - fee, 6),
-                "level": None,
-                "reason": reason,
-            }
-        )
+        release_sell(qty, price * (1.0 - slip), config.taker_fee_rate, timestamp, None, reason)
 
     def rebuild_orders(timestamp: datetime, price: float) -> None:
         nonlocal prev_close
@@ -941,15 +1046,17 @@ def simulate_grid(
     first = start_idx
     first_allowed = gate is None or gate.allow.get(times[first], True)
     if params.initial_inventory_pct > 0 and first_allowed:
-        price = o[first] * (1.0 + slip)
+        price = float(o[first]) * (1.0 + slip)
         eq = config.capital
         budget = eq * config.leverage * params.max_utilization * params.initial_inventory_pct
-        qty = budget / price
+        qty = min(budget / price, max_buy_qty(float(o[first])))
+        budget = qty * price
         if qty > 0:
             fee = budget * config.taker_fee_rate
             state.position_qty = qty
             state.avg_entry = price
             state.fees_paid += fee
+            state.carry_cost += fee
             state.turnover += budget
             state.slippage_paid += budget * slip
             state.buy_fills += 1
@@ -971,13 +1078,13 @@ def simulate_grid(
     stop_equity = config.capital * (1.0 - params.stop_loss_pct)
     hybrid_blocked = False
 
-    for i in range(start_idx, len(rows)):
+    for i in range(start_idx, count):
         if state.stopped:
             break
-        bar_open = float(o[i])
-        bar_high = float(h[i])
-        bar_low = float(low[i])
-        bar_close = float(c[i])
+        bar_open = o_list[i]
+        bar_high = h_list[i]
+        bar_low = low_list[i]
+        bar_close = c_list[i]
         timestamp = times[i]
 
         # Funding events that occurred since the previous bar.
@@ -986,20 +1093,24 @@ def simulate_grid(
             funding_idx += 1
             current_funding_z = float(funding_z[funding_idx - 1])
             state.funding_z_max = max(state.funding_z_max, current_funding_z)
-            if state.position_qty > 0 and event["time"] >= times[start_idx]:
+            # Prints at the start instant settle before the opening inventory
+            # exists, so only later prints are charged.
+            if state.position_qty > 0 and event["time"] > times[start_idx]:
                 mark = event.get("mark_price") or bar_open
                 cost = state.position_qty * float(mark) * float(event["rate"])
                 state.funding_paid += cost
+                state.carry_cost += cost
                 state.funding_events += 1
 
-        # Adaptive regime gates, computed from completed data only.
+        # Adaptive regime gates, computed from completed data only (bar i-1).
         ctx_i = max(0, i - 1)
-        atr_now = float(series["atr"][ctx_i])
-        support_now = float(series["support"][ctx_i])
-        range_high_now = float(series["range_high"][ctx_i])
-        range_low_now = float(series["range_low"][ctx_i])
-        trend_up = bool(series["trend_up"][ctx_i])
-        momentum = float(series["momentum"][ctx_i])
+        atr_now = atr_series[ctx_i]
+        support_now = support_series[ctx_i]
+        range_high_now = range_high_series[ctx_i]
+        range_low_now = range_low_series[ctx_i]
+        trend_up = bool(trend_series[ctx_i])
+        momentum = momentum_series[ctx_i]
+        previous_allowed = allow_buys
         range_pos = _range_position(prev_close, range_low_now, range_high_now)
         crowded = (
             params.funding_z_threshold > 0
@@ -1046,7 +1157,7 @@ def simulate_grid(
             else:
                 hybrid_blocked = True
 
-        reason = rebalance_trigger(i, atr_now, trend_up, prev_close)
+        reason = rebalance_trigger(i, atr_now, trend_up, bar_open)
         if (
             params.rebalance_mode == "adaptive"
             and i - last_review_i >= review_bars
@@ -1116,12 +1227,7 @@ def simulate_grid(
                             queue_order(idx - 1, "buy", sold)
 
         # Conservative intrabar path: open -> nearer extreme -> farther extreme -> close.
-        first_extreme = bar_low if (bar_open - bar_low) <= (bar_high - bar_open) else bar_high
-        second_extreme = bar_high if first_extreme == bar_low else bar_low
-        path = [bar_open]
-        for point in (first_extreme, second_extreme, bar_close):
-            if not math.isclose(point, path[-1], rel_tol=0, abs_tol=1e-12):
-                path.append(point)
+        path = intrabar_path(bar_open, bar_high, bar_low, bar_close)
 
         # Captured so orders created by fills wait for the next bar.
         pending_orders = orders.copy()
@@ -1132,9 +1238,10 @@ def simulate_grid(
                     order = pending_orders.get(idx)
                     if not order or order["side"] != "buy":
                         continue
-                    if p1 <= levels[idx] <= p0:
+                    level_price = float(levels[idx])
+                    if buy_crosses(level_price, p0, p1, trade_through):
                         before = state.position_qty
-                        if execute_buy(idx, levels[idx], timestamp, "grid"):
+                        if execute_buy(idx, level_price, timestamp, "grid"):
                             new_qty = state.position_qty - before
                             if new_qty > 0 and idx + 1 < len(levels):
                                 queue_order(idx + 1, "sell", new_qty)
@@ -1144,16 +1251,19 @@ def simulate_grid(
                     order = pending_orders.get(idx)
                     if not order or order["side"] != "sell":
                         continue
-                    if p0 <= levels[idx] <= p1:
+                    level_price = float(levels[idx])
+                    if sell_crosses(level_price, p0, p1, trade_through):
                         before = state.position_qty
-                        if execute_sell(idx, levels[idx], timestamp, "grid"):
+                        if execute_sell(idx, level_price, timestamp, "grid"):
                             sold = before - state.position_qty
                             if sold > 0 and idx - 1 >= 0:
                                 queue_order(idx - 1, "buy", sold)
                         pending_orders.pop(idx, None)
 
         prev_close = bar_close
-        atr_bar = float(series["atr"][i])
+        # Exits and ladder shifts use the ATR known before this bar (the same
+        # value the paper strategy holds), never the bar's own range.
+        atr_bar = atr_now
         skip_queue = False
 
         # Hard stop: ATR distance plus structural support invalidation. The
@@ -1239,12 +1349,13 @@ def simulate_grid(
                 rebuild_orders(timestamp, bar_close)
                 skip_queue = True
 
-        # Arm / update the trailing take-profit once net profit clears the bar.
+        # Arm / update the trailing take-profit once the open inventory itself
+        # is in profit. Arming on account equity would leave it permanently
+        # armed after early gains and turn the grid into a trend-exit system.
         if not tp_triggered:
             if state.position_qty > 0:
                 if not tp_active:
-                    eq_close = equity_at(bar_close, state.position_qty, state.avg_entry)
-                    if eq_close >= config.capital * (1.0 + params.tp_activate_net_return):
+                    if inventory_in_profit(bar_close, state.avg_entry, params):
                         tp_active = True
                         peak_price = bar_high
                 else:
@@ -1281,6 +1392,12 @@ def simulate_grid(
                 state.trail_up_shifts += 1
                 rebuild_orders(timestamp, bar_close)
                 skip_queue = True
+
+        # Re-arm the buy side as soon as the risk gates clear. Without this the
+        # ladder stays empty until the next scheduled rebalance.
+        if not skip_queue and not previous_allowed and allow_buys:
+            rebuild_orders(timestamp, bar_close)
+            skip_queue = True
 
         record_equity(bar_close, timestamp)
         state.bars += 1
@@ -1369,6 +1486,8 @@ def simulate_grid(
         "funding_paid": round(state.funding_paid, 4),
         "funding_events": state.funding_events,
         "realized_pnl": round(state.realized_pnl, 4),
+        "gross_profit": round(state.gross_profit, 6),
+        "gross_loss": round(state.gross_loss, 6),
         "turnover": round(state.turnover, 2),
         "slippage_paid": round(state.slippage_paid, 4),
         "exposure": round(exposure, 6),
@@ -1413,6 +1532,9 @@ def simulate_grid(
     curve = _sampled_curve(
         curve_t, curve_eq, curve_px, curve_dd, curve_low, curve_high
     )
+    daily_equity: dict[str, float] = {}
+    for moment, value in zip(curve_t, curve_eq):
+        daily_equity[moment.date().isoformat()] = round(float(value), 6)
     return SimulationResult(
         metrics=metrics,
         equity_curve=curve,
@@ -1421,4 +1543,5 @@ def simulate_grid(
         stopped=state.stopped,
         liquidated=state.liquidated,
         stop_reason=state.stop_reason,
+        daily_equity=daily_equity,
     )

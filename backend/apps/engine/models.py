@@ -40,6 +40,9 @@ class AnalysisRun(models.Model):
     finished_at = models.DateTimeField(null=True, blank=True)
     data_cutoff = models.DateTimeField(null=True, blank=True)
     duration_seconds = models.FloatField(null=True, blank=True)
+    strategy_version = models.ForeignKey(
+        "engine.StrategyVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
 
     class Meta:
         ordering = ["-started_at"]
@@ -79,6 +82,9 @@ class CoinAnalysis(models.Model):
     diagnostics = models.JSONField(default=dict, blank=True)
     data_start = models.DateTimeField(null=True, blank=True)
     data_end = models.DateTimeField(null=True, blank=True)
+    config_version = models.ForeignKey(
+        "engine.ConfigVersion", on_delete=models.PROTECT, null=True, blank=True, related_name="+"
+    )
     created_at = models.DateTimeField(default=timezone.now)
 
     class Meta:
@@ -89,6 +95,8 @@ class CoinAnalysis(models.Model):
         indexes = [
             models.Index(fields=["analysis", "rank"]),
             models.Index(fields=["coin", "-created_at"]),
+            # (created_at, id) is the v1 backtests paging key.
+            models.Index(fields=["created_at", "id"]),
         ]
 
     def __str__(self) -> str:
@@ -161,3 +169,39 @@ def log_decision(
         job_run_id=job_run_id,
         coin=coin,
     )
+
+
+class StrategyVersion(models.Model):
+    """Content-hashed snapshot of the strategy settings plus the code version."""
+
+    id = models.CharField(max_length=64, primary_key=True)
+    snapshot = models.JSONField()
+    code_sha = models.CharField(max_length=64)
+    parent = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.PROTECT, related_name="children"
+    )
+    diff = models.JSONField(default=dict)
+    first_seen_at = models.DateTimeField(default=timezone.now, db_index=True)
+    backfilled = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["first_seen_at"]
+
+    def __str__(self) -> str:
+        return self.id[:12]
+
+
+class ConfigVersion(models.Model):
+    """Content-hashed per-symbol grid parameters."""
+
+    id = models.CharField(max_length=64, primary_key=True)
+    symbol = models.CharField(max_length=40, db_index=True)
+    params = models.JSONField()
+    first_seen_at = models.DateTimeField(default=timezone.now, db_index=True)
+    backfilled = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["first_seen_at"]
+
+    def __str__(self) -> str:
+        return f"{self.symbol}:{self.id[:12]}"

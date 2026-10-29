@@ -56,13 +56,18 @@ export default function RankingsPage() {
     addCoin.mutate(
       { symbol: ticker, name: name.trim() || undefined },
       {
-        onSuccess: ({ coin }) => {
+        onSuccess: ({ coin, job, detail }) => {
           setAddOpen(false);
           setSymbol('');
           setName('');
-          toast.success(`${coin.symbol} queued for solo analysis`, {
-            description: 'Results appear on the coin page once the worker finishes.'
-          });
+          if (job) {
+            toast.success(`${coin.symbol} queued for solo analysis`, {
+              description: 'Results appear on the coin page once the worker finishes.'
+            });
+          } else {
+            // Only one analysis may be active at a time; the coin is stored.
+            toast.warning(`${coin.symbol} added, analysis not queued`, { description: detail });
+          }
           router.push(`/dashboard/coins/${coin.symbol}`);
         },
         onError: (error: Error) => toast.error(error.message)
@@ -305,7 +310,7 @@ export default function RankingsPage() {
                           gate.passed ? 'text-emerald-600 dark:text-emerald-400' : 'text-rose-600'
                         }`}
                       >
-                        {gate.passed ? 'pass' : 'fail'} · {formatGateValue(gate.value)}
+                        {gate.passed ? 'pass' : 'fail'} · {formatGateValue(gate.value, gate.name)}
                       </span>
                     </div>
                   ))}
