@@ -131,3 +131,49 @@ class EventHelperTests(TestCase):
     def test_snapshot_records_state(self):
         snap = snapshot_session(self.session, "start")
         self.assertEqual(snap.state["equity"], self.session.equity)
+
+    def test_session_state_grid_derives_spacing_from_levels(self):
+        self.session.grid_state = {"levels": [121, 100, 110], "range_low": 100, "range_high": 121}
+        grid = session_state(self.session)["grid"]
+        self.assertEqual(grid["range_low"], 100)
+        self.assertEqual(grid["range_high"], 121)
+        self.assertEqual(grid["levels"], [121, 100, 110])
+        self.assertAlmostEqual(grid["spacing"], 0.1)
+
+    def test_session_state_grid_empty_has_no_spacing(self):
+        grid = session_state(self.session)["grid"]
+        self.assertIsNone(grid["spacing"])
+        self.assertIsNone(grid["levels"])
+
+    def test_session_state_spacing_none_for_nonpositive_level(self):
+        self.session.grid_state = {"levels": [0, 10]}
+        self.assertIsNone(session_state(self.session)["grid"]["spacing"])
+
+    def test_record_event_explicit_values_override_session(self):
+        sv = resolve_strategy_version()
+        cv = resolve_config_version("BTCUSDT", {"a": 1})
+        self.session.strategy_version = resolve_strategy_version(snapshot={"x": 1}, code_sha="z")
+        self.session.save()
+        ev = record_event(GridEvent.Type.STOP, session=self.session, symbol="ETHUSDT",
+                          strategy_version=sv, config_version=cv, environment="live")
+        ev.refresh_from_db()
+        self.assertEqual(ev.environment, "live")
+        self.assertEqual(ev.symbol, "ETHUSDT")
+        self.assertEqual(ev.strategy_version_id, sv.id)
+        self.assertEqual(ev.config_version_id, cv.id)
+        self.assertEqual(ev.before, {})
+        self.assertEqual(ev.after, {})
+
+    def test_snapshot_stamps_versions_and_state_round_trips(self):
+        sv = resolve_strategy_version()
+        cv = resolve_config_version("BTCUSDT", {"a": 1})
+        self.session.strategy_version = sv
+        self.session.config_version = cv
+        self.session.save()
+        snap = snapshot_session(self.session, "daily")
+        snap.refresh_from_db()
+        self.assertEqual(snap.strategy_version_id, sv.id)
+        self.assertEqual(snap.config_version_id, cv.id)
+        self.assertEqual(snap.trigger, "daily")
+        self.assertEqual(snap.state, session_state(self.session))
+        self.assertEqual(snap.state["unrealized_pnl"], 20.0)

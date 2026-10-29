@@ -6,7 +6,21 @@ from django.utils import timezone
 
 from .models import GridEvent, PaperSession, SessionSnapshot
 
-_GRID_KEYS = ("range_low", "range_high", "levels", "spacing")
+_GRID_KEYS = ("range_low", "range_high", "levels")
+
+
+def _grid_spacing(levels) -> float | None:
+    """Mean fractional gap between adjacent levels.
+
+    The strategy persists ``levels`` rather than a spacing, so derive it here.
+    """
+    if not levels or len(levels) < 2:
+        return None
+    ordered = sorted(levels)
+    if ordered[0] <= 0:
+        return None
+    gaps = [(b - a) / a for a, b in zip(ordered, ordered[1:])]
+    return sum(gaps) / len(gaps)
 
 
 def session_state(session: PaperSession) -> dict:
@@ -32,7 +46,10 @@ def session_state(session: PaperSession) -> dict:
         "wins": session.wins,
         "losses": session.losses,
         "net_return": session.net_return,
-        "grid": {k: grid_state.get(k) for k in _GRID_KEYS},
+        "grid": {
+            **{k: grid_state.get(k) for k in _GRID_KEYS},
+            "spacing": _grid_spacing(grid_state.get("levels")),
+        },
         "stop_reason": session.stop_reason,
     }
 
