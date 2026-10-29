@@ -421,6 +421,14 @@ curl -X POST http://localhost:8000/api/jobs/runs/run/ \
   -d '{"job_type":"daily_analysis"}'
 ```
 
+## ETL API (v1)
+
+A read-only, versioned REST API for external ETL and analytics tools lives under `/api/v1/`. It
+uses its own Bearer keys (`manage.py etl_api_key create|revoke|list`), cursor pagination with
+watermarks, and serves an OpenAPI 3 document at `/api/v1/meta/schema/`. See
+[docs/etl-api-v1.md](docs/etl-api-v1.md) for authentication, pagination, errors, every endpoint
+and worked curl examples.
+
 ## Configuration
 
 Copy `.env.example` to `.env`. Key settings:

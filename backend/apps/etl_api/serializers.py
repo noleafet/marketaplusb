@@ -263,3 +263,62 @@ def order_audit_out(a) -> dict:
         "allowed": a.allowed,
         "reason": a.reason,
     }
+
+
+# Resource name -> public field names, in served order. The OpenAPI builder reads
+# this, and tests_contract freezes it against the real serializer output.
+RESOURCES: dict[str, tuple[str, ...]] = {
+    "strategy_version": (
+        "id", "snapshot", "code_sha", "parent_id", "diff", "first_seen_at", "backfilled",
+    ),
+    "config_version": ("id", "symbol", "params", "first_seen_at", "backfilled"),
+    "candle": (
+        "symbol", "timeframe", "open_time", "close_time", "open", "high", "low", "close",
+        "volume", "quote_volume", "trades",
+    ),
+    "funding": ("symbol", "funding_time", "rate", "mark_price"),
+    "features": ("symbol", "timeframe", "as_of", "analysis_id", "strategy_version", "features"),
+    "metrics": METRIC_FIELDS,
+    "backtest": (
+        "id", "run_id", "environment", "symbol", "timeframe", "trigger", "mode", "scope",
+        "strategy_version", "config_version", "data_start", "data_end", "data_cutoff",
+        "holdout_start", "in_sample", "out_of_sample", "score", "rank", "suitability",
+        "eligible", "exclusion_reason", "component_scores", "trade_sample", "created_at",
+    ),
+    "fold": (
+        "environment", "fold", "train_start", "train_end", "test_start", "test_end", "params",
+        "train_metrics", "test_metrics", "regime",
+    ),
+    "session": (
+        "id", "environment", "symbol", "strategy_version", "config_version", "started_at",
+        "last_tick_at", "updated_at", "status", "bias", "capital", "leverage", "position_qty",
+        "avg_entry", "mark_price", "equity", "peak_equity", "max_drawdown", "realized_pnl",
+        "unrealized_pnl", "fees_paid", "funding_paid", "carry_cost", "fill_count",
+        "closed_lots", "wins", "losses", "net_return", "grid", "stop_reason",
+    ),
+    "snapshot": (
+        "session_id", "time", "trigger", "state", "strategy_version", "config_version",
+        "backfilled",
+    ),
+    "equity": ("time", "equity", "price", "position_qty", "drawdown"),
+    "fill": (
+        "id", "session_id", "environment", "symbol", "time", "created_at", "side", "price",
+        "qty", "notional", "fee", "realized_pnl", "level", "reason", "strategy_version",
+        "config_version",
+    ),
+    "evaluation": (
+        "id", "session_id", "evaluated_at", "passed", "metrics", "failures", "thresholds",
+    ),
+    "event": (
+        "id", "time", "type", "environment", "symbol", "session_id", "reason", "before",
+        "after", "strategy_version", "config_version", "backfilled",
+    ),
+    "order_audit": (
+        "created_at", "symbol", "side", "order_type", "qty", "price", "notional", "allowed",
+        "reason",
+    ),
+    "health": (
+        "market_candles", "funding_rates", "analysis_run", "paper_session_tick",
+        "current_strategy_version",
+    ),
+}

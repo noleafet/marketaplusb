@@ -3,7 +3,7 @@ from django.urls import path, re_path
 from .views.backtests import BacktestDetailView, BacktestFoldsView, BacktestListView
 from .views.base import NotFoundView
 from .views.market import CandlesView, FeaturesView, FundingView
-from .views.meta import HealthView
+from .views.meta import HealthView, SchemaView
 from .views.sessions import (
     EquityView,
     EvaluationsView,
@@ -24,6 +24,7 @@ from .views.versions import (
 
 urlpatterns = [
     path("meta/health/", HealthView.as_view(), name="etl-health"),
+    path("meta/schema/", SchemaView.as_view(), name="etl-schema"),
     path("strategy-versions/", StrategyVersionListView.as_view(), name="etl-strategy-versions"),
     path(
         "strategy-versions/<str:pk>/",
