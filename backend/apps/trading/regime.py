@@ -584,6 +584,41 @@ def release_regime_pauses(now: datetime) -> list[str]:
     return resumed
 
 
+def recovery_status(state: MarketRegimeState) -> list[dict[str, Any]] | None:
+    """The recovery checklist from the last evaluation; None unless bearish."""
+
+    if state.phase != BEARISH:
+        return None
+    checks = (state.metrics or {}).get("recovery") or {}
+    guard = all(
+        bool(checks.get(name)) for name in ("cooled", "rsi", "vwap", "open_interest")
+    )
+    return [
+        {"check": "guard_recovery", "passed": guard},
+        {"check": "above_support", "passed": bool(checks.get("above_support"))},
+        {"check": "trailing_clear", "passed": bool(checks.get("below_trailing_stop"))},
+        {"check": "no_oi_flush", "passed": bool(checks.get("no_oi_flush"))},
+        {"check": "min_duration", "passed": bool(checks.get("min_duration"))},
+    ]
+
+
+def thresholds(row: StrategySettings) -> dict[str, Any]:
+    from django.conf import settings
+
+    return {
+        "trailing_stop_pct": float(row.btc_trailing_stop_pct),
+        "trailing_window_days": int(row.btc_trailing_window_days),
+        "oi_flush_pct": float(row.btc_oi_flush_pct),
+        "oi_near_high_pct": float(row.btc_oi_near_high_pct),
+        "funding_z": float(row.btc_funding_z),
+        "min_bearish_hours": float(row.btc_min_bearish_hours),
+        "rsi_overbought": float(settings.RISK["RSI_OVERBOUGHT"]),
+        "rsi_recovery": float(settings.RISK["RSI_RECOVERY"]),
+        "guard_trailing_pct": float(settings.RISK["TRAILING_STOP_PCT"]),
+        "support_buffer_atr": SUPPORT_BUFFER_ATR,
+    }
+
+
 def _apply_effects(state: MarketRegimeState, now: datetime, client: Any) -> None:
     if state.phase == BEARISH:
         apply_bearish(now, client)

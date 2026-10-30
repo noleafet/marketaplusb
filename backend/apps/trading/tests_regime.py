@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone as dt_timezone
 
 from unittest.mock import MagicMock, patch
 
+from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
@@ -731,3 +732,117 @@ class OpenInterestRecorderTests(TestCase):
         enqueue_job("btc_open_interest")
         with self.assertRaises(DuplicateJobQueued):
             enqueue_job("btc_open_interest")
+
+
+REGIME_URL = "/api/strategy/regime/"
+RECOVERY_CHECKS = [
+    "guard_recovery",
+    "above_support",
+    "trailing_clear",
+    "no_oi_flush",
+    "min_duration",
+]
+
+
+@override_settings(ENGINE_API_TOKEN=TOKEN, ENGINE_ALLOW_PUBLIC_READS=True)
+class RegimeApiTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+
+    def test_normal_shape(self):
+        state = MarketRegimeState.load()
+        state.metrics = {"price": 100.0, "drawdown_pct": 0.01}
+        state.save()
+        body = self.client.get(REGIME_URL).json()
+        self.assertTrue(body["enabled"])
+        self.assertEqual(body["phase"], "normal")
+        self.assertEqual(body["reasons"], [])
+        self.assertEqual(body["metrics"]["price"], 100.0)
+        self.assertIsNone(body["recovery"])
+        self.assertEqual(body["last_error"], "")
+        self.assertEqual(body["transitions"], [])
+        self.assertEqual(
+            body["thresholds"],
+            {
+                "trailing_stop_pct": 0.08,
+                "trailing_window_days": 7,
+                "oi_flush_pct": 0.05,
+                "oi_near_high_pct": 0.03,
+                "funding_z": 2.0,
+                "min_bearish_hours": 4.0,
+                "rsi_overbought": settings.RISK["RSI_OVERBOUGHT"],
+                "rsi_recovery": settings.RISK["RSI_RECOVERY"],
+                "guard_trailing_pct": settings.RISK["TRAILING_STOP_PCT"],
+                "support_buffer_atr": 0.25,
+            },
+        )
+
+    def test_bearish_lists_recovery_checks_and_transitions(self):
+        from apps.trading.regime import _record_transition, evaluate_regime
+
+        decision = evaluate_regime(
+            "bearish", T0 - timedelta(hours=1), {}, reading(close_1h=89.4), regime_config()
+        )
+        state = MarketRegimeState.load()
+        state.phase = decision.phase
+        state.entered_at = T0 - timedelta(hours=1)
+        state.reasons = decision.reasons
+        state.metrics = decision.metrics
+        state.save()
+        _record_transition("normal", "bearish", ["support_breakdown"], decision.metrics, T0)
+
+        body = self.client.get(REGIME_URL).json()
+        self.assertEqual(body["phase"], "bearish")
+        self.assertEqual([item["check"] for item in body["recovery"]], RECOVERY_CHECKS)
+        passed = {item["check"]: item["passed"] for item in body["recovery"]}
+        self.assertEqual(
+            passed,
+            {
+                "guard_recovery": True,
+                "above_support": False,
+                "trailing_clear": True,
+                "no_oi_flush": True,
+                "min_duration": False,
+            },
+        )
+        self.assertTrue(all(isinstance(value, bool) for value in passed.values()))
+        self.assertEqual(
+            body["transitions"],
+            [
+                {
+                    "time": T0.isoformat().replace("+00:00", "Z"),
+                    "from": "normal",
+                    "to": "bearish",
+                    "reasons": ["support_breakdown"],
+                }
+            ],
+        )
+
+    def test_transitions_newest_first_and_capped(self):
+        from apps.trading.regime import _record_transition
+
+        for i in range(25):
+            _record_transition("normal", "warning", ["guard_armed"], {}, T0 + timedelta(hours=i))
+        transitions = self.client.get(REGIME_URL).json()["transitions"]
+        self.assertEqual(len(transitions), 20)
+        self.assertGreater(transitions[0]["time"], transitions[-1]["time"])
+
+    def test_read_only(self):
+        response = self.client.post(REGIME_URL, {}, format="json", HTTP_X_ENGINE_TOKEN=TOKEN)
+        self.assertEqual(response.status_code, 405)
+
+    def test_etl_events_serve_regime_events(self):
+        from apps.etl_api.keys import create_client
+        from apps.trading.regime import _record_transition
+
+        _record_transition("normal", "bearish", ["trailing_stop"], {"price": 91.0}, T0)
+        _, key = create_client("t")
+        etl = APIClient()
+        etl.credentials(HTTP_AUTHORIZATION=f"Bearer {key}")
+        response = etl.get("/api/v1/events/", {"type": "regime"})
+        self.assertEqual(response.status_code, 200, response.content)
+        data = response.json()["data"]
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["type"], "regime")
+        self.assertEqual(data[0]["symbol"], "BTCUSDT")
+        self.assertEqual(data[0]["after"]["phase"], "bearish")

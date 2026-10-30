@@ -18,7 +18,7 @@ from apps.jobs.runner import JobAlreadyActive, enqueue_job
 from apps.jobs.models import JobRun
 from apps.jobs.serializers import JobRunSerializer
 from apps.trading.events import record_event
-from apps.trading.models import GridEvent, PaperSession, StrategySettings
+from apps.trading.models import GridEvent, MarketRegimeState, PaperSession, StrategySettings
 from apps.trading.portfolio import open_sessions
 
 HISTORY_RUNS = 12
@@ -165,6 +165,44 @@ class StrategySettingsView(viewsets.ViewSet):
                 # Settings are saved; only the re-run is refused.
                 payload["job_conflict"] = exc.message
         return Response(payload, status=status.HTTP_200_OK)
+
+
+REGIME_TRANSITIONS = 20
+
+
+class MarketRegimeView(viewsets.ViewSet):
+    """BTC market regime: phase, readings, recovery checklist, transitions."""
+
+    def list(self, request):
+        from apps.trading.regime import recovery_status, thresholds
+
+        row = StrategySettings.load()
+        state = MarketRegimeState.load()
+        events = GridEvent.objects.filter(type=GridEvent.Type.REGIME).order_by("-time")[
+            :REGIME_TRANSITIONS
+        ]
+        return Response(
+            {
+                "enabled": row.btc_regime_enabled,
+                "phase": state.phase,
+                "entered_at": state.entered_at,
+                "reasons": list(state.reasons or []),
+                "metrics": state.metrics or {},
+                "thresholds": thresholds(row),
+                "recovery": recovery_status(state),
+                "last_evaluated_at": state.last_evaluated_at,
+                "last_error": state.last_error,
+                "transitions": [
+                    {
+                        "time": event.time,
+                        "from": (event.before or {}).get("phase"),
+                        "to": (event.after or {}).get("phase"),
+                        "reasons": (event.after or {}).get("reasons") or [],
+                    }
+                    for event in events
+                ],
+            }
+        )
 
 
 def _daily_session_returns(session_id: str) -> dict[str, float]:
