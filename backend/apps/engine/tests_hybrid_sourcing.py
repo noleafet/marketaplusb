@@ -511,6 +511,16 @@ class CurrentRunTests(TestCase):
         self.assertEqual(engine["latest_comparison_analysis"]["mode"], "normal")
         self.assertNotIn("latest_hybrid_analysis", engine)
 
+    def test_validation_history_follows_active_mode(self):
+        client = APIClient()
+        client.credentials(HTTP_X_ENGINE_TOKEN="t")
+        for mode, run in (("hybrid", self.hybrid), ("normal", self.normal)):
+            self._set_mode(mode)
+            with override_settings(ENGINE_API_TOKEN="t"):
+                body = client.get("/api/strategy/validation/").json()
+            self.assertEqual(body["analysis"]["id"], str(run.id))
+            self.assertEqual([row["analysis"] for row in body["ic_history"]], [str(run.id)])
+
     def test_dashboard_never_repeats_primary_as_comparison(self):
         AnalysisRun.objects.all().delete()
         AnalysisRun.objects.create(
@@ -535,11 +545,16 @@ class ModeSwitchTests(TestCase):
         self.client = APIClient()
         self.client.credentials(HTTP_X_ENGINE_TOKEN="t")
 
-    def _run(self, mode, age_minutes):
+    def _run(self, mode, age_minutes, *, drives=False, summary=None):
+        if summary is None:
+            # A hybrid run made since the full-window change records its coverage.
+            summary = {"hybrid_coverage": {"coins": 2, "covered": 2}} if mode == "hybrid" else {}
         return AnalysisRun.objects.create(
             status=AnalysisRun.Status.SUCCEEDED,
             scope=AnalysisRun.Scope.UNIVERSE,
             mode=mode,
+            drives_sessions=drives,
+            summary=summary,
             started_at=timezone.now() - timedelta(minutes=age_minutes),
         )
 
@@ -551,32 +566,78 @@ class ModeSwitchTests(TestCase):
         with override_settings(ENGINE_API_TOKEN="t"):
             return self.client.post("/api/live/status/mode/", body, format="json")
 
+    def _set_mode(self, mode):
+        LiveTradingState.objects.filter(pk=1).update(mode=mode)
+
     def test_stale_when_no_run_for_mode(self):
         self._run("normal", 5)
         data = self._get()
         self.assertEqual(data["mode"], "normal")
         self.assertFalse(data["analysis_stale"])
-        LiveTradingState.objects.filter(pk=1).update(mode="hybrid")
+        self._set_mode("hybrid")
         data = self._get()
         self.assertTrue(data["analysis_stale"])
         self.assertIsNone(data["latest_analysis"])
 
-    def test_stale_when_older_than_other_mode(self):
+    def test_stale_when_older_than_other_modes_driving_run(self):
+        # Comparison off: the hybrid ranking predates the last session-driving
+        # normal run, so switching to hybrid shows it as stale.
         self._run("hybrid", 60)
-        newer = self._run("normal", 5)
-        LiveTradingState.objects.filter(pk=1).update(mode="hybrid")
+        newer = self._run("normal", 5, drives=True)
+        self._set_mode("hybrid")
         data = self._get()
         self.assertTrue(data["analysis_stale"])
         self.assertEqual(data["latest_analysis"]["mode"], "hybrid")
         self.assertNotEqual(data["latest_analysis"]["id"], str(newer.id))
 
     def test_fresh_when_newer(self):
-        self._run("normal", 60)
+        self._run("normal", 60, drives=True)
         hybrid = self._run("hybrid", 5)
-        LiveTradingState.objects.filter(pk=1).update(mode="hybrid")
+        self._set_mode("hybrid")
         data = self._get()
         self.assertFalse(data["analysis_stale"])
         self.assertEqual(data["latest_analysis"]["id"], str(hybrid.id))
+
+    def test_primary_then_comparison_is_fresh_for_both_modes(self):
+        # One job: the active-mode primary drives sessions, the other-mode
+        # comparison runs after it.
+        primary = self._run("hybrid", 10, drives=True)
+        self._run("normal", 5)
+        self._set_mode("hybrid")
+        data = self._get()
+        self.assertFalse(data["analysis_stale"])
+        self.assertEqual(data["latest_analysis"]["id"], str(primary.id))
+        # Switching to the comparison's mode: it is a full ranking, so fresh.
+        self._set_mode("normal")
+        self.assertFalse(self._get()["analysis_stale"])
+
+    def test_comparison_off_switch_to_older_mode_is_stale(self):
+        self._run("normal", 60 * 24 * 3)
+        for age in (60 * 24 * 2, 60 * 24):
+            self._run("hybrid", age, drives=True)
+        self._set_mode("normal")
+        self.assertTrue(self._get()["analysis_stale"])
+
+    def test_legacy_hybrid_run_is_stale(self):
+        self._run("normal", 60)
+        self._run("hybrid", 5, drives=True, summary={"hybrid": {"lookback_days": 60}})
+        self._set_mode("hybrid")
+        self.assertTrue(self._get()["analysis_stale"])
+
+    def test_reposting_same_mode_logs_nothing(self):
+        self._set_mode("hybrid")
+        before = LiveTradingState.load().updated_at
+        response = self._post({"mode": "hybrid", "rerun_analysis": True})
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["purge"], {"sessions": 0, "positions": 0})
+        self.assertFalse(DecisionLog.objects.filter(category="live").exists())
+        self.assertEqual(LiveTradingState.load().updated_at, before)
+
+    def test_same_mode_with_adx_still_logs(self):
+        self._set_mode("hybrid")
+        response = self._post({"mode": "hybrid", "adx_enabled": True})
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertTrue(DecisionLog.objects.filter(category="live").exists())
 
     @patch("apps.trading.views.enqueue_job")
     def test_rerun_enqueues_when_stale(self, enqueue):
@@ -590,7 +651,7 @@ class ModeSwitchTests(TestCase):
 
     @patch("apps.trading.views.enqueue_job")
     def test_rerun_skipped_when_fresh(self, enqueue):
-        self._run("normal", 60)
+        self._run("normal", 60, drives=True)
         self._run("hybrid", 5)
         response = self._post({"mode": "hybrid", "confirm": True, "rerun_analysis": True})
         self.assertEqual(response.status_code, 200, response.content)

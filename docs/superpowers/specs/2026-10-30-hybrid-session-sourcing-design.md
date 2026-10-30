@@ -164,8 +164,14 @@ after the active one, for the comparison view.
 - The response (and `GET`) gains, for the mode now active:
   - `latest_analysis`: `{id, started_at, mode}` of the latest succeeded universe
     run of that mode, or null.
-  - `analysis_stale`: true when there is no such run, or when its `started_at`
-    is older than the latest succeeded universe run of the other mode.
+  - `analysis_stale`: true when there is no such run; when it is a hybrid run
+    whose summary has no `hybrid_coverage` key (a legacy short-window run); or
+    when a succeeded universe run of the other mode with `drives_sessions=true`
+    started after it. The comparison run that follows the primary in the same
+    job is a full ranking, so it never makes either mode stale: in steady state
+    (comparison on or off) and after a switch with the comparison on, the
+    active mode is fresh. After a switch with the comparison off, the new
+    mode's ranking is stale when it predates the last session-driving run.
 - The request accepts `rerun_analysis: true`. When it is set and the result is
   stale, the view enqueues `daily_analysis` (trigger manual) and returns `job`,
   or `job_conflict` with the existing message on `JobAlreadyActive`. This is
@@ -239,7 +245,9 @@ or conflict message the response returns.
   timeline, and the comparison run in the same job reuses the cached timeline.
 - Versioning: toggling `run_comparison_analysis` leaves the strategy version id
   unchanged.
-- Mode switch: `analysis_stale` covers no run, an older run and a newer run;
+- Mode switch: `analysis_stale` covers no run, a primary-then-comparison pair
+  (fresh for both modes), a switch with the comparison off (stale) and a legacy
+  hybrid run (stale);
   `rerun_analysis` enqueues when stale, does nothing when fresh, and returns
   `job_conflict` when a job is active.
 - `latest_analysis()` default follows `LiveTradingState.mode`.

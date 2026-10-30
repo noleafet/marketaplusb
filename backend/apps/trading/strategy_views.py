@@ -248,7 +248,7 @@ class StrategyValidationView(viewsets.ViewSet):
         history = list(
             AnalysisRun.objects.filter(
                 status=AnalysisRun.Status.SUCCEEDED,
-                mode=AnalysisRun.Mode.NORMAL,
+                mode=run.mode if run else AnalysisRun.Mode.NORMAL,
                 scope=AnalysisRun.Scope.UNIVERSE,
             )
             .order_by("-started_at")

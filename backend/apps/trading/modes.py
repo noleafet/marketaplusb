@@ -38,14 +38,32 @@ def _latest_universe_run(mode: str) -> AnalysisRun | None:
 
 
 def mode_analysis_status(mode: str) -> dict[str, Any]:
-    """Latest universe ranking for ``mode`` and whether it trails the other mode's."""
+    """Latest universe ranking for ``mode`` and whether it is stale.
+
+    It is stale when there is none, when it is a hybrid run from before the
+    full-window gate (its summary has no ``hybrid_coverage``), or when the
+    other mode has since driven paper sessions. A comparison run made after
+    the primary in the same job is a full ranking and never makes the
+    primary stale.
+    """
 
     own = _latest_universe_run(mode)
-    other_mode = (
-        AnalysisRun.Mode.NORMAL if mode == AnalysisRun.Mode.HYBRID else AnalysisRun.Mode.HYBRID
-    )
-    other = _latest_universe_run(other_mode)
-    stale = own is None or (other is not None and own.started_at < other.started_at)
+    stale = own is None
+    if own is not None:
+        legacy_hybrid = own.mode == AnalysisRun.Mode.HYBRID and "hybrid_coverage" not in (
+            own.summary or {}
+        )
+        overtaken = (
+            AnalysisRun.objects.filter(
+                status=AnalysisRun.Status.SUCCEEDED,
+                scope=AnalysisRun.Scope.UNIVERSE,
+                drives_sessions=True,
+                started_at__gt=own.started_at,
+            )
+            .exclude(mode=own.mode)
+            .exists()
+        )
+        stale = legacy_hybrid or overtaken
     return {
         "latest_analysis": (
             {"id": str(own.id), "started_at": own.started_at, "mode": own.mode} if own else None
@@ -118,6 +136,9 @@ def set_trading_mode(
     if mode not in LiveTradingState.Mode.values:
         raise ValueError(f"Unknown trading mode: {mode}")
     state = LiveTradingState.load()
+    if mode == state.mode and adx_enabled is None:
+        # Nothing to change (e.g. the rerun button re-posting the active mode).
+        return state, {"sessions": 0, "positions": 0}
     limits = dict(state.limits or {})
     if adx_enabled is not None:
         limits["hybrid_adx"] = bool(adx_enabled)
