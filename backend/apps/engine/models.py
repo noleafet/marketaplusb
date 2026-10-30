@@ -38,6 +38,7 @@ class AnalysisRun(models.Model):
     error = models.TextField(blank=True, default="")
     started_at = models.DateTimeField(default=timezone.now)
     finished_at = models.DateTimeField(null=True, blank=True)
+    drives_sessions = models.BooleanField(default=False, db_index=True)
     data_cutoff = models.DateTimeField(null=True, blank=True)
     duration_seconds = models.FloatField(null=True, blank=True)
     strategy_version = models.ForeignKey(

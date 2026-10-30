@@ -287,6 +287,7 @@ class StrategySettings(models.Model):
     # directly comparable to the walk-forward numbers.
     overbought_guard_enabled = models.BooleanField(default=True)
     holdout_days = models.PositiveSmallIntegerField(default=90)
+    run_comparison_analysis = models.BooleanField(default=True)
 
     book_capital = models.FloatField(default=8000.0)
     max_sessions = models.PositiveSmallIntegerField(default=8)

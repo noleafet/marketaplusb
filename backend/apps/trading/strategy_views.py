@@ -37,6 +37,7 @@ class StrategySettingsSerializer(serializers.ModelSerializer):
             "trade_through_bps",
             "overbought_guard_enabled",
             "holdout_days",
+            "run_comparison_analysis",
             "book_capital",
             "max_sessions",
             "max_book_exposure",
