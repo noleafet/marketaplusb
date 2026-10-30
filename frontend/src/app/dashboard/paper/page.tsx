@@ -18,6 +18,7 @@ import { toast } from 'sonner';
 import { formatPercent, formatUsd, relativeTime } from '@/features/grid/api';
 import EmptyPanel from '@/features/grid/components/empty-panel';
 import MetricCard from '@/features/grid/components/metric-card';
+import RegimeBanner from '@/features/grid/components/regime-banner';
 import StatusBadge from '@/features/grid/components/status-badge';
 import { usePaperSessions, useSetBias, useTickAll, useTriggerJob } from '@/features/grid/queries';
 
@@ -93,6 +94,7 @@ export default function PaperSessionsPage() {
       }
     >
       <div className='space-y-4'>
+        <RegimeBanner />
         <div className='grid gap-4 md:grid-cols-2 xl:grid-cols-4'>
           <MetricCard
             title='Active sessions'

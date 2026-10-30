@@ -642,6 +642,42 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
         ]
       },
       {
+        kind: 'list',
+        title: 'BTC market regime',
+        description:
+          'One BTC check every paper tick protects every coin at once. Same rules in normal and hybrid mode, and in the backtest.',
+        rows: [
+          {
+            name: 'Warning',
+            value: 'buys blocked',
+            tone: 'warn',
+            detail:
+              'BTC 15m RSI above 75 (guard armed), or funding z ≥ 2 over 90 prints while 10-day momentum is negative or the trend is not up. Open positions are kept.'
+          },
+          {
+            name: 'Bearish',
+            value: 'flatten + pause',
+            tone: 'bad',
+            detail:
+              'Guard exit, BTC 8% below its 7-day high, 1h open interest down 5% over 6 hours within 3% of the 24h high, or a 1h close below 30-day support minus 0.25 ATR. Every active session is sold to USDT and paused.'
+          },
+          {
+            name: 'Recovery',
+            value: '≥ 4h',
+            tone: 'good',
+            detail:
+              'Guard recovery checks, back above support, inside the trailing stop, no OI flush, and at least 4 hours bearish. Only sessions the regime paused resume.'
+          },
+          {
+            name: 'Backtest',
+            value: 'modelled',
+            tone: 'info',
+            detail:
+              'The analysis replays the same evaluator over BTC history and reports each coin with and without the regime. OI signals use stored hourly history only (about 30 days at first).'
+          }
+        ]
+      },
+      {
         kind: 'table',
         title: 'Simulation cost assumptions',
         description:

@@ -489,6 +489,67 @@ export interface StrategySettingsValues {
   daily_loss_limit_pct: number;
   retire_after_failed_runs: number;
   max_strategy_correlation: number;
+  btc_regime_enabled: boolean;
+  btc_trailing_stop_pct: number;
+  btc_trailing_window_days: number;
+  btc_oi_flush_pct: number;
+  btc_oi_near_high_pct: number;
+  btc_funding_z: number;
+  btc_min_bearish_hours: number;
+}
+
+export type RegimePhase = 'normal' | 'warning' | 'bearish';
+
+export interface RegimeMetrics {
+  time?: string;
+  price?: number;
+  window_high?: number;
+  drawdown_pct?: number;
+  high_24h?: number;
+  rsi_15m?: number | null;
+  vwap_15m?: number | null;
+  close_1h?: number;
+  support?: number;
+  support_line?: number;
+  atr?: number;
+  momentum?: number;
+  trend_up?: boolean;
+  funding_z?: number | null;
+  oi_change_pct?: number | null;
+  oi_available?: boolean;
+  guard_phase?: string;
+}
+
+export interface RegimeTransition {
+  time: string;
+  from: RegimePhase | null;
+  to: RegimePhase | null;
+  reasons: string[];
+}
+
+export interface MarketRegime {
+  enabled: boolean;
+  phase: RegimePhase;
+  entered_at: string | null;
+  reasons: string[];
+  metrics: RegimeMetrics;
+  thresholds: {
+    trailing_stop_pct: number;
+    trailing_window_days: number;
+    oi_flush_pct: number;
+    oi_near_high_pct: number;
+    funding_z: number;
+    min_bearish_hours: number;
+    rsi_overbought: number;
+    rsi_recovery: number;
+    guard_trailing_pct: number;
+    support_buffer_atr: number;
+  };
+  /** Only while bearish. */
+  recovery: Array<{ check: string; passed: boolean }> | null;
+  last_evaluated_at: string | null;
+  last_error: string;
+  transitions: RegimeTransition[];
 }
 
 export interface StrategySettings extends StrategySettingsValues {

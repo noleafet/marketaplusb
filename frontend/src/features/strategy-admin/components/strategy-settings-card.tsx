@@ -6,7 +6,11 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { FieldGroup } from '@/components/ui/field';
 import { formatPercent, formatUsd, relativeTime } from '@/features/grid/api';
-import { useSetStrategySettings, useStrategySettings } from '@/features/grid/queries';
+import {
+  useMarketRegime,
+  useSetStrategySettings,
+  useStrategySettings
+} from '@/features/grid/queries';
 import type { StrategySettings } from '@/features/grid/types';
 import { useAppForm } from '@/lib/form';
 import * as z from 'zod';
@@ -57,6 +61,33 @@ const settingsSchema = z.object({
     .number({ error: requiredNumber })
     .min(0.1, 'Must be at least 0.1.')
     .max(1, 'Must be at most 1.'),
+  btc_regime_enabled: z.boolean(),
+  // Percent fields below are edited as percentages and stored as fractions.
+  btc_trailing_stop_pct: z
+    .number({ error: requiredNumber })
+    .min(2, 'Must be at least 2.')
+    .max(30, 'Must be at most 30.'),
+  btc_trailing_window_days: z
+    .number({ error: 'Enter a number.' })
+    .int('Whole days only.')
+    .min(1, 'Must be at least 1.')
+    .max(30, 'Must be at most 30.'),
+  btc_oi_flush_pct: z
+    .number({ error: requiredNumber })
+    .min(1, 'Must be at least 1.')
+    .max(30, 'Must be at most 30.'),
+  btc_oi_near_high_pct: z
+    .number({ error: requiredNumber })
+    .min(0.5, 'Must be at least 0.5.')
+    .max(10, 'Must be at most 10.'),
+  btc_funding_z: z
+    .number({ error: requiredNumber })
+    .min(0.5, 'Must be at least 0.5.')
+    .max(5, 'Must be at most 5.'),
+  btc_min_bearish_hours: z
+    .number({ error: requiredNumber })
+    .min(0, 'Must be at least 0.')
+    .max(72, 'Must be at most 72.'),
   rerun_analysis: z.boolean()
 });
 
@@ -72,11 +103,22 @@ function toDraft(settings: StrategySettings): SettingsDraft {
     book_capital: settings.book_capital,
     max_sessions: settings.max_sessions,
     max_book_exposure: settings.max_book_exposure,
-    daily_loss_limit_pct: Number((settings.daily_loss_limit_pct * 100).toFixed(4)),
+    daily_loss_limit_pct: asPercent(settings.daily_loss_limit_pct),
     retire_after_failed_runs: settings.retire_after_failed_runs,
     max_strategy_correlation: settings.max_strategy_correlation,
+    btc_regime_enabled: settings.btc_regime_enabled,
+    btc_trailing_stop_pct: asPercent(settings.btc_trailing_stop_pct),
+    btc_trailing_window_days: settings.btc_trailing_window_days,
+    btc_oi_flush_pct: asPercent(settings.btc_oi_flush_pct),
+    btc_oi_near_high_pct: asPercent(settings.btc_oi_near_high_pct),
+    btc_funding_z: settings.btc_funding_z,
+    btc_min_bearish_hours: settings.btc_min_bearish_hours,
     rerun_analysis: true
   };
+}
+
+function asPercent(fraction: number): number {
+  return Number((fraction * 100).toFixed(4));
 }
 
 function SettingsForm({
@@ -91,16 +133,29 @@ function SettingsForm({
     defaultValues: toDraft(settings),
     validators: { onSubmit: settingsSchema },
     onSubmit: async ({ value }) => {
-      const { rerun_analysis, daily_loss_limit_pct, ...rest } = value;
+      const {
+        rerun_analysis,
+        daily_loss_limit_pct,
+        btc_trailing_stop_pct,
+        btc_oi_flush_pct,
+        btc_oi_near_high_pct,
+        ...rest
+      } = value;
       await mutation.mutateAsync({
         ...rest,
         daily_loss_limit_pct: daily_loss_limit_pct / 100,
+        btc_trailing_stop_pct: btc_trailing_stop_pct / 100,
+        btc_oi_flush_pct: btc_oi_flush_pct / 100,
+        btc_oi_near_high_pct: btc_oi_near_high_pct / 100,
         rerun_analysis: rerun_analysis && value.signal_interval !== settings.signal_interval
       });
     }
   });
   const book = settings.book_state ?? {};
   const exposureCap = settings.max_book_exposure;
+  const regime = useMarketRegime().data;
+  // The BTC regime blocks buys too; the book state only knows its own limits.
+  const regimeBlock = regime?.enabled && regime.phase !== 'normal' ? regime.phase : null;
 
   return (
     <CardContent>
@@ -132,13 +187,15 @@ function SettingsForm({
           />
           <StatTile
             label='New buys'
-            value={book.halted ? 'Halted' : 'Allowed'}
+            value={book.halted ? 'Halted' : regimeBlock ? 'Blocked' : 'Allowed'}
             hint={
               book.halted
                 ? `Daily loss limit hit ${relativeTime(book.halted_at)}`
-                : 'No book-level block'
+                : regimeBlock
+                  ? `BTC regime ${regimeBlock}`
+                  : 'No book-level block'
             }
-            tone={book.halted ? 'bad' : 'good'}
+            tone={book.halted || regimeBlock === 'bearish' ? 'bad' : regimeBlock ? 'warn' : 'good'}
           />
         </div>
 
@@ -310,6 +367,89 @@ function SettingsForm({
             </form.Subscribe>
           </FieldGroup>
         </div>
+
+        <FieldGroup>
+          <p className='text-muted-foreground text-[11px] font-medium tracking-wide uppercase'>
+            BTC market regime
+          </p>
+          <form.AppField
+            name='btc_regime_enabled'
+            children={(field) => (
+              <field.SwitchField
+                label='BTC regime protection'
+                description='Watch BTC every paper tick: a warning blocks new buys on every coin, a bearish regime sells every active session to USDT and pauses it until BTC recovers. Also applied in the backtest.'
+              />
+            )}
+          />
+          <div className='grid gap-4 sm:grid-cols-2 xl:grid-cols-3'>
+            <form.AppField
+              name='btc_trailing_stop_pct'
+              children={(field) => (
+                <field.TextField
+                  label='Trailing stop (%)'
+                  description='Bearish when BTC is this far below its recent high.'
+                  type='number'
+                  step={0.5}
+                />
+              )}
+            />
+            <form.AppField
+              name='btc_trailing_window_days'
+              children={(field) => (
+                <field.TextField
+                  label='Trailing window (days)'
+                  description='How far back the recent high is measured.'
+                  type='number'
+                  step={1}
+                />
+              )}
+            />
+            <form.AppField
+              name='btc_min_bearish_hours'
+              children={(field) => (
+                <field.TextField
+                  label='Minimum bearish (hours)'
+                  description='Earliest recovery after turning bearish.'
+                  type='number'
+                  step={0.5}
+                />
+              )}
+            />
+            <form.AppField
+              name='btc_oi_flush_pct'
+              children={(field) => (
+                <field.TextField
+                  label='Open-interest flush (%)'
+                  description='Bearish when 1h OI drops this much over 6 hours…'
+                  type='number'
+                  step={0.5}
+                />
+              )}
+            />
+            <form.AppField
+              name='btc_oi_near_high_pct'
+              children={(field) => (
+                <field.TextField
+                  label='Near 24h high (%)'
+                  description='…while BTC is within this distance of its 24h high.'
+                  type='number'
+                  step={0.5}
+                />
+              )}
+            />
+            <form.AppField
+              name='btc_funding_z'
+              children={(field) => (
+                <field.TextField
+                  label='Funding crowding (z)'
+                  description='Warning when funding is this extreme and momentum fades.'
+                  type='number'
+                  step={0.1}
+                />
+              )}
+            />
+          </div>
+        </FieldGroup>
 
         {mutation.isError ? (
           <ToneNote

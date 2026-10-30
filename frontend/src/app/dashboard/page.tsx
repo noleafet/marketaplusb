@@ -26,6 +26,7 @@ import {
 } from '@/features/grid/api';
 import EmptyPanel from '@/features/grid/components/empty-panel';
 import MetricCard from '@/features/grid/components/metric-card';
+import RegimeBanner from '@/features/grid/components/regime-banner';
 import StatusBadge from '@/features/grid/components/status-badge';
 import { useDashboard, useJobsSummary, useTriggerJob } from '@/features/grid/queries';
 
@@ -120,6 +121,7 @@ export default function DashboardPage() {
       }
     >
       <div className='space-y-4'>
+        <RegimeBanner />
         <Alert>
           <Icons.shield />
           <AlertTitle>Research and paper trading only</AlertTitle>

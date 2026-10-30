@@ -22,7 +22,8 @@ export const gridKeys = {
   live: ['grid', 'live'] as const,
   tradingMode: ['grid', 'trading-mode'] as const,
   strategySettings: ['grid', 'strategy-settings'] as const,
-  strategyValidation: ['grid', 'strategy-validation'] as const
+  strategyValidation: ['grid', 'strategy-validation'] as const,
+  marketRegime: ['grid', 'market-regime'] as const
 };
 
 export function useDashboard() {
@@ -190,6 +191,14 @@ export function useStrategyValidation() {
     queryKey: gridKeys.strategyValidation,
     queryFn: engineApi.strategyValidation,
     refetchInterval: 60000
+  });
+}
+
+export function useMarketRegime() {
+  return useQuery({
+    queryKey: gridKeys.marketRegime,
+    queryFn: engineApi.marketRegime,
+    refetchInterval: 30000
   });
 }
 
