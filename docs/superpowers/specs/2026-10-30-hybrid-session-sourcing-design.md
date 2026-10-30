@@ -58,6 +58,15 @@ Success criteria:
   rankings and the settings staleness check.
 - `set_trading_mode` switches `LiveTradingState.mode`; switching to hybrid
   needs `confirm=true` and purges open paper orders and positions.
+- BTC market regime (landed on main 2026-10-30): each run builds a BTC regime
+  timeline (`_regime_timeline`, synced only when `not hybrid`), and the
+  simulation gate is `combine_gates(hybrid_gate, regime_gate)`.
+  `_bootstrap_paper_sessions` skips opening sessions while the regime is
+  bearish. None of that changes here, apart from the sync flag (3.3).
+- The strategy version snapshot (`versioning.strategy_snapshot`) lists
+  `StrategySettings` fields explicitly. The new `run_comparison_analysis`
+  setting is deliberately NOT added to it: it doesn't change any result, so
+  toggling it must not mint a new strategy version.
 - The settings view already has a staleness and rerun pattern:
   `analysis_stale` in the payload and `rerun_analysis` in the request, which
   enqueues `daily_analysis` and returns `job_conflict` on `JobAlreadyActive`.
@@ -115,6 +124,18 @@ The hybrid-specific simulation (gate application, `hybrid_blocked_bars`,
   also `1h` and `15m`, through `sync_coin_market_data` with the same lookback
   and warmup. A sync already done earlier in the same job is a cheap no-op:
   the incremental sync fetches only bars newer than the latest stored one.
+- `sync_coin_market_data` only fetches forward from the newest stored bar, so
+  history older than the oldest stored bar is never filled in. The 1h and 15m
+  syncs therefore use the pattern `_regime_timeline` already uses for BTC:
+  `force=True` when `earliest_candle_time(symbol, interval)` is missing or later
+  than the window start plus one day. Factor that check into one helper,
+  `_sync_window(coin, client, interval, *, lookback_days, warmup_days)`, used by
+  both the regime timeline and the per-coin hybrid syncs.
+- The BTC regime timeline's sync (`_regime_timeline(..., sync=not hybrid)`)
+  becomes `sync=True` in every run. With the active mode first, a hybrid
+  primary run would otherwise build the regime from stale BTC candles. The
+  timeline cache (`_REGIME_TIMELINE_CACHE`) keeps working: both runs now share
+  the same window, so the second run in a job reuses the first run's timeline.
 - `_build_hybrid_gate(symbol, rows, *, lookback_days, adx_enabled)` reads 1h
   and 15m from `market_candles` via `load_candles`, over the same window it
   uses today (`lookback_days + HYBRID_WARMUP_DAYS`), keeping only closed bars.
@@ -212,6 +233,12 @@ or conflict message the response returns.
 - Hybrid lookback and holdout: a hybrid run uses the full lookback and `holdout_days`.
 - Coverage: a coin missing 15m is excluded with the existing reason, and
   `hybrid_coverage` counts it.
+- Back-fill: when stored 15m history starts after the window start, the sync
+  runs with `force=True`. When it already covers the window, it doesn't.
+- Regime: a hybrid primary run syncs BTC 15m/1h before building the regime
+  timeline, and the comparison run in the same job reuses the cached timeline.
+- Versioning: toggling `run_comparison_analysis` leaves the strategy version id
+  unchanged.
 - Mode switch: `analysis_stale` covers no run, an older run and a newer run;
   `rerun_analysis` enqueues when stale, does nothing when fresh, and returns
   `job_conflict` when a job is active.
