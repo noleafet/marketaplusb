@@ -394,9 +394,9 @@ bearish: on BTC it followed almost every overbought spike (163 of 229 bearish en
 churned the book.
 
 **Backtest.** The daily analysis syncs BTC 15m and 1h candles, replays the same evaluator over the
-window once per run and gates every coin's simulations with it: buys
-disarmed and sells moved to the nearest levels while not `normal`. Test folds and the holdout also
-run without the regime, reported per coin as `regime_off_return`, `regime_effect_return` and
+window once per job (the comparison run reuses it) and gates every coin's simulations with
+it: buys disarmed and sells moved to the nearest levels while not `normal`. Test folds and the
+holdout also run without the regime, reported per coin as `regime_off_return`, `regime_effect_return` and
 `regime_effect_drawdown`; validation turns the averages into a strength or weakness finding.
 Parity tests check that the live controller produces the same phase changes as the backtest
 timeline, and that the paper strategy fills exactly like the simulator through a de-risk window.

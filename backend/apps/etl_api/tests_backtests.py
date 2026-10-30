@@ -101,9 +101,9 @@ class BacktestTests(BacktestBase):
             list(d),
             [
                 "id", "run_id", "environment", "symbol", "timeframe", "trigger", "mode",
-                "scope", "drives_sessions", "strategy_version", "config_version", "data_start", "data_end",
-                "data_cutoff", "holdout_start", "in_sample", "out_of_sample", "score", "rank",
-                "suitability", "eligible", "exclusion_reason", "component_scores",
+                "scope", "drives_sessions", "strategy_version", "config_version", "data_start",
+                "data_end", "data_cutoff", "holdout_start", "in_sample", "out_of_sample", "score",
+                "rank", "suitability", "eligible", "exclusion_reason", "component_scores",
                 "trade_sample", "created_at",
             ],
         )
