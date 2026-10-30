@@ -165,26 +165,41 @@ export default function StrategyOverview() {
       icon: <Icons.activity className='size-4' />
     });
 
-    if (comparisonRun) {
-      const hybridSummary = (comparisonRun.summary ?? {}) as Record<string, unknown>;
-      const hybridGate = (hybridSummary.hybrid ?? {}) as Record<string, unknown>;
-      const blockedPct = toNumber(hybridGate.blocked_pct_avg);
-      const hybridExits = toNumber(hybridGate.confirmed_exits);
-      const hybridTone: CatalogTone =
-        comparisonRun.status === 'succeeded' ? 'good' : comparisonRun.status === 'failed' ? 'bad' : 'info';
+    const gateSource = [latest, comparisonRun].find(
+      (run) => run?.mode === 'hybrid' && run.summary?.hybrid
+    );
+    if (gateSource) {
+      const gate = (gateSource.summary?.hybrid ?? {}) as Record<string, unknown>;
+      const blockedPct = toNumber(gate.blocked_pct_avg);
+      const confirmedExits = toNumber(gate.confirmed_exits);
       notes.push({
-        tone: hybridTone,
+        tone: 'info',
+        title: 'Hybrid gate',
+        body: `${formatDate(gateSource.started_at)} · ${
+          blockedPct !== null
+            ? `${formatPercent(blockedPct, 0)} of bars below trend`
+            : 'blocked share unavailable'
+        } · ${
+          confirmedExits !== null ? `${confirmedExits} confirmed exits` : 'no exits counted'
+        }${gate.adx_enabled ? ' · ADX filter on' : ''}`,
+        icon: <Icons.activity className='size-4' />
+      });
+    }
+
+    if (comparisonRun) {
+      const comparisonTone: CatalogTone =
+        comparisonRun.status === 'succeeded'
+          ? 'good'
+          : comparisonRun.status === 'failed'
+            ? 'bad'
+            : 'info';
+      notes.push({
+        tone: comparisonTone,
         title: `Comparison run (${comparisonRun.mode}) ${comparisonRun.status}`,
         body:
           comparisonRun.status === 'failed'
             ? comparisonRun.error || 'Comparison analysis failed.'
-            : `${formatDate(comparisonRun.started_at)} · ${
-                blockedPct !== null
-                  ? `${formatPercent(blockedPct, 0)} of bars below trend`
-                  : 'gate stats pending'
-              } · ${
-                hybridExits !== null ? `${hybridExits} confirmed exits` : 'no exits counted'
-              }${hybridGate.adx_enabled ? ' · ADX filter on' : ''}`,
+            : formatDate(comparisonRun.started_at),
         icon: <Icons.activity className='size-4' />
       });
     } else {

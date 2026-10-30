@@ -510,3 +510,20 @@ class CurrentRunTests(TestCase):
         self.assertEqual(engine["latest_analysis"]["mode"], "hybrid")
         self.assertEqual(engine["latest_comparison_analysis"]["mode"], "normal")
         self.assertNotIn("latest_hybrid_analysis", engine)
+
+    def test_dashboard_never_repeats_primary_as_comparison(self):
+        AnalysisRun.objects.all().delete()
+        AnalysisRun.objects.create(
+            status=AnalysisRun.Status.SUCCEEDED,
+            scope=AnalysisRun.Scope.UNIVERSE,
+            mode=AnalysisRun.Mode.HYBRID,
+        )
+        self._set_mode("normal")
+        client = APIClient()
+        client.credentials(HTTP_X_ENGINE_TOKEN="t")
+        with override_settings(ENGINE_API_TOKEN="t"):
+            engine = client.get("/api/engine/dashboard/").json()["engine"]
+        # latest_analysis never falls back across modes, so the primary is empty
+        # and the other mode's run is shown only as the comparison, never twice.
+        self.assertIsNone(engine["latest_analysis"])
+        self.assertEqual(engine["latest_comparison_analysis"]["mode"], "hybrid")

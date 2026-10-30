@@ -178,18 +178,21 @@ class DecisionLogViewSet(viewsets.ReadOnlyModelViewSet):
 
 class DashboardSummaryView(viewsets.ViewSet):
     def list(self, request):
-        run = latest_analysis()
         from apps.trading.models import LiveTradingState
 
+        active_mode = LiveTradingState.load().mode
+        run = latest_analysis(mode=active_mode)
         comparison_run = (
             AnalysisRun.objects.filter(
                 status=AnalysisRun.Status.SUCCEEDED,
                 scope=AnalysisRun.Scope.UNIVERSE,
             )
-            .exclude(mode=LiveTradingState.load().mode)
+            .exclude(mode=active_mode)
             .order_by("-started_at")
             .first()
         )
+        if comparison_run is not None and run is not None and comparison_run.id == run.id:
+            comparison_run = None
         results = (
             run.coin_results.select_related("coin").order_by("rank", "-score")[:10]
             if run
