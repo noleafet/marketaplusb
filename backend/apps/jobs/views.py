@@ -19,6 +19,8 @@ JOB_DESCRIPTIONS = {
     "daily_analysis": "Sync data, run walk-forward backtests, score coins, write reports, bootstrap paper sessions.",
     "paper_tick": "Advance active paper sessions using live Binance public market data.",
     "paper_evaluate": "Check paper sessions against promotion thresholds.",
+    "paper_risk": "Resume paper sessions paused by the overbought guard once recovery confirms.",
+    "btc_open_interest": "Store BTC 1h open interest for backtesting the BTC market regime.",
 }
 
 

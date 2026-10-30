@@ -118,12 +118,19 @@ def handle_paper_risk(params: dict[str, Any], job_run) -> dict[str, Any]:
     return run_risk_guard(job_run_id=job_run.id)
 
 
+def handle_btc_open_interest(params: dict[str, Any], job_run) -> dict[str, Any]:
+    from apps.trading.regime import record_open_interest
+
+    return {"ok": True, "inserted": record_open_interest()}
+
+
 HANDLERS: dict[str, JobHandler] = {
     "coins_refresh": handle_coins_refresh,
     "daily_analysis": handle_daily_analysis,
     "paper_tick": handle_paper_tick,
     "paper_evaluate": handle_paper_evaluate,
     "paper_risk": handle_paper_risk,
+    "btc_open_interest": handle_btc_open_interest,
 }
 
 

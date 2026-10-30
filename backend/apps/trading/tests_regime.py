@@ -667,3 +667,67 @@ class RegimeAnalysisTests(TestCase):
         self.assertAlmostEqual(session.position_qty, 0.0)
         self.assertFalse(session.fills.filter(side="buy").exists())
         self.assertFalse(session.grid_state.get("allow_buys", True))
+
+
+def oi_rows(start, hours, base=1000.0):
+    return [
+        {"time": start + timedelta(hours=i), "open_interest": base + i, "open_interest_value": 0.0}
+        for i in range(hours)
+    ]
+
+
+class OpenInterestRecorderTests(TestCase):
+    def setUp(self):
+        self.now = datetime(2026, 10, 30, 12, 0, tzinfo=dt_timezone.utc)
+        self.client = MagicMock()
+
+    def record(self):
+        from apps.trading.regime import record_open_interest
+
+        with patch("apps.trading.regime.timezone.now", return_value=self.now):
+            return record_open_interest(client=self.client)
+
+    def test_first_run_backfills_then_only_new_rows(self):
+        start = self.now - timedelta(hours=10)
+        self.client.open_interest_hist.return_value = oi_rows(start, 10)
+        self.assertEqual(self.record(), 10)
+        kwargs = self.client.open_interest_hist.call_args.kwargs
+        self.assertEqual(kwargs["limit"], 500)
+        self.assertIsNone(kwargs.get("start_ms"))
+
+        # An hour later: two overlapping rows, two new ones, one in the future.
+        self.now += timedelta(hours=1)
+        self.client.open_interest_hist.return_value = oi_rows(start + timedelta(hours=8), 5)
+        self.assertEqual(self.record(), 2)
+        kwargs = self.client.open_interest_hist.call_args.kwargs
+        self.assertEqual(
+            kwargs["start_ms"], int((start + timedelta(hours=10)).timestamp() * 1000)
+        )
+        self.assertEqual(OpenInterestPoint.objects.filter(symbol="BTCUSDT").count(), 12)
+
+    def test_resume_after_long_gap_stays_inside_binance_window(self):
+        OpenInterestPoint.objects.create(
+            symbol="BTCUSDT", time=self.now - timedelta(days=60), open_interest=1.0
+        )
+        self.client.open_interest_hist.return_value = []
+        self.record()
+        start_ms = self.client.open_interest_hist.call_args.kwargs["start_ms"]
+        self.assertGreaterEqual(
+            start_ms, int((self.now - timedelta(days=30)).timestamp() * 1000)
+        )
+
+    def test_schedule_exists_hourly(self):
+        from apps.jobs.models import JobSchedule
+        from apps.jobs.schedules import ensure_schedules
+
+        ensure_schedules()
+        schedule = JobSchedule.objects.get(slug="btc-open-interest")
+        self.assertEqual(schedule.job_type, "btc_open_interest")
+        self.assertEqual(schedule.interval_seconds, 3600)
+
+    def test_duplicate_queued_job_refused(self):
+        from apps.jobs.runner import DuplicateJobQueued, enqueue_job
+
+        enqueue_job("btc_open_interest")
+        with self.assertRaises(DuplicateJobQueued):
+            enqueue_job("btc_open_interest")

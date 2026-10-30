@@ -24,6 +24,7 @@ from typing import Any, Mapping
 
 import numpy as np
 from django.db import transaction
+from django.utils import timezone
 
 from apps.common.binance import BinanceError, BinanceFuturesClient
 from apps.engine.grid import (
@@ -36,7 +37,13 @@ from apps.engine.grid import (
 from apps.engine.models import log_decision
 from apps.trading import risk
 from apps.trading.events import record_event, snapshot_session
-from apps.trading.models import GridEvent, MarketRegimeState, PaperSession, StrategySettings
+from apps.trading.models import (
+    GridEvent,
+    MarketRegimeState,
+    OpenInterestPoint,
+    PaperSession,
+    StrategySettings,
+)
 
 logger = logging.getLogger("engine")
 
@@ -59,6 +66,10 @@ FUNDING_LOOKBACK = 90
 # settle, so live reads 120 days to match the backtest's long history.
 LIVE_1H_DAYS = 120
 LIVE_FUNDING_DAYS = 32
+# Binance serves open-interest history for about the last 30 days, at most
+# 500 rows per request.
+OI_HISTORY_DAYS = 29
+OI_MAX_ROWS = 500
 # Thresholds are compared with a small tolerance so a reading exactly on a
 # threshold triggers regardless of float rounding.
 EPS = 1e-9
@@ -432,6 +443,36 @@ def fetch_live_inputs(
         logger.warning("BTC open interest unavailable: %s", exc)
         oi_points = []
     return bars_15m, bars_1h, funding, oi_points
+
+
+def record_open_interest(client: Any = None, symbol: str = SYMBOL) -> int:
+    """Store hourly open interest since the last stored point; returns rows added.
+
+    The stored history lets the backtest replay the OI flush signal. The first
+    run back-fills what Binance serves; later runs continue from the last row.
+    """
+
+    client = client if client is not None else BinanceFuturesClient()
+    now = timezone.now()
+    last = (
+        OpenInterestPoint.objects.filter(symbol=symbol)
+        .order_by("-time")
+        .values_list("time", flat=True)
+        .first()
+    )
+    start_ms = None
+    if last is not None:
+        start = max(last + BAR_1H, now - timedelta(days=OI_HISTORY_DAYS))
+        start_ms = int(start.timestamp() * 1000)
+    rows = client.open_interest_hist(symbol, "1h", limit=OI_MAX_ROWS, start_ms=start_ms)
+    points = [
+        OpenInterestPoint(symbol=symbol, time=row["time"], open_interest=float(row["open_interest"]))
+        for row in rows
+        if row["time"] <= now
+    ]
+    before = OpenInterestPoint.objects.filter(symbol=symbol).count()
+    OpenInterestPoint.objects.bulk_create(points, ignore_conflicts=True)
+    return OpenInterestPoint.objects.filter(symbol=symbol).count() - before
 
 
 EFFECTS = {

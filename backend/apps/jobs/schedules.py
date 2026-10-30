@@ -58,6 +58,18 @@ DEFAULT_SCHEDULES = [
         "params": {},
         "interval_seconds": max(60, int(settings.RISK.get("INTERVAL_SECONDS", 300))),
     },
+    {
+        "slug": "btc-open-interest",
+        "name": "BTC open-interest recorder",
+        "description": (
+            "Store BTC 1h open interest so the BTC market regime's OI flush "
+            "signal can be backtested."
+        ),
+        "job_type": "btc_open_interest",
+        "kind": JobSchedule.Kind.INTERVAL,
+        "params": {},
+        "interval_seconds": 3600,
+    },
 ]
 
 
