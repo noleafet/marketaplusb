@@ -186,22 +186,40 @@ def _hybrid_adx_enabled() -> bool:
     return bool((LiveTradingState.load().limits or {}).get("hybrid_adx"))
 
 
-def _closed_klines(
-    client: BinanceFuturesClient,
-    symbol: str,
-    interval: str,
-    start: datetime,
-    end: datetime,
-) -> list[dict[str, Any]]:
-    """Fetch klines and drop the candle that is still forming at ``end``."""
+def _closed(rows: list[dict[str, Any]], interval: str, end: datetime) -> list[dict[str, Any]]:
+    """Drop the candle that is still forming at ``end``."""
 
-    rows = client.klines_range(symbol, interval, start, end)
     step = timedelta(milliseconds=INTERVAL_MS[interval])
     return [row for row in rows if row["time"] + step <= end]
 
 
-def _build_hybrid_gate(
+def _sync_window(
+    coin,
     client: BinanceFuturesClient,
+    interval: str,
+    *,
+    lookback_days: int,
+    warmup_days: int,
+) -> dict[str, Any]:
+    """Sync ``coin``'s ``interval`` candles over lookback + warm-up days.
+
+    The sync is incremental from the newest stored candle, so history stored
+    for a shorter window is back-filled once with a full fetch.
+    """
+
+    start = timezone.now() - timedelta(days=lookback_days + warmup_days)
+    earliest = earliest_candle_time(coin.binance_symbol, interval)
+    return sync_coin_market_data(
+        coin,
+        client,
+        lookback_days=lookback_days,
+        interval=interval,
+        warmup_days=warmup_days,
+        force=earliest is None or earliest > start + timedelta(days=1),
+    )
+
+
+def _build_hybrid_gate(
     symbol: str,
     rows: list[dict[str, Any]],
     *,
@@ -214,8 +232,8 @@ def _build_hybrid_gate(
         return None
     end = timezone.now()
     start = end - timedelta(days=lookback_days + HYBRID_WARMUP_DAYS)
-    klines_1h = _closed_klines(client, symbol, "1h", start, end)
-    klines_15m = _closed_klines(client, symbol, "15m", start, end)
+    klines_1h = _closed(load_candles(symbol, "1h", start, end), "1h", end)
+    klines_15m = _closed(load_candles(symbol, "15m", start, end), "15m", end)
     gate = build_gate(rows, klines_1h, klines_15m, adx_enabled=adx_enabled)
     return gate if gate.allow else None
 
@@ -256,17 +274,12 @@ def _regime_timeline(
     start = end - timedelta(days=lookback_days + regime_warmup)
     if sync:
         for interval in ("15m", "1h"):
-            # The sync is incremental from the newest stored candle, so BTC
-            # history stored for a shorter window (BTC's own 1h coin sync has
-            # no regime warm-up) is back-filled once with a full fetch.
-            earliest = earliest_candle_time(REGIME_SYMBOL, interval)
-            sync_coin_market_data(
+            _sync_window(
                 btc,
                 client,
+                interval,
                 lookback_days=lookback_days,
-                interval=interval,
                 warmup_days=regime_warmup,
-                force=earliest is None or earliest > start + timedelta(days=1),
             )
     config = RegimeConfig.from_settings(strategy_settings)
     last_bar = latest_candle_time(REGIME_SYMBOL, "15m")
@@ -674,7 +687,6 @@ def _run_daily_analysis(
             if hybrid and len(rows) >= min_bars:
                 try:
                     gate = _build_hybrid_gate(
-                        client,
                         coin.binance_symbol,
                         rows,
                         lookback_days=lookback_days,
