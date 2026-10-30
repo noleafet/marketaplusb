@@ -84,10 +84,15 @@ def refresh_book_state(settings_row: StrategySettings, now: datetime) -> dict[st
     return state
 
 
-def buy_block_reason(state: dict[str, Any], settings_row: StrategySettings) -> str:
+def buy_block_reason(
+    state: dict[str, Any], settings_row: StrategySettings, regime_phase: str = "normal"
+) -> str:
     if state.get("halted"):
         return "daily_loss_halt"
     cap = float(settings_row.max_book_exposure)
     if cap > 0 and float(state.get("exposure") or 0.0) >= cap:
         return "book_exposure_cap"
+    # The BTC market regime blocks new buys on every coin while not normal.
+    if regime_phase in ("warning", "bearish"):
+        return f"btc_regime_{regime_phase}"
     return ""

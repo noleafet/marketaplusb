@@ -17,12 +17,15 @@ duration has elapsed. The live controller and the backtest timeline both build
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Mapping
 
 import numpy as np
+from django.db import transaction
 
+from apps.common.binance import BinanceError, BinanceFuturesClient
 from apps.engine.grid import (
     MIN_FUNDING_HISTORY,
     GridParams,
@@ -30,9 +33,15 @@ from apps.engine.grid import (
     _indicator_series,
     _rolling_extreme,
 )
+from apps.engine.models import log_decision
 from apps.trading import risk
+from apps.trading.events import record_event, snapshot_session
+from apps.trading.models import GridEvent, MarketRegimeState, PaperSession, StrategySettings
+
+logger = logging.getLogger("engine")
 
 SYMBOL = "BTCUSDT"
+REGIME_PAUSE_SOURCE = "btc_regime"
 NORMAL = "normal"
 WARNING = "warning"
 BEARISH = "bearish"
@@ -46,6 +55,10 @@ WARMUP_1H_DAYS = 45
 OI_READINGS = 6
 SUPPORT_BUFFER_ATR = 0.25
 FUNDING_LOOKBACK = 90
+# Live history. The 1h EMA50-day trend needs far more than its warm-up to
+# settle, so live reads 120 days to match the backtest's long history.
+LIVE_1H_DAYS = 120
+LIVE_FUNDING_DAYS = 32
 # Thresholds are compared with a small tolerance so a reading exactly on a
 # threshold triggers regardless of float rounding.
 EPS = 1e-9
@@ -370,3 +383,229 @@ def evaluate_regime(
         entered_at=reading.time if changed else entered_at,
         changed=changed,
     )
+
+
+# ---------------------------------------------------------------- live
+
+
+class RegimeDataError(RuntimeError):
+    pass
+
+
+def _closed(rows: list[dict[str, Any]], length: timedelta, now: datetime) -> list[dict[str, Any]]:
+    return sorted((row for row in rows if row["time"] + length <= now), key=lambda r: r["time"])
+
+
+def fetch_live_inputs(
+    client: BinanceFuturesClient, now: datetime, config: RegimeConfig | None = None
+) -> tuple[list, list, list, list]:
+    """Closed BTC 15m and 1h bars, funding prints, and the latest hourly OI.
+
+    Raises ``BinanceError`` when candles or funding cannot be fetched. Open
+    interest failing only makes it unavailable, as in the coin guard.
+    """
+
+    window_days = int(config.trailing_window_days) if config else 7
+    days_15m = max(8, window_days + 1)
+    bars_15m = _closed(
+        client.klines_range(SYMBOL, "15m", now - timedelta(days=days_15m), now),
+        BAR_15M,
+        now,
+    )
+    bars_1h = _closed(
+        client.klines_range(SYMBOL, "1h", now - timedelta(days=LIVE_1H_DAYS), now),
+        BAR_1H,
+        now,
+    )
+    funding = client.funding_rates(
+        SYMBOL, now - timedelta(days=LIVE_FUNDING_DAYS), now, max_requests=6
+    )
+    if not isinstance(funding, list):
+        raise BinanceError("Unexpected funding response")
+    try:
+        oi_points = [
+            row
+            for row in client.open_interest_hist(SYMBOL, "1h", limit=OI_READINGS)
+            if row["time"] <= now
+        ]
+    except (BinanceError, KeyError, TypeError, ValueError) as exc:
+        logger.warning("BTC open interest unavailable: %s", exc)
+        oi_points = []
+    return bars_15m, bars_1h, funding, oi_points
+
+
+EFFECTS = {
+    NORMAL: "grid trading unrestricted",
+    WARNING: "new buys blocked on every coin",
+    BEARISH: "every active session flattened to USDT and paused",
+}
+
+
+def _record_transition(
+    old: str, new: str, reasons: list[str], metrics: dict[str, Any], now: datetime
+) -> None:
+    record_event(
+        GridEvent.Type.REGIME,
+        symbol=SYMBOL,
+        reason=",".join(reasons),
+        before={"phase": old},
+        after={"phase": new, "reasons": reasons, "metrics": metrics},
+        time=now,
+    )
+    because = f" ({', '.join(reasons)})" if reasons else ""
+    log_decision(
+        "risk",
+        f"BTC market regime {old} -> {new}{because}: {EFFECTS[new]}.",
+        severity="warning" if new in (WARNING, BEARISH) else "info",
+        payload={"before": old, "after": new, "reasons": reasons, "metrics": metrics},
+    )
+
+
+def apply_bearish(now: datetime, client: BinanceFuturesClient | None = None) -> list[str]:
+    """Flatten and pause every active, unlocked session; returns symbols.
+
+    Idempotent: runs every tick while bearish and only touches sessions that
+    are still active. A session that fails is left untouched for the next tick.
+    """
+
+    from apps.trading import paper
+
+    flattened: list[str] = []
+    candidates = (
+        PaperSession.objects.filter(status=PaperSession.Status.ACTIVE)
+        .exclude(bias=PaperSession.Bias.BEARISH)
+        .values_list("id", flat=True)
+    )
+    for session_id in list(candidates):
+        try:
+            with transaction.atomic():
+                session = (
+                    PaperSession.objects.select_for_update()
+                    .select_related("coin")
+                    .get(id=session_id)
+                )
+                if (
+                    session.status != PaperSession.Status.ACTIVE
+                    or session.bias == PaperSession.Bias.BEARISH
+                ):
+                    continue
+                position_qty = session.position_qty
+                price = paper.flatten_session(session, now, REGIME_PAUSE_SOURCE, client)
+                session.status = PaperSession.Status.PAUSED
+                session.risk_state = {
+                    **(session.risk_state or {}),
+                    "pause_source": REGIME_PAUSE_SOURCE,
+                }
+                session.save()
+            record_event(GridEvent.Type.PAUSE, session=session, reason=REGIME_PAUSE_SOURCE)
+            snapshot_session(session, "pause")
+            log_decision(
+                "risk",
+                f"{session.coin.symbol} paused by the BTC market regime; "
+                "inventory sold to USDT until BTC recovers.",
+                severity="warning",
+                coin=session.coin,
+                payload={
+                    "session_id": str(session.id),
+                    "price": round(price, 10),
+                    "position_qty": round(position_qty, 10),
+                    "equity": round(session.equity, 4),
+                },
+            )
+            flattened.append(session.coin.symbol)
+        except Exception:  # noqa: BLE001 - one session must not block the rest
+            logger.exception("BTC regime flatten failed for session %s", session_id)
+    return flattened
+
+
+def release_regime_pauses(now: datetime) -> list[str]:
+    """Resume every session the regime paused; returns symbols."""
+
+    from apps.trading import paper
+
+    resumed: list[str] = []
+    paused = PaperSession.objects.filter(status=PaperSession.Status.PAUSED).select_related("coin")
+    for session in paused:
+        state = dict(session.risk_state or {})
+        if state.get("pause_source") != REGIME_PAUSE_SOURCE:
+            continue
+        state.pop("pause_source")
+        session.risk_state = state
+        session.save(update_fields=["risk_state", "updated_at"])
+        # Paused by its own coin guard as well: that guard's recovery decides.
+        if state.get("phase") == "paused":
+            continue
+        paper.resume_session(session, reason=REGIME_PAUSE_SOURCE)
+        resumed.append(session.coin.symbol)
+    return resumed
+
+
+def _apply_effects(state: MarketRegimeState, now: datetime, client: Any) -> None:
+    if state.phase == BEARISH:
+        apply_bearish(now, client)
+    else:
+        release_regime_pauses(now)
+
+
+def refresh_regime(now: datetime, client: Any = None) -> MarketRegimeState:
+    """Evaluate BTC on its latest closed 15m bar and apply the phase."""
+
+    row = StrategySettings.load()
+    MarketRegimeState.load()
+    if not row.btc_regime_enabled:
+        with transaction.atomic():
+            state = MarketRegimeState.objects.select_for_update().get(pk=1)
+            old = state.phase
+            state.last_evaluated_at = now
+            state.last_error = ""
+            if old != NORMAL:
+                state.phase = NORMAL
+                state.entered_at = now
+                state.reasons = ["disabled"]
+                _record_transition(old, NORMAL, ["disabled"], dict(state.metrics or {}), now)
+            state.save()
+        release_regime_pauses(now)
+        return state
+
+    client = client if client is not None else BinanceFuturesClient()
+    config = RegimeConfig.from_settings(row)
+    try:
+        readings = reading_series(*fetch_live_inputs(client, now, config), config)
+        if not readings:
+            raise RegimeDataError("BTC history too short for the regime warm-up")
+    except (BinanceError, RegimeDataError) as exc:
+        state = MarketRegimeState.load()
+        state.last_error = str(exc)[:255]
+        state.last_evaluated_at = now
+        state.save(update_fields=["last_error", "last_evaluated_at", "updated_at"])
+        log_decision(
+            "risk",
+            f"BTC market regime not evaluated ({exc}); phase stays {state.phase}.",
+            severity="warning",
+            payload={"phase": state.phase, "error": state.last_error},
+        )
+        _apply_effects(state, now, client)
+        return state
+
+    reading = readings[-1]
+    with transaction.atomic():
+        state = MarketRegimeState.objects.select_for_update().get(pk=1)
+        state.last_evaluated_at = now
+        state.last_error = ""
+        # Each closed 15m bar is evaluated once, exactly as the backtest does;
+        # later ticks inside the same bar only re-apply the stored phase.
+        if (state.metrics or {}).get("time") != reading.time.isoformat():
+            old = state.phase
+            decision = evaluate_regime(
+                old, state.entered_at, state.guard_state, reading, config
+            )
+            state.phase = decision.phase
+            state.reasons = decision.reasons
+            state.metrics = decision.metrics
+            state.guard_state = decision.guard_state
+            state.entered_at = decision.entered_at
+            if decision.changed:
+                _record_transition(old, decision.phase, decision.reasons, decision.metrics, now)
+        state.save()
+    _apply_effects(state, now, client)
+    return state

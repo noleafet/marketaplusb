@@ -23,6 +23,7 @@ from apps.trading.hybrid import evaluate as evaluate_trend
 from apps.trading.models import (
     GridEvent,
     LiveTradingState,
+    MarketRegimeState,
     PaperEvaluation,
     PaperFill,
     PaperSession,
@@ -399,6 +400,81 @@ def _funding_z_at(
         return None
 
 
+def _persist_fills(session: PaperSession, adapter: PaperExecutionAdapter) -> list:
+    fills = adapter.fills
+    if fills:
+        PaperFill.objects.bulk_create(
+            [
+                PaperFill(
+                    session=session,
+                    strategy_version_id=session.strategy_version_id,
+                    config_version_id=session.config_version_id,
+                    time=fill.time,
+                    side=fill.side,
+                    price=fill.price,
+                    qty=fill.qty,
+                    notional=fill.notional,
+                    fee=fill.fee,
+                    realized_pnl=fill.realized_pnl,
+                    level=fill.level,
+                    reason=fill.reason,
+                )
+                for fill in fills
+            ]
+        )
+        session.fill_count += len(fills)
+        session.closed_lots += sum(1 for fill in fills if fill.side == "sell")
+    return fills
+
+
+def flatten_session(
+    session: PaperSession,
+    now: datetime,
+    reason: str,
+    client: BinanceFuturesClient | None = None,
+) -> float:
+    """Sell a session's inventory to USDT at the live price; returns the price.
+
+    The caller holds the session row lock and decides the new status. Raises
+    when inventory is held but no usable price exists, so the caller can leave
+    the session untouched and retry on the next tick.
+    """
+
+    price = 0.0
+    symbol = session.coin.binance_symbol
+    if client is not None and symbol:
+        try:
+            price = _fetch_price(client, symbol)
+        except BinanceError as exc:
+            logger.warning("Price fetch failed for %s: %s", symbol, exc)
+    price = price or float(session.mark_price or 0.0)
+    if session.position_qty > 0 and price <= 0:
+        raise BinanceError(f"No price to flatten {session.coin.symbol}")
+    settings_row = StrategySettings.load()
+    params = GridParams.from_dict(session.params or {})
+    config = _sim_config(session, settings_row)
+    adapter = PaperExecutionAdapter(session, config=config, params=params)
+    strategy = IncrementalGridStrategy(params, config, adapter, session.grid_state or {})
+    if price > 0:
+        strategy.flatten(price, now, reason)
+    adapter.flush()
+    _persist_fills(session, adapter)
+    session.grid_state = strategy.to_state()
+    insert_equity_points(
+        [
+            {
+                "time": now,
+                "session_id": str(session.id),
+                "equity": session.equity,
+                "price": session.mark_price,
+                "position_qty": session.position_qty,
+                "drawdown": session.max_drawdown,
+            }
+        ]
+    )
+    return price
+
+
 def _tick_session(
     session: PaperSession,
     client: BinanceFuturesClient,
@@ -597,29 +673,7 @@ def _tick_session(
 
     # Persist fills, state, and equity.
     adapter.flush()
-    fills = adapter.fills
-    if fills:
-        PaperFill.objects.bulk_create(
-            [
-                PaperFill(
-                    session=session,
-                    strategy_version_id=session.strategy_version_id,
-                    config_version_id=session.config_version_id,
-                    time=fill.time,
-                    side=fill.side,
-                    price=fill.price,
-                    qty=fill.qty,
-                    notional=fill.notional,
-                    fee=fill.fee,
-                    realized_pnl=fill.realized_pnl,
-                    level=fill.level,
-                    reason=fill.reason,
-                )
-                for fill in fills
-            ]
-        )
-        session.fill_count += len(fills)
-        session.closed_lots += sum(1 for fill in fills if fill.side == "sell")
+    fills = _persist_fills(session, adapter)
 
     # Hard portfolio stop, independent of the per-bar stop in the strategy.
     if (
@@ -762,15 +816,23 @@ def evaluate_session(
 def tick_paper_sessions(
     *, session_ids: list[str] | None = None, job_run_id=None
 ) -> dict[str, Any]:
+    from apps.trading.regime import refresh_regime
+
     now = timezone.now()
+    client = BinanceFuturesClient()
+    # BTC regime first: a bearish regime pauses sessions before they tick.
+    try:
+        regime = refresh_regime(now, client)
+    except Exception:  # noqa: BLE001 - the stored phase still applies
+        logger.exception("BTC regime refresh failed")
+        regime = MarketRegimeState.load()
     sessions = PaperSession.objects.filter(status=PaperSession.Status.ACTIVE).select_related("coin")
     if session_ids:
         sessions = sessions.filter(id__in=session_ids)
     session_list = list(sessions)
-    client = BinanceFuturesClient()
     settings_row = StrategySettings.load()
     book = portfolio.refresh_book_state(settings_row, now)
-    block = portfolio.buy_block_reason(book, settings_row)
+    block = portfolio.buy_block_reason(book, settings_row, regime.phase)
     results: list[dict[str, Any]] = []
     errors = 0
     total_fills = 0
@@ -806,6 +868,7 @@ def tick_paper_sessions(
         "fills": total_fills,
         "book": {key: value for key, value in book.items() if key != "start"},
         "buy_block": block,
+        "regime": {"phase": regime.phase, "reasons": list(regime.reasons or [])},
         "results": results,
     }
     if errors:
@@ -851,7 +914,9 @@ def run_risk_guard(*, job_run_id=None) -> dict[str, Any]:
             status=PaperSession.Status.PAUSED
         ).select_related("coin")
         # A manual pause is the operator's call; the guard must not resume it.
+        # Neither may it resume a session the BTC regime is holding.
         if (session.risk_state or {}).get("phase") == "paused"
+        and (session.risk_state or {}).get("pause_source") != "btc_regime"
     ]
     client = BinanceFuturesClient()
     results: list[dict[str, Any]] = []
@@ -962,7 +1027,7 @@ def pause_session(session: PaperSession) -> PaperSession:
     return session
 
 
-def resume_session(session: PaperSession) -> PaperSession:
+def resume_session(session: PaperSession, reason: str = "") -> PaperSession:
     if session.status == PaperSession.Status.PAUSED:
         session.status = PaperSession.Status.ACTIVE
         session.last_tick_at = timezone.now()
@@ -970,11 +1035,12 @@ def resume_session(session: PaperSession) -> PaperSession:
         # instead of replaying bars from before the pause.
         session.grid_state = {}
         session.save(update_fields=["status", "last_tick_at", "grid_state", "updated_at"])
-        record_event(GridEvent.Type.RESUME, session=session)
+        record_event(GridEvent.Type.RESUME, session=session, reason=reason)
         snapshot_session(session, "resume")
         log_decision(
             "paper",
-            f"{session.coin.symbol} paper session resumed.",
+            f"{session.coin.symbol} paper session resumed"
+            f"{f' ({reason})' if reason else ''}.",
             coin=session.coin,
             payload={"session_id": str(session.id)},
         )
