@@ -659,7 +659,7 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
             value: 'flatten + pause',
             tone: 'bad',
             detail:
-              'Guard exit, BTC 8% below its 7-day high, 1h open interest down 5% over 6 hours within 3% of the 24h high, or a 1h close below 30-day support minus 0.25 ATR. Every active session is sold to USDT and paused.'
+              'Guard trailing or OI-flush exit (its momentum-decay exit only ends the warning), BTC 8% below its 7-day high, 1h open interest down 5% over 6 hours within 3% of the 24h high, or a 1h close below 30-day support minus 0.25 ATR. Every active session is sold to USDT and paused.'
           },
           {
             name: 'Recovery',

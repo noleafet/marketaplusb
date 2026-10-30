@@ -3,7 +3,7 @@ import type { RegimePhase } from './types';
 export const REGIME_REASON_LABELS: Record<string, string> = {
   guard_armed: 'BTC RSI overbought (guard armed)',
   funding_crowded: 'Funding crowded while momentum fades',
-  guard_exit: 'BTC overbought guard exit',
+  guard_exit: 'BTC overbought guard exit (trailing or OI flush)',
   trailing_stop: 'BTC fell below its trailing stop',
   oi_flush: 'Open-interest flush near the 24h high',
   support_breakdown: 'BTC 1h close below support',

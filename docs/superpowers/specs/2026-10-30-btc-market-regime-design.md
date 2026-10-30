@@ -58,7 +58,7 @@ All BTC inputs use **closed** candles. "Price" means the last closed 15m close.
 |---|---|---|
 | Guard armed | BTC 15m RSI > 75 (guard enters `armed`) | warning |
 | Funding crowding | BTC funding z-score ≥ 2.0 over the previous 90 prints, with BTC 10-day momentum < 0 or the EMA20/50 trend not up | warning |
-| Guard exit | Existing guard exit while armed: 6% below the armed peak, MACD histogram shrinking 2 bars with close below VWAP, or OI flush near the peak | bearish |
+| Guard exit | Existing guard exit while armed: 6% below the armed peak, or OI flush near the peak. Its momentum-decay exit (MACD histogram shrinking 2 bars with close below VWAP) is excluded, see the amendment below | bearish |
 | Trailing stop | Price ≥ 8% below the highest 15m high of the last 7 days | bearish |
 | OI flush | 1h open interest down ≥ 5% over the last 6 readings while price is within 3% of the 24-hour high | bearish |
 | Support breakdown | Last closed 1h close below the 30-day support measured before that bar, minus 0.25 × ATR | bearish |
@@ -91,6 +91,10 @@ Transitions:
   The new phase is `warning` if a warning signal still holds, else `normal`.
 - If BTC data cannot be fetched or is too short, the phase **does not change**;
   `last_error` and a warning decision log record it.
+
+**Amendment (2026-10-30, after measuring on real data).** With the momentum-decay exit counted,
+BTC turned bearish 229 times in 520 days (163 of them from that exit) and the regime cost more
+return than it saved in drawdown on ETH and SOL. It now only ends the guard's armed state.
 
 ## 4. Components
 

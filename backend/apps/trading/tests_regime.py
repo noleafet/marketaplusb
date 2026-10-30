@@ -202,6 +202,27 @@ class RegimeEvaluatorTests(TestCase):
         self.assertIn("guard_exit", decision.reasons)
         self.assertEqual(decision.guard_state["phase"], "paused")
 
+    def test_momentum_decay_guard_exit_is_not_bearish(self):
+        armed = {
+            "phase": "armed",
+            "armed_at": (T0 - timedelta(hours=1)).isoformat(),
+            "peak_high": 100.0,
+            "peak_at": (T0 - timedelta(hours=1)).isoformat(),
+        }
+        # 1% off the peak, MACD histogram shrinking, close below VWAP.
+        decision = self.evaluate(
+            phase="warning",
+            entered_at=T0 - timedelta(hours=1),
+            guard_state=armed,
+            price=99.0,
+            macd_hist=(0.4, 0.3, 0.2, 0.1),
+            vwap=99.5,
+        )
+        self.assertEqual(decision.guard_state["phase"], "paused")
+        self.assertEqual(decision.guard_state["pause_reason"], "momentum_decay")
+        self.assertNotIn("guard_exit", decision.reasons)
+        self.assertEqual(decision.phase, "normal")
+
     def test_normal_jumps_straight_to_bearish(self):
         decision = self.evaluate(phase="normal", close_1h=80.0)
         self.assertEqual(decision.phase, "bearish")

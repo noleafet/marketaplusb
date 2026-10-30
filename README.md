@@ -362,12 +362,14 @@ of every paper tick (before any session ticks), and each closed bar is evaluated
 | --- | --- | --- |
 | `normal` | no warning or bearish signal | none |
 | `warning` | BTC 15m RSI > 75 (BTC overbought guard armed), or funding crowding | New buys blocked; positions kept. New sessions still open but cannot buy |
-| `bearish` | BTC guard exit, trailing stop, open-interest flush near the 24h high, or a 1h close below 30-day support − 0.25 ATR | Every active session is sold to USDT, paused and tagged `btc_regime`; the daily analysis opens no new sessions |
+| `bearish` | BTC guard trailing or OI-flush exit (not its momentum-decay exit), trailing stop, open-interest flush near the 24h high, or a 1h close below 30-day support − 0.25 ATR | Every active session is sold to USDT, paused and tagged `btc_regime`; the daily analysis opens no new sessions |
 
 `bearish` is left only when **all** recovery checks pass: the guard's recovery (RSI above 35 and
 rising, 15m close above VWAP, OI turning up or 60 minutes without OI data), back above the support
 line, inside the trailing stop, no OI flush, and the minimum bearish duration. The new phase is
-`warning` if a warning signal still holds, else `normal`. Only sessions the regime paused resume;
+`warning` if a warning signal still holds, else `normal`. The guard's momentum-decay exit (MACD
+shrinking with a close below VWAP) only ends its armed state: on 520 days of BTC it followed almost
+every overbought spike and flattened the book 163 times, costing more than it saved. Only sessions the regime paused resume;
 manual pauses, coin-guard pauses and bearish-locked sessions are never touched. If BTC data cannot
 be fetched, the phase does not change and the error is shown. It applies identically in normal and
 hybrid mode (no EMA100 gate on BTC).

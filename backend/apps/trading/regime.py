@@ -61,6 +61,11 @@ BARS_1H_PER_DAY = 24
 WARMUP_1H_DAYS = 45
 OI_READINGS = 6
 SUPPORT_BUFFER_ATR = 0.25
+# Guard exits that turn the regime bearish. The guard's momentum-decay exit
+# (MACD shrinking with a close below VWAP) follows almost every BTC overbought
+# spike: as a book-wide flatten it fired 163 times in 520 days and cost more
+# than it saved, so it only ends the guard's armed state.
+BEARISH_GUARD_EXITS = frozenset({"trailing_drawdown", "oi_flush"})
 FUNDING_LOOKBACK = 90
 # Live history. The 1h EMA50-day trend needs far more than its warm-up to
 # settle, so live reads 120 days to match the backtest's long history.
@@ -321,7 +326,7 @@ def evaluate_regime(
     breakdown = reading.support > 0 and reading.close_1h < support_line
 
     bearish: list[str] = []
-    if guard.action == "pause":
+    if guard.action == "pause" and guard.reason in BEARISH_GUARD_EXITS:
         bearish.append("guard_exit")
     if trailing:
         bearish.append("trailing_stop")
