@@ -239,8 +239,8 @@ def _build_hybrid_gate(
 
 
 # The latest BTC regime timeline, keyed by (last BTC 15m bar, regime config)
-# and stored with its start: the hybrid pass that follows the normal pass in
-# the same job reuses it, and a run needing an earlier start rebuilds it.
+# and stored with its start: the comparison run that follows the primary run
+# in the same job reuses it, and a run needing an earlier start rebuilds it.
 _REGIME_TIMELINE_CACHE: dict[tuple, tuple[datetime, RegimeTimeline]] = {}
 
 
@@ -414,12 +414,21 @@ def run_daily_analysis(
     params: dict[str, Any] | None = None,
     job_run_id=None,
     trend_mode: str = AnalysisRun.Mode.NORMAL,
+    drives_sessions: bool = False,
 ) -> AnalysisRun:
-    """Run one analysis; refuses to start while another one is running."""
+    """Run one analysis; refuses to start while another one is running.
+
+    Only a run with ``drives_sessions`` builds the published reports and opens
+    or retires paper sessions; any other run is a ranking for comparison.
+    """
 
     with _analysis_lock():
         return _run_daily_analysis(
-            trigger=trigger, params=params, job_run_id=job_run_id, trend_mode=trend_mode
+            trigger=trigger,
+            params=params,
+            job_run_id=job_run_id,
+            trend_mode=trend_mode,
+            drives_sessions=drives_sessions,
         )
 
 
@@ -429,6 +438,7 @@ def _run_daily_analysis(
     params: dict[str, Any] | None,
     job_run_id,
     trend_mode: str,
+    drives_sessions: bool = False,
 ) -> AnalysisRun:
     if trend_mode not in AnalysisRun.Mode.values:
         raise ValueError(f"Unknown analysis mode: {trend_mode}")
@@ -439,17 +449,8 @@ def _run_daily_analysis(
     interval = analysis_params["interval"]
     config = engine_config(interval)
     base_params = base_grid_params()
-    # The hybrid diagnostic replays only HYBRID_LOOKBACK_DAYS (180 by default);
-    # carving a 90-day holdout out of that leaves no room for a single fold.
-    holdout_days = 0 if hybrid else int(strategy_settings.holdout_days or 0)
-    hybrid_days = max(120, int(cfg["HYBRID_LOOKBACK_DAYS"]))
-    # Hybrid results only count bars inside the fetched 1h/15m coverage, so the
-    # simulation window is clamped to the hybrid lookback.
-    lookback_days = (
-        min(analysis_params["lookback_days"], hybrid_days)
-        if hybrid
-        else analysis_params["lookback_days"]
-    )
+    holdout_days = int(strategy_settings.holdout_days or 0)
+    lookback_days = analysis_params["lookback_days"]
     hybrid_adx = _hybrid_adx_enabled() if hybrid else False
     warmup_days = int(cfg["WARMUP_BUFFER_DAYS"])
 
@@ -458,6 +459,7 @@ def _run_daily_analysis(
         status=AnalysisRun.Status.RUNNING,
         trigger=trigger,
         mode=trend_mode,
+        drives_sessions=drives_sessions,
         scope=(
             AnalysisRun.Scope.SOLO
             if analysis_params["symbols"]
@@ -547,7 +549,7 @@ def _run_daily_analysis(
             strategy_settings,
             lookback_days=lookback_days,
             warmup_days=warmup_days,
-            sync=not hybrid,
+            sync=True,
         )
         if regime_timeline is not None:
             regime_info.update(regime_timeline.stats())
@@ -562,6 +564,8 @@ def _run_daily_analysis(
     executor = ProcessPoolExecutor(max_workers=workers) if workers > 1 else None
     pending: dict[Future, dict[str, Any]] = {}
     processed = 0
+    hybrid_attempted = 0
+    hybrid_covered = 0
 
     def finish(job: dict[str, Any], wf: WalkForwardResult | None, error: str = "") -> None:
         """Merge a walk-forward result into its item (runs in this process)."""
@@ -635,24 +639,46 @@ def _run_daily_analysis(
     try:
         for coin in coin_list:
             sync_info: dict[str, Any] = {}
-            # The hybrid run follows the normal run in the same job and reuses the
-            # candles it just synced; only the 1h/15m gate inputs are fetched.
-            if not hybrid:
-                try:
-                    sync_info = sync_coin_market_data(
-                        coin,
-                        client,
-                        lookback_days=lookback_days,
-                        interval=interval,
-                        warmup_days=warmup_days,
-                        force=bool(analysis_params["force"]),
-                    )
-                    if not sync_info.get("ok"):
-                        data_errors.append({"symbol": coin.symbol, "error": sync_info.get("error")})
-                except Exception as exc:  # keep going on per-coin failures
-                    logger.warning("Market data sync failed for %s: %s", coin.symbol, exc)
-                    data_errors.append({"symbol": coin.symbol, "error": str(exc)})
-                    sync_info = {"ok": False, "error": str(exc)}
+            # Every run syncs its own inputs. When a second run follows in the
+            # same job the incremental sync finds nothing new and is cheap.
+            try:
+                sync_info = sync_coin_market_data(
+                    coin,
+                    client,
+                    lookback_days=lookback_days,
+                    interval=interval,
+                    warmup_days=warmup_days,
+                    force=bool(analysis_params["force"]),
+                )
+                if not sync_info.get("ok"):
+                    data_errors.append({"symbol": coin.symbol, "error": sync_info.get("error")})
+            except Exception as exc:  # keep going on per-coin failures
+                logger.warning("Market data sync failed for %s: %s", coin.symbol, exc)
+                data_errors.append({"symbol": coin.symbol, "error": str(exc)})
+                sync_info = {"ok": False, "error": str(exc)}
+            if hybrid:
+                # The trend gate reads stored 1h/15m candles over the window
+                # _build_hybrid_gate uses.
+                for gate_interval in ("1h", "15m"):
+                    try:
+                        gate_sync = _sync_window(
+                            coin,
+                            client,
+                            gate_interval,
+                            lookback_days=lookback_days,
+                            warmup_days=HYBRID_WARMUP_DAYS,
+                        )
+                        if not gate_sync.get("ok"):
+                            data_errors.append(
+                                {"symbol": coin.symbol, "error": gate_sync.get("error")}
+                            )
+                    except Exception as exc:  # keep going on per-coin failures
+                        logger.warning(
+                            "%s sync failed for %s: %s", gate_interval, coin.symbol, exc
+                        )
+                        data_errors.append(
+                            {"symbol": coin.symbol, "error": f"{gate_interval}: {exc}"}
+                        )
 
             rows = load_candles(coin.binance_symbol, interval, data_start_floor, timezone.now())
             funding = load_funding(coin.binance_symbol, data_start_floor, timezone.now())
@@ -685,6 +711,7 @@ def _run_daily_analysis(
 
             gate: Gate | None = None
             if hybrid and len(rows) >= min_bars:
+                hybrid_attempted += 1
                 try:
                     gate = _build_hybrid_gate(
                         coin.binance_symbol,
@@ -693,8 +720,10 @@ def _run_daily_analysis(
                         adx_enabled=hybrid_adx,
                     )
                 except Exception as exc:  # noqa: BLE001 - keep the rest of the universe
-                    logger.warning("Hybrid kline fetch failed for %s: %s", coin.symbol, exc)
+                    logger.warning("Hybrid trend gate unavailable for %s: %s", coin.symbol, exc)
                     data_errors.append({"symbol": coin.symbol, "error": str(exc)})
+                if gate is not None:
+                    hybrid_covered += 1
 
             if len(rows) < min_bars:
                 item["eligible"] = False
@@ -930,6 +959,10 @@ def _run_daily_analysis(
                 int(row.get("confirmed_exits") or 0) for row in gate_rows
             ),
         }
+        analysis.summary["hybrid_coverage"] = {
+            "coins": hybrid_attempted,
+            "covered": hybrid_covered,
+        }
 
     config_payload = {
         "min_adv_usd": cfg["MIN_ADV_USD"],
@@ -948,8 +981,8 @@ def _run_daily_analysis(
         "max_top_trade_share": cfg["MAX_TOP_TRADE_SHARE"],
     }
     # Solo runs must not displace the universe ranking/performance reports, and
-    # hybrid runs are diagnostics rather than the published report set.
-    if analysis.scope == AnalysisRun.Scope.UNIVERSE and not hybrid:
+    # only the run that drives paper sessions publishes the report set.
+    if analysis.scope == AnalysisRun.Scope.UNIVERSE and drives_sessions:
         try:
             reports = build_reports(analysis, ranked, config_payload)
             analysis.summary["report_ids"] = [str(report.id) for report in reports]
@@ -957,7 +990,7 @@ def _run_daily_analysis(
             logger.exception("Report generation failed")
             analysis.summary["report_error"] = str(exc)
 
-    if not hybrid:
+    if drives_sessions:
         try:
             _bootstrap_paper_sessions(analysis, ranked, strategy_settings, job_run_id)
         except Exception as exc:  # noqa: BLE001

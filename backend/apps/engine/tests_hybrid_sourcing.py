@@ -99,15 +99,18 @@ class StoredGateTests(TestCase):
     def test_gate_from_stored_klines_equals_build_gate(self):
         h_rows, m_rows = self._seed()
         rows = _bars(h_rows[-1]["time"] - timedelta(hours=300), 300, timedelta(hours=1))
-        got = analysis._build_hybrid_gate(
-            "AAAUSDT", rows, lookback_days=180, adx_enabled=False)
         end = timezone.now()
+        with patch.object(analysis.timezone, "now", return_value=end):
+            got = analysis._build_hybrid_gate(
+                "AAAUSDT", rows, lookback_days=180, adx_enabled=False)
+        start = end - timedelta(days=180 + analysis.HYBRID_WARMUP_DAYS)
+
+        def window(bars, interval):
+            return analysis._closed(
+                [r for r in bars if start <= r["time"] <= end], interval, end)
+
         want = build_gate(
-            rows,
-            analysis._closed(h_rows, "1h", end),
-            analysis._closed(m_rows, "15m", end),
-            adx_enabled=False,
-        )
+            rows, window(h_rows, "1h"), window(m_rows, "15m"), adx_enabled=False)
         self.assertIsNotNone(got)
         self.assertEqual(got.allow, want.allow)
         self.assertEqual(got.exit, want.exit)
@@ -124,9 +127,11 @@ class StoredGateTests(TestCase):
             captured["k15m"] = k15m
             return SimpleNamespace(allow={1: True}, exit={}, derisk={})
 
-        with patch("apps.engine.analysis.build_gate", fake):
+        end = now  # frozen: the forming bar must still be forming at the read
+        with patch("apps.engine.analysis.build_gate", fake), patch.object(
+            analysis.timezone, "now", return_value=end
+        ):
             analysis._build_hybrid_gate("AAAUSDT", [], lookback_days=10, adx_enabled=False)
-        end = timezone.now()
         self.assertTrue(captured["k15m"])
         self.assertTrue(all(
             r["time"] + timedelta(minutes=15) <= end for r in captured["k15m"]))
@@ -162,3 +167,198 @@ class StoredGateTests(TestCase):
     @patch("apps.engine.analysis.sync_coin_market_data")
     def test_sync_window_forces_when_nothing_stored(self, sync):
         self.assertIs(self._window(sync, None).kwargs["force"], True)
+
+
+from contextlib import ExitStack
+from unittest.mock import MagicMock
+
+from django.conf import settings as django_settings
+
+from apps.coins.models import Coin
+from apps.engine.hybrid_gate import Gate
+from apps.engine.models import CoinAnalysis
+from apps.engine.regime_timeline import RegimeTimeline
+from apps.engine.walkforward import WalkForwardResult
+
+
+def _stub_wf(kwargs):
+    return WalkForwardResult(
+        oos_metrics={}, in_sample_metrics={}, folds=[], params={}, chart={},
+        trade_sample=[], data_start=None, data_end=None, error="stub walk-forward",
+    )
+
+
+class RunBehaviourTests(TestCase):
+    """Run-level wiring: everything below the orchestration is stubbed."""
+
+    def setUp(self):
+        analysis._REGIME_TIMELINE_CACHE.clear()
+        for rank, symbol in enumerate(("AAA", "BBB"), start=1):
+            Coin.objects.create(
+                coingecko_id=symbol.lower(), symbol=symbol, name=symbol, rank=rank,
+                binance_symbol=f"{symbol}USDT", analysis_eligible=True, in_top100=True,
+            )
+        row = StrategySettings.load()
+        row.btc_regime_enabled = False
+        row.save()
+        end = _floor(timezone.now(), timedelta(hours=1)) - timedelta(hours=4)
+        self.rows = _bars(end - timedelta(hours=4 * 299), 300, timedelta(hours=4))
+        self.gate = Gate(allow={r["time"]: True for r in self.rows}, exit={})
+        self.gates = {"AAAUSDT": self.gate, "BBBUSDT": self.gate}
+
+    def _run(self, *, extra=(), **kwargs):
+        with ExitStack() as stack:
+            def p(name, **kw):
+                return stack.enter_context(patch.object(analysis, name, **kw))
+
+            p("BinanceFuturesClient")
+            self.sync = p("sync_coin_market_data", return_value={"ok": True})
+            self.sync_window = p("_sync_window", return_value={"ok": True})
+            p("load_candles", side_effect=lambda *a, **k: list(self.rows))
+            p("load_funding", return_value=[])
+            p("compute_features", return_value={})
+            p("analysis_workers", return_value=1)
+            self.build_gate = p(
+                "_build_hybrid_gate",
+                side_effect=lambda symbol, rows, **k: self.gates.get(symbol),
+            )
+            self.wf = p("_walk_forward_job", side_effect=_stub_wf)
+            self.reports = p("build_reports", return_value=[])
+            self.bootstrap = p("_bootstrap_paper_sessions")
+            for name, kw in extra:
+                stack.enter_context(patch.object(analysis, name, **kw))
+            return analysis.run_daily_analysis(trigger="manual", **kwargs)
+
+    def test_hybrid_run_uses_full_lookback_and_holdout(self):
+        run = self._run(trend_mode=AnalysisRun.Mode.HYBRID)
+        lookback = max(120, int(django_settings.ENGINE["LOOKBACK_DAYS"]))
+        holdout = StrategySettings.load().holdout_days
+        self.assertGreater(lookback, 180)
+        self.assertGreater(holdout, 0)
+        self.assertEqual(run.params["lookback_days"], lookback)
+        self.assertEqual(run.params["config"]["holdout_days"], holdout)
+        self.assertEqual(run.summary["hybrid"]["lookback_days"], lookback)
+        self.assertEqual(run.summary["hybrid"]["warmup_days"], analysis.HYBRID_WARMUP_DAYS)
+        self.assertTrue(self.wf.call_args_list)
+        for call in self.wf.call_args_list:
+            self.assertEqual(call.args[0]["lookback_days"], lookback)
+            self.assertEqual(call.args[0]["holdout_days"], holdout)
+        for call in self.build_gate.call_args_list:
+            self.assertEqual(call.kwargs["lookback_days"], lookback)
+
+    def test_only_driving_run_bootstraps_and_reports(self):
+        for mode in (AnalysisRun.Mode.NORMAL, AnalysisRun.Mode.HYBRID):
+            run = self._run(trend_mode=mode, drives_sessions=False)
+            self.assertEqual(run.status, AnalysisRun.Status.SUCCEEDED)
+            self.reports.assert_not_called()
+            self.bootstrap.assert_not_called()
+        run = self._run(trend_mode=AnalysisRun.Mode.HYBRID, drives_sessions=True)
+        self.assertEqual(run.status, AnalysisRun.Status.SUCCEEDED)
+        self.reports.assert_called_once()
+        self.bootstrap.assert_called_once()
+        self.assertEqual(self.bootstrap.call_args.args[0].id, run.id)
+
+    def test_normal_driving_run_bootstraps_and_reports(self):
+        self._run(trend_mode=AnalysisRun.Mode.NORMAL, drives_sessions=True)
+        self.reports.assert_called_once()
+        self.bootstrap.assert_called_once()
+
+    def test_solo_hybrid_run_does_not_retire(self):
+        from apps.engine.analysis import _bootstrap_paper_sessions
+
+        with patch("apps.trading.paper.retire_stale_sessions") as retire, patch(
+            "apps.trading.paper.ensure_paper_sessions", return_value=[]
+        ) as ensure:
+            run = self._run(
+                trend_mode=AnalysisRun.Mode.HYBRID,
+                drives_sessions=True,
+                params={"symbols": ["AAA"]},
+                extra=[("_bootstrap_paper_sessions", {"side_effect": _bootstrap_paper_sessions})],
+            )
+        self.assertEqual(run.scope, AnalysisRun.Scope.SOLO)
+        self.assertNotIn("paper_session_error", run.summary)
+        self.reports.assert_not_called()
+        ensure.assert_called_once()
+        retire.assert_not_called()
+
+    def test_hybrid_primary_syncs_regime_inputs(self):
+        row = StrategySettings.load()
+        row.btc_regime_enabled = True
+        row.save()
+        regime = MagicMock(return_value=None)
+        self._run(
+            trend_mode=AnalysisRun.Mode.HYBRID,
+            drives_sessions=True,
+            extra=[("_regime_timeline", {"new": regime})],
+        )
+        regime.assert_called_once()
+        self.assertIs(regime.call_args.kwargs["sync"], True)
+
+    def test_hybrid_run_syncs_1h_and_15m_per_coin(self):
+        run = self._run(trend_mode=AnalysisRun.Mode.HYBRID)
+        lookback = run.params["lookback_days"]
+        calls = {
+            (c.args[0].binance_symbol, c.args[2]): c.kwargs
+            for c in self.sync_window.call_args_list
+        }
+        self.assertEqual(len(calls), len(self.sync_window.call_args_list))
+        self.assertEqual(
+            set(calls),
+            {(s, i) for s in ("AAAUSDT", "BBBUSDT") for i in ("1h", "15m")},
+        )
+        for kwargs in calls.values():
+            self.assertEqual(kwargs["lookback_days"], lookback)
+            self.assertEqual(kwargs["warmup_days"], analysis.HYBRID_WARMUP_DAYS)
+        # The base interval is synced in hybrid runs too.
+        self.assertEqual(
+            sorted(c.args[0].binance_symbol for c in self.sync.call_args_list),
+            ["AAAUSDT", "BBBUSDT"],
+        )
+        for call in self.sync.call_args_list:
+            self.assertEqual(call.kwargs["interval"], run.params["interval"])
+            self.assertEqual(call.kwargs["lookback_days"], lookback)
+
+    def test_normal_run_syncs_base_interval_only(self):
+        self._run(trend_mode=AnalysisRun.Mode.NORMAL)
+        self.assertEqual(self.sync.call_count, 2)
+        self.sync_window.assert_not_called()
+
+    def test_gate_sync_failure_is_a_data_error(self):
+        run = self._run(
+            trend_mode=AnalysisRun.Mode.HYBRID,
+            extra=[("_sync_window", {"side_effect": RuntimeError("15m down")})],
+        )
+        self.assertEqual(run.status, AnalysisRun.Status.SUCCEEDED)
+        self.assertEqual(run.summary["data_errors"], 4)
+        self.assertIn("15m down", run.summary["data_error_samples"][0]["error"])
+
+    def test_hybrid_coverage_summary(self):
+        self.gates = {"AAAUSDT": self.gate}
+        run = self._run(trend_mode=AnalysisRun.Mode.HYBRID)
+        self.assertEqual(run.summary["hybrid_coverage"], {"coins": 2, "covered": 1})
+        bbb = CoinAnalysis.objects.get(analysis=run, coin__symbol="BBB")
+        self.assertFalse(bbb.eligible)
+        # Scoring appends its own reasons (the stub history is short).
+        self.assertTrue(bbb.exclusion_reason.startswith("hybrid trend data unavailable"))
+
+    def test_drives_sessions_recorded(self):
+        for flag in (True, False):
+            run = self._run(trend_mode=AnalysisRun.Mode.HYBRID, drives_sessions=flag)
+            run.refresh_from_db()
+            self.assertIs(run.drives_sessions, flag)
+        self.assertFalse(self._run().drives_sessions)
+
+    def test_comparison_reuses_regime_timeline(self):
+        row = StrategySettings.load()
+        row.btc_regime_enabled = True
+        row.save()
+        timeline = RegimeTimeline(changes=[(self.rows[0]["time"], "normal")], readings=1)
+        build = MagicMock(return_value=timeline)
+        extra = [
+            ("latest_candle_time", {"return_value": self.rows[-1]["time"]}),
+            ("build_regime_timeline", {"new": build}),
+        ]
+        # Active mode first (hybrid), then the normal comparison.
+        self._run(trend_mode=AnalysisRun.Mode.HYBRID, drives_sessions=True, extra=extra)
+        self._run(trend_mode=AnalysisRun.Mode.NORMAL, extra=extra)
+        self.assertEqual(build.call_count, 1)
