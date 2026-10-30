@@ -1034,7 +1034,16 @@ def resume_session(session: PaperSession, reason: str = "") -> PaperSession:
         # Drop the stale ladder: the next tick rebuilds around the live price
         # instead of replaying bars from before the pause.
         session.grid_state = {}
-        session.save(update_fields=["status", "last_tick_at", "grid_state", "updated_at"])
+        # Any resume ends a BTC regime pause; a leftover tag would let the
+        # regime later resume a manual pause.
+        session.risk_state = {
+            key: value
+            for key, value in (session.risk_state or {}).items()
+            if key != "pause_source"
+        }
+        session.save(
+            update_fields=["status", "last_tick_at", "grid_state", "risk_state", "updated_at"]
+        )
         record_event(GridEvent.Type.RESUME, session=session, reason=reason)
         snapshot_session(session, "resume")
         log_decision(

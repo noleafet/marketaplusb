@@ -536,8 +536,16 @@ def apply_bearish(now: datetime, client: BinanceFuturesClient | None = None) -> 
                 position_qty = session.position_qty
                 price = paper.flatten_session(session, now, REGIME_PAUSE_SOURCE, client)
                 session.status = PaperSession.Status.PAUSED
+                # Inventory is gone, so the coin guard's armed peak is stale;
+                # keep only its last readings for display.
+                kept = {
+                    key: value
+                    for key, value in (session.risk_state or {}).items()
+                    if key in ("last_metrics", "last_eval_at")
+                }
                 session.risk_state = {
-                    **(session.risk_state or {}),
+                    **kept,
+                    "phase": "idle",
                     "pause_source": REGIME_PAUSE_SOURCE,
                 }
                 session.save()
@@ -568,18 +576,28 @@ def release_regime_pauses(now: datetime) -> list[str]:
     from apps.trading import paper
 
     resumed: list[str] = []
-    paused = PaperSession.objects.filter(status=PaperSession.Status.PAUSED).select_related("coin")
-    for session in paused:
-        state = dict(session.risk_state or {})
-        if state.get("pause_source") != REGIME_PAUSE_SOURCE:
-            continue
-        state.pop("pause_source")
-        session.risk_state = state
-        session.save(update_fields=["risk_state", "updated_at"])
-        # Paused by its own coin guard as well: that guard's recovery decides.
-        if state.get("phase") == "paused":
-            continue
-        paper.resume_session(session, reason=REGIME_PAUSE_SOURCE)
+    candidates = PaperSession.objects.filter(
+        status=PaperSession.Status.PAUSED, risk_state__pause_source=REGIME_PAUSE_SOURCE
+    ).values_list("id", flat=True)
+    for session_id in list(candidates):
+        # Locked and re-checked: a concurrent stop or retirement wins.
+        with transaction.atomic():
+            session = (
+                PaperSession.objects.select_for_update().select_related("coin").get(id=session_id)
+            )
+            state = dict(session.risk_state or {})
+            if (
+                session.status != PaperSession.Status.PAUSED
+                or state.get("pause_source") != REGIME_PAUSE_SOURCE
+            ):
+                continue
+            state.pop("pause_source")
+            session.risk_state = state
+            session.save(update_fields=["risk_state", "updated_at"])
+            # Paused by its own coin guard as well: that guard's recovery decides.
+            if state.get("phase") == "paused":
+                continue
+            paper.resume_session(session, reason=REGIME_PAUSE_SOURCE)
         resumed.append(session.coin.symbol)
     return resumed
 
@@ -671,9 +689,11 @@ def refresh_regime(now: datetime, client: Any = None) -> MarketRegimeState:
         state = MarketRegimeState.objects.select_for_update().get(pk=1)
         state.last_evaluated_at = now
         state.last_error = ""
-        # Each closed 15m bar is evaluated once, exactly as the backtest does;
-        # later ticks inside the same bar only re-apply the stored phase.
-        if (state.metrics or {}).get("time") != reading.time.isoformat():
+        # Each closed 15m bar is evaluated once and in order, exactly as the
+        # backtest does: later ticks inside the same bar, and an overlapping
+        # tick that fetched an older bar, only re-apply the stored phase.
+        last = risk._parse((state.metrics or {}).get("time"))
+        if last is None or reading.time > last:
             old = state.phase
             decision = evaluate_regime(
                 old, state.entered_at, state.guard_state, reading, config

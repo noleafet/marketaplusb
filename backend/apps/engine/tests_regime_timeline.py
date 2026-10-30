@@ -112,32 +112,59 @@ class GateMappingTests(TestCase):
 
 
 class TimelineCacheTests(TestCase):
-    def test_timeline_cached_for_hybrid_pass(self):
+    def regime_timeline(self, lookback_days, *, sync=False, earliest=None, builds=None):
         from apps.engine import analysis
 
-        analysis._REGIME_TIMELINE_CACHE.clear()
-        row = StrategySettings.load()
         timeline = RegimeTimeline(changes=[(at(9), "normal")], readings=1)
         with patch.object(
             analysis, "latest_candle_time", return_value=at(20)
+        ), patch.object(
+            analysis, "earliest_candle_time", return_value=earliest
         ), patch.object(analysis, "load_candles", return_value=[]), patch.object(
             analysis, "load_funding", return_value=[]
         ), patch.object(
             analysis, "build_regime_timeline", return_value=timeline
         ) as build, patch.object(analysis, "sync_coin_market_data") as sync:
-            first = analysis._regime_timeline(
-                object(), row, lookback_days=520, warmup_days=45, sync=True
+            result = analysis._regime_timeline(
+                object(),
+                StrategySettings.load(),
+                lookback_days=lookback_days,
+                warmup_days=45,
+                sync=sync,
             )
-            second = analysis._regime_timeline(
-                object(), row, lookback_days=180, warmup_days=45, sync=False
-            )
-        self.assertIs(first, timeline)
-        self.assertIs(second, timeline)
-        build.assert_called_once()
-        self.assertEqual(sync.call_count, 2)
+        if builds is not None:
+            self.assertEqual(build.call_count, builds)
+        return result, sync
+
+    def setUp(self):
+        from apps.engine import analysis
+
+        analysis._REGIME_TIMELINE_CACHE.clear()
+
+    def test_timeline_cached_for_hybrid_pass(self):
+        first, sync = self.regime_timeline(520, sync=True, builds=1)
         self.assertEqual(
             sorted(call.kwargs["interval"] for call in sync.call_args_list), ["15m", "1h"]
         )
+        # The shorter hybrid window is covered by the cached timeline.
+        second, _ = self.regime_timeline(180, builds=0)
+        self.assertIs(second, first)
+
+    def test_longer_window_rebuilds(self):
+        self.regime_timeline(120, builds=1)
+        # A cached timeline starting later than this run needs would leave its
+        # early bars ungated.
+        self.regime_timeline(520, builds=1)
+
+    def test_short_btc_history_is_back_filled(self):
+        from django.utils import timezone
+
+        _, sync = self.regime_timeline(520, sync=True, earliest=timezone.now() - timedelta(days=60))
+        self.assertTrue(all(call.kwargs["force"] for call in sync.call_args_list))
+        _, sync = self.regime_timeline(
+            520, sync=True, earliest=timezone.now() - timedelta(days=800)
+        )
+        self.assertFalse(any(call.kwargs["force"] for call in sync.call_args_list))
 
     def test_disabled_regime_builds_nothing(self):
         from apps.engine import analysis

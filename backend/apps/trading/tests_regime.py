@@ -568,6 +568,60 @@ class RegimeControllerTests(TestCase):
         fetch.assert_not_called()
         self.assertEqual(summary["sessions"], 0)
 
+    def test_manual_resume_clears_tag_so_a_later_manual_pause_stays(self):
+        from apps.trading.paper import pause_session, resume_session
+
+        session = self.holding(self.eth)
+        self.refresh(**BEARISH_FIELDS)
+        session.refresh_from_db()
+        resume_session(session)
+        session.refresh_from_db()
+        self.assertNotIn("pause_source", session.risk_state)
+        pause_session(session)
+        later = T0 + timedelta(hours=5)
+        state = self.refresh(now=later, time=later)
+        self.assertEqual(state.phase, "normal")
+        session.refresh_from_db()
+        self.assertEqual(session.status, PaperSession.Status.PAUSED)
+
+    def test_older_reading_is_never_applied(self):
+        self.refresh(**BEARISH_FIELDS)
+        # An overlapping tick that fetched the previous bar must not move the
+        # state machine backwards.
+        state = self.refresh(time=T0 - timedelta(minutes=15))
+        self.assertEqual(state.phase, "bearish")
+        self.assertEqual(state.metrics["time"], T0.isoformat())
+        self.assertEqual(GridEvent.objects.filter(type=GridEvent.Type.REGIME).count(), 1)
+
+    def test_regime_pause_resets_an_armed_coin_guard(self):
+        session = self.holding(
+            self.eth,
+            risk_state={
+                "phase": "armed",
+                "peak_high": 120.0,
+                "armed_at": T0.isoformat(),
+                "last_metrics": {"rsi_15m": 80.0},
+            },
+        )
+        self.refresh(**BEARISH_FIELDS)
+        session.refresh_from_db()
+        self.assertEqual(
+            session.risk_state,
+            {"phase": "idle", "pause_source": "btc_regime", "last_metrics": {"rsi_15m": 80.0}},
+        )
+
+    def test_release_skips_sessions_no_longer_paused(self):
+        stopped = self.holding(
+            self.eth,
+            status=PaperSession.Status.STOPPED,
+            risk_state={"pause_source": "btc_regime"},
+        )
+        from apps.trading.regime import release_regime_pauses
+
+        self.assertEqual(release_regime_pauses(T0), [])
+        stopped.refresh_from_db()
+        self.assertEqual(stopped.status, PaperSession.Status.STOPPED)
+
     def test_buy_block_reason_regime(self):
         from apps.trading.portfolio import buy_block_reason
 

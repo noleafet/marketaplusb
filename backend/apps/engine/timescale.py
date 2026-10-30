@@ -67,6 +67,16 @@ def latest_candle_time(symbol: str, interval: str) -> datetime | None:
     return _aware(value) if value else None
 
 
+def earliest_candle_time(symbol: str, interval: str) -> datetime | None:
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT MIN(time) FROM market_candles WHERE symbol = %s AND interval = %s",
+            [symbol, interval],
+        )
+        value = cursor.fetchone()[0]
+    return _aware(value) if value else None
+
+
 def load_candles(
     symbol: str, interval: str, start: datetime, end: datetime
 ) -> list[dict[str, Any]]:

@@ -32,7 +32,12 @@ from apps.engine.robustness import (
     select_diversified,
 )
 from apps.engine.scoring import ranking_summary, score_results
-from apps.engine.timescale import latest_candle_time, load_candles, load_funding
+from apps.engine.timescale import (
+    earliest_candle_time,
+    latest_candle_time,
+    load_candles,
+    load_funding,
+)
 from apps.engine.validation import (
     MIN_SCOPE_COINS,
     findings,
@@ -215,9 +220,10 @@ def _build_hybrid_gate(
     return gate if gate.allow else None
 
 
-# One BTC regime timeline per (last BTC 15m bar, regime config): the hybrid
-# pass that follows the normal pass in the same job reuses it.
-_REGIME_TIMELINE_CACHE: dict[tuple, RegimeTimeline] = {}
+# The latest BTC regime timeline, keyed by (last BTC 15m bar, regime config)
+# and stored with its start: the hybrid pass that follows the normal pass in
+# the same job reuses it, and a run needing an earlier start rebuilds it.
+_REGIME_TIMELINE_CACHE: dict[tuple, tuple[datetime, RegimeTimeline]] = {}
 
 
 def _regime_config_key(config: RegimeConfig) -> tuple:
@@ -246,14 +252,21 @@ def _regime_timeline(
         return None
     btc = SimpleNamespace(binance_symbol=REGIME_SYMBOL)
     regime_warmup = warmup_days + WARMUP_1H_DAYS + 2
+    end = timezone.now()
+    start = end - timedelta(days=lookback_days + regime_warmup)
     if sync:
         for interval in ("15m", "1h"):
+            # The sync is incremental from the newest stored candle, so BTC
+            # history stored for a shorter window (BTC's own 1h coin sync has
+            # no regime warm-up) is back-filled once with a full fetch.
+            earliest = earliest_candle_time(REGIME_SYMBOL, interval)
             sync_coin_market_data(
                 btc,
                 client,
                 lookback_days=lookback_days,
                 interval=interval,
                 warmup_days=regime_warmup,
+                force=earliest is None or earliest > start + timedelta(days=1),
             )
     config = RegimeConfig.from_settings(strategy_settings)
     last_bar = latest_candle_time(REGIME_SYMBOL, "15m")
@@ -261,10 +274,8 @@ def _regime_timeline(
         return None
     key = (last_bar, _regime_config_key(config))
     cached = _REGIME_TIMELINE_CACHE.get(key)
-    if cached is not None:
-        return cached
-    end = timezone.now()
-    start = end - timedelta(days=lookback_days + regime_warmup)
+    if cached is not None and cached[0] <= start:
+        return cached[1]
     oi_points = list(
         OpenInterestPoint.objects.filter(symbol=REGIME_SYMBOL, time__gte=start).values(
             "time", "open_interest"
@@ -278,7 +289,7 @@ def _regime_timeline(
         config,
     )
     _REGIME_TIMELINE_CACHE.clear()
-    _REGIME_TIMELINE_CACHE[key] = timeline
+    _REGIME_TIMELINE_CACHE[key] = (start, timeline)
     return timeline
 
 
