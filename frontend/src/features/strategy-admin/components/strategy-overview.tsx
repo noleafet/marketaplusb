@@ -75,7 +75,7 @@ export default function StrategyOverview() {
   const resultsQuery = useResults({ limit: 500 });
 
   const latest = dashboard.data?.engine.latest_analysis ?? null;
-  const hybridRun = dashboard.data?.engine.latest_hybrid_analysis ?? null;
+  const comparisonRun = dashboard.data?.engine.latest_comparison_analysis ?? null;
   const summary = (latest?.summary ?? {}) as Record<string, unknown>;
   const results = resultsQuery.data?.results ?? [];
 
@@ -165,20 +165,20 @@ export default function StrategyOverview() {
       icon: <Icons.activity className='size-4' />
     });
 
-    if (hybridRun) {
-      const hybridSummary = (hybridRun.summary ?? {}) as Record<string, unknown>;
+    if (comparisonRun) {
+      const hybridSummary = (comparisonRun.summary ?? {}) as Record<string, unknown>;
       const hybridGate = (hybridSummary.hybrid ?? {}) as Record<string, unknown>;
       const blockedPct = toNumber(hybridGate.blocked_pct_avg);
       const hybridExits = toNumber(hybridGate.confirmed_exits);
       const hybridTone: CatalogTone =
-        hybridRun.status === 'succeeded' ? 'good' : hybridRun.status === 'failed' ? 'bad' : 'info';
+        comparisonRun.status === 'succeeded' ? 'good' : comparisonRun.status === 'failed' ? 'bad' : 'info';
       notes.push({
         tone: hybridTone,
-        title: `Hybrid backtest ${hybridRun.status}`,
+        title: `Comparison run (${comparisonRun.mode}) ${comparisonRun.status}`,
         body:
-          hybridRun.status === 'failed'
-            ? hybridRun.error || 'Hybrid analysis failed.'
-            : `${formatDate(hybridRun.started_at)} · ${
+          comparisonRun.status === 'failed'
+            ? comparisonRun.error || 'Comparison analysis failed.'
+            : `${formatDate(comparisonRun.started_at)} · ${
                 blockedPct !== null
                   ? `${formatPercent(blockedPct, 0)} of bars below trend`
                   : 'gate stats pending'
@@ -190,8 +190,8 @@ export default function StrategyOverview() {
     } else {
       notes.push({
         tone: 'neutral',
-        title: 'No hybrid backtest yet',
-        body: 'The daily job replays the trend-gated backtest right after the normal analysis.',
+        title: 'No comparison run yet',
+        body: 'The daily job runs the inactive trading mode after the active one for comparison.',
         icon: <Icons.clock className='size-4' />
       });
     }

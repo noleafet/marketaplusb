@@ -231,7 +231,7 @@ export interface DashboardSummary {
   generated_at: string;
   engine: {
     latest_analysis: AnalysisRun | null;
-    latest_hybrid_analysis: AnalysisRun | null;
+    latest_comparison_analysis: AnalysisRun | null;
     results: CoinResult[];
     suitability_counts: Record<string, number>;
   };

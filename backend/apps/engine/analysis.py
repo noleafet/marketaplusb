@@ -1034,9 +1034,19 @@ def _run_daily_analysis(
     return analysis
 
 
-def latest_analysis(mode: str = AnalysisRun.Mode.NORMAL) -> AnalysisRun | None:
-    """Latest succeeded universe run of ``mode``, falling back to any run."""
+ACTIVE_MODE = "active"
 
+
+def latest_analysis(mode: str = ACTIVE_MODE) -> AnalysisRun | None:
+    """Latest succeeded universe run of ``mode``, falling back to any run.
+
+    ``ACTIVE_MODE`` resolves to the live trading mode; a falsy mode means any.
+    """
+
+    if mode == ACTIVE_MODE:
+        from apps.trading.models import LiveTradingState
+
+        mode = LiveTradingState.load().mode
     succeeded = AnalysisRun.objects.filter(status=AnalysisRun.Status.SUCCEEDED)
     if mode:
         succeeded = succeeded.filter(mode=mode)

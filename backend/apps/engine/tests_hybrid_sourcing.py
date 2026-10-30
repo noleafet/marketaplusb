@@ -458,3 +458,55 @@ class DailyJobTests(TestCase):
     def test_manual_trigger_uses_active_mode(self):
         self._run(mode="hybrid", trigger=JobRun.Trigger.MANUAL)
         self.assertEqual(self.calls[0], ("hybrid", True))
+
+
+class CurrentRunTests(TestCase):
+    def setUp(self):
+        from apps.coins.models import Coin
+        from apps.engine.models import CoinAnalysis
+
+        self.normal = AnalysisRun.objects.create(
+            status=AnalysisRun.Status.SUCCEEDED, scope=AnalysisRun.Scope.UNIVERSE
+        )
+        self.hybrid = AnalysisRun.objects.create(
+            status=AnalysisRun.Status.SUCCEEDED,
+            scope=AnalysisRun.Scope.UNIVERSE,
+            mode=AnalysisRun.Mode.HYBRID,
+        )
+        for run, sym in ((self.normal, "NRMUSDT"), (self.hybrid, "HYBUSDT")):
+            coin = Coin.objects.create(coingecko_id=sym.lower(), symbol=sym, name=sym)
+            CoinAnalysis.objects.create(analysis=run, coin=coin)
+
+    def _set_mode(self, mode):
+        LiveTradingState.load()
+        LiveTradingState.objects.filter(pk=1).update(mode=mode)
+
+    def test_latest_analysis_follows_active_mode(self):
+        from apps.engine.analysis import latest_analysis
+
+        self._set_mode("normal")
+        self.assertEqual(latest_analysis().id, self.normal.id)
+        self._set_mode("hybrid")
+        self.assertEqual(latest_analysis().id, self.hybrid.id)
+        self.assertEqual(latest_analysis(mode="normal").id, self.normal.id)
+        self.assertEqual(latest_analysis(mode="hybrid").id, self.hybrid.id)
+        self.assertEqual(latest_analysis(mode="").id, self.hybrid.id)
+
+    def test_results_default_follows_active_mode(self):
+        self._set_mode("hybrid")
+        client = APIClient()
+        client.credentials(HTTP_X_ENGINE_TOKEN="t")
+        with override_settings(ENGINE_API_TOKEN="t"):
+            data = client.get("/api/engine/results/").json()
+        rows = data["results"] if isinstance(data, dict) else data
+        self.assertEqual([r["coin"]["symbol"] for r in rows], ["HYBUSDT"])
+
+    def test_dashboard_comparison_is_inactive_mode(self):
+        self._set_mode("hybrid")
+        client = APIClient()
+        client.credentials(HTTP_X_ENGINE_TOKEN="t")
+        with override_settings(ENGINE_API_TOKEN="t"):
+            engine = client.get("/api/engine/dashboard/").json()["engine"]
+        self.assertEqual(engine["latest_analysis"]["mode"], "hybrid")
+        self.assertEqual(engine["latest_comparison_analysis"]["mode"], "normal")
+        self.assertNotIn("latest_hybrid_analysis", engine)

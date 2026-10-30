@@ -5,7 +5,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from apps.coins.models import Coin
-from apps.engine.analysis import latest_analysis
+from apps.engine.analysis import ACTIVE_MODE, latest_analysis
 from apps.engine.models import AnalysisRun, CoinAnalysis, DecisionLog, Report
 from apps.engine.serializers import (
     AnalysisRunSerializer,
@@ -91,7 +91,7 @@ class CoinAnalysisViewSet(viewsets.ReadOnlyModelViewSet):
         queryset = CoinAnalysis.objects.select_related("coin", "analysis")
         analysis_id = self.request.query_params.get("analysis")
         if analysis_id in (None, "", "latest"):
-            mode = self.request.query_params.get("mode") or AnalysisRun.Mode.NORMAL
+            mode = self.request.query_params.get("mode") or ACTIVE_MODE
             run = latest_analysis(mode=mode) or AnalysisRun.objects.order_by("-started_at").first()
             if run is None:
                 return queryset.none()
@@ -179,7 +179,17 @@ class DecisionLogViewSet(viewsets.ReadOnlyModelViewSet):
 class DashboardSummaryView(viewsets.ViewSet):
     def list(self, request):
         run = latest_analysis()
-        hybrid_run = latest_analysis(mode=AnalysisRun.Mode.HYBRID)
+        from apps.trading.models import LiveTradingState
+
+        comparison_run = (
+            AnalysisRun.objects.filter(
+                status=AnalysisRun.Status.SUCCEEDED,
+                scope=AnalysisRun.Scope.UNIVERSE,
+            )
+            .exclude(mode=LiveTradingState.load().mode)
+            .order_by("-started_at")
+            .first()
+        )
         results = (
             run.coin_results.select_related("coin").order_by("rank", "-score")[:10]
             if run
@@ -210,10 +220,8 @@ class DashboardSummaryView(viewsets.ViewSet):
                 "generated_at": timezone.now(),
                 "engine": {
                     "latest_analysis": AnalysisRunSerializer(run).data if run else None,
-                    "latest_hybrid_analysis": (
-                        AnalysisRunSerializer(hybrid_run).data
-                        if hybrid_run is not None and hybrid_run != run
-                        else None
+                    "latest_comparison_analysis": (
+                        AnalysisRunSerializer(comparison_run).data if comparison_run else None
                     ),
                     "results": CoinAnalysisCompactSerializer(results, many=True).data,
                     "suitability_counts": suitability,
