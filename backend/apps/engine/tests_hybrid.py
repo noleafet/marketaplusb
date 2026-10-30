@@ -251,6 +251,10 @@ class AnalysisModeTests(TestCase):
             mode=AnalysisRun.Mode.HYBRID,
         )
 
+        from apps.trading.models import LiveTradingState
+
+        LiveTradingState.load()
+        LiveTradingState.objects.filter(pk=1).update(mode="normal")
         self.assertEqual(latest_analysis().id, normal.id)
         self.assertEqual(latest_analysis(mode=AnalysisRun.Mode.HYBRID).id, hybrid.id)
 
