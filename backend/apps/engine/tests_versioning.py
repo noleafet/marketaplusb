@@ -359,10 +359,11 @@ class CaptureTests(TestCase):
             self.assertEqual(f.strategy_version_id, sv.id)
             self.assertEqual(f.config_version_id, cv.id)
 
-    def _fake_analysis(self, hybrid_ok=True):
+    def _fake_analysis(self, normal_ok=True):
+        # The default (normal) mode is the primary run; hybrid is the comparison.
         def fake(**kwargs):
             normal = kwargs.get("trend_mode", AnalysisRun.Mode.NORMAL) == AnalysisRun.Mode.NORMAL
-            ok = normal or hybrid_ok
+            ok = normal_ok or not normal
             return SimpleNamespace(
                 id="run", Status=AnalysisRun.Status,
                 status=AnalysisRun.Status.SUCCEEDED if ok else AnalysisRun.Status.FAILED,
@@ -389,10 +390,10 @@ class CaptureTests(TestCase):
         )
 
     @patch("apps.jobs.handlers.run_daily_analysis")
-    def test_daily_job_hybrid_failure_writes_no_daily_snapshots(self, run_daily):
+    def test_daily_job_primary_failure_writes_no_daily_snapshots(self, run_daily):
         from apps.trading.models import SessionSnapshot
         self._three_sessions()
-        run_daily.side_effect = self._fake_analysis(hybrid_ok=False)
+        run_daily.side_effect = self._fake_analysis(normal_ok=False)
         with self.assertRaises(RuntimeError):
             handle_daily_analysis({}, JobRun.objects.create(job_type="daily_analysis"))
         self.assertEqual(SessionSnapshot.objects.filter(trigger="daily").count(), 0)

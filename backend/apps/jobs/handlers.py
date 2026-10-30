@@ -25,42 +25,75 @@ def handle_coins_refresh(params: dict[str, Any], job_run) -> dict[str, Any]:
     return result
 
 
-def handle_daily_analysis(params: dict[str, Any], job_run) -> dict[str, Any]:
-    trigger = "scheduled" if job_run.trigger == "scheduled" else "manual"
-    analysis = run_daily_analysis(
-        trigger=trigger,
-        params=params,
-        job_run_id=job_run.id,
-    )
-    if analysis.status != analysis.Status.SUCCEEDED:
-        raise RuntimeError(analysis.error or "analysis run failed")
-    result: dict[str, Any] = {
+def _analysis_payload(analysis) -> dict[str, Any]:
+    return {
         "analysis_id": str(analysis.id),
         "status": analysis.status,
         "summary": analysis.summary,
         "duration_seconds": analysis.duration_seconds,
     }
 
-    # The hybrid run replays the same universe with the closed 1h/15m trend
-    # gate. It depends on the normal run only for the freshly synced candles.
-    try:
-        hybrid = run_daily_analysis(
-            trigger=trigger,
-            params=params,
-            job_run_id=job_run.id,
-            trend_mode=AnalysisRun.Mode.HYBRID,
-        )
-    except Exception as exc:  # noqa: BLE001 - normal results are already persisted
-        logger.exception("Hybrid analysis run failed")
-        raise RuntimeError(f"hybrid analysis run failed: {exc}") from exc
-    result["hybrid"] = {
-        "analysis_id": str(hybrid.id),
-        "status": hybrid.status,
-        "summary": hybrid.summary,
-        "duration_seconds": hybrid.duration_seconds,
-    }
-    if hybrid.status != hybrid.Status.SUCCEEDED:
-        raise RuntimeError(hybrid.error or "hybrid analysis run failed")
+
+def handle_daily_analysis(params: dict[str, Any], job_run) -> dict[str, Any]:
+    from apps.trading.models import LiveTradingState, StrategySettings
+
+    trigger = "scheduled" if job_run.trigger == "scheduled" else "manual"
+    # The active mode is read once: the job's primary run and comparison must
+    # stay a consistent pair even if the mode is switched while it runs.
+    mode = LiveTradingState.load().mode
+    other = (
+        AnalysisRun.Mode.NORMAL
+        if mode == AnalysisRun.Mode.HYBRID
+        else AnalysisRun.Mode.HYBRID
+    )
+
+    analysis = run_daily_analysis(
+        trigger=trigger,
+        params=params,
+        job_run_id=job_run.id,
+        trend_mode=mode,
+        drives_sessions=True,
+    )
+    if analysis.status != analysis.Status.SUCCEEDED:
+        raise RuntimeError(analysis.error or "analysis run failed")
+    result: dict[str, Any] = {**_analysis_payload(analysis), "mode": mode}
+
+    # The other mode is a ranking for comparison only; it never opens sessions
+    # and its failure must not fail the job whose primary results are saved.
+    if not StrategySettings.load().run_comparison_analysis:
+        result["comparison"] = {"skipped": True}
+    else:
+        error = ""
+        comparison = None
+        try:
+            comparison = run_daily_analysis(
+                trigger=trigger,
+                params=params,
+                job_run_id=job_run.id,
+                trend_mode=other,
+                drives_sessions=False,
+            )
+            if comparison.status != comparison.Status.SUCCEEDED:
+                error = comparison.error or "comparison analysis run failed"
+        except Exception as exc:  # noqa: BLE001 - primary results are already persisted
+            logger.exception("Comparison analysis run failed")
+            error = str(exc) or exc.__class__.__name__
+        if error:
+            log_decision(
+                "analysis",
+                f"Comparison {other} analysis failed: {error}",
+                severity="warning",
+                payload={"mode": other, "error": error},
+                job_run_id=job_run.id,
+            )
+            result["comparison"] = {"mode": other, "error": error}
+        else:
+            result["comparison"] = {
+                "analysis_id": str(comparison.id),
+                "status": comparison.status,
+                "mode": other,
+                "duration_seconds": comparison.duration_seconds,
+            }
 
     from apps.trading.events import snapshot_session
     from apps.trading.models import PaperSession

@@ -419,7 +419,7 @@ def run_daily_analysis(
     """Run one analysis; refuses to start while another one is running.
 
     Only a run with ``drives_sessions`` builds the published reports and opens
-    or retires paper sessions; any other run is a ranking for comparison.
+    (and, for universe runs, retires) paper sessions; any other run is a ranking for comparison.
     """
 
     with _analysis_lock():
@@ -959,6 +959,7 @@ def _run_daily_analysis(
                 int(row.get("confirmed_exits") or 0) for row in gate_rows
             ),
         }
+        # ``coins`` counts only coins with enough base history (200 bars) to build a gate.
         analysis.summary["hybrid_coverage"] = {
             "coins": hybrid_attempted,
             "covered": hybrid_covered,

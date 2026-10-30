@@ -362,3 +362,99 @@ class RunBehaviourTests(TestCase):
         self._run(trend_mode=AnalysisRun.Mode.HYBRID, drives_sessions=True, extra=extra)
         self._run(trend_mode=AnalysisRun.Mode.NORMAL, extra=extra)
         self.assertEqual(build.call_count, 1)
+
+
+from apps.engine.models import DecisionLog
+from apps.jobs.handlers import handle_daily_analysis
+from apps.jobs.models import JobRun
+from apps.trading.models import LiveTradingState
+
+
+class DailyJobTests(TestCase):
+    def setUp(self):
+        self.calls = []
+        self.statuses = {}
+        self.on_first_call = None
+
+    def _fake(self, **kwargs):
+        mode = kwargs.get("trend_mode", AnalysisRun.Mode.NORMAL)
+        self.calls.append((mode, kwargs.get("drives_sessions", False)))
+        if len(self.calls) == 1 and self.on_first_call:
+            self.on_first_call()
+        status = self.statuses.get(mode, AnalysisRun.Status.SUCCEEDED)
+        return SimpleNamespace(
+            id=f"{mode}-run",
+            Status=AnalysisRun.Status,
+            status=status,
+            summary={"mode": mode},
+            duration_seconds=1.0,
+            error="boom" if status == AnalysisRun.Status.FAILED else "",
+        )
+
+    def _run(self, *, mode="normal", trigger=JobRun.Trigger.SCHEDULED):
+        state = LiveTradingState.load()
+        state.mode = mode
+        state.save()
+        job = JobRun.objects.create(job_type="daily_analysis", trigger=trigger)
+        with patch("apps.jobs.handlers.run_daily_analysis", side_effect=self._fake):
+            return handle_daily_analysis({}, job)
+
+    def test_hybrid_mode_runs_hybrid_first(self):
+        result = self._run(mode="hybrid")
+        self.assertEqual(self.calls, [("hybrid", True), ("normal", False)])
+        self.assertEqual(result["mode"], "hybrid")
+        self.assertEqual(result["analysis_id"], "hybrid-run")
+        self.assertEqual(result["comparison"]["mode"], "normal")
+        self.assertNotIn("hybrid", result)
+
+    def test_normal_mode_runs_normal_first(self):
+        result = self._run(mode="normal")
+        self.assertEqual(self.calls, [("normal", True), ("hybrid", False)])
+        self.assertEqual(result["mode"], "normal")
+        self.assertEqual(result["comparison"]["analysis_id"], "hybrid-run")
+
+    def test_comparison_off_runs_once(self):
+        row = StrategySettings.load()
+        row.run_comparison_analysis = False
+        row.save()
+        result = self._run(mode="normal")
+        self.assertEqual(self.calls, [("normal", True)])
+        self.assertEqual(result["comparison"], {"skipped": True})
+
+    def test_failed_comparison_keeps_job_succeeded(self):
+        self.statuses["hybrid"] = AnalysisRun.Status.FAILED
+        result = self._run(mode="normal")
+        self.assertEqual(result["comparison"]["error"], "boom")
+        self.assertEqual(result["comparison"]["mode"], "hybrid")
+        logs = DecisionLog.objects.filter(severity="warning")
+        self.assertEqual(logs.count(), 1)
+        self.assertIn("Comparison hybrid analysis failed", logs.first().message)
+
+    def test_raising_comparison_keeps_job_succeeded(self):
+        def fake(**kwargs):
+            if kwargs.get("trend_mode") == AnalysisRun.Mode.HYBRID:
+                raise ValueError("kaput")
+            return self._fake(**kwargs)
+
+        job = JobRun.objects.create(job_type="daily_analysis")
+        with patch("apps.jobs.handlers.run_daily_analysis", side_effect=fake):
+            result = handle_daily_analysis({}, job)
+        self.assertEqual(result["comparison"], {"mode": "hybrid", "error": "kaput"})
+
+    def test_failed_primary_fails_job(self):
+        self.statuses["normal"] = AnalysisRun.Status.FAILED
+        with self.assertRaises(RuntimeError):
+            self._run(mode="normal")
+        self.assertEqual(self.calls, [("normal", True)])
+
+    def test_mode_read_once_at_job_start(self):
+        def flip():
+            LiveTradingState.objects.filter(pk=1).update(mode="normal")
+
+        self.on_first_call = flip
+        self._run(mode="hybrid")
+        self.assertEqual(self.calls, [("hybrid", True), ("normal", False)])
+
+    def test_manual_trigger_uses_active_mode(self):
+        self._run(mode="hybrid", trigger=JobRun.Trigger.MANUAL)
+        self.assertEqual(self.calls[0], ("hybrid", True))

@@ -255,7 +255,7 @@ class AnalysisModeTests(TestCase):
         self.assertEqual(latest_analysis(mode=AnalysisRun.Mode.HYBRID).id, hybrid.id)
 
     @patch("apps.jobs.handlers.run_daily_analysis")
-    def test_daily_job_runs_hybrid_after_normal(self, run_daily):
+    def test_daily_job_runs_normal_first_with_hybrid_comparison(self, run_daily):
         job = JobRun.objects.create(job_type="daily_analysis")
 
         def fake(**kwargs):
@@ -277,10 +277,11 @@ class AnalysisModeTests(TestCase):
             [AnalysisRun.Mode.NORMAL, AnalysisRun.Mode.HYBRID],
         )
         self.assertEqual(result["analysis_id"], "normal-run")
-        self.assertEqual(result["hybrid"]["analysis_id"], "hybrid-run")
+        self.assertEqual(result["comparison"]["analysis_id"], "hybrid-run")
+        self.assertEqual(result["mode"], "normal")
 
     @patch("apps.jobs.handlers.run_daily_analysis")
-    def test_hybrid_failure_is_reported_after_normal_results(self, run_daily):
+    def test_comparison_failure_is_reported_without_failing_the_job(self, run_daily):
         job = JobRun.objects.create(job_type="daily_analysis")
 
         def fake(**kwargs):
@@ -299,5 +300,7 @@ class AnalysisModeTests(TestCase):
             )
 
         run_daily.side_effect = fake
-        with self.assertRaises(RuntimeError):
-            handle_daily_analysis({}, job)
+        result = handle_daily_analysis({}, job)
+
+        self.assertEqual(result["analysis_id"], "run")
+        self.assertEqual(result["comparison"]["error"], "hybrid broke")
