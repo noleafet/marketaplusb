@@ -527,3 +527,87 @@ class CurrentRunTests(TestCase):
         # and the other mode's run is shown only as the comparison, never twice.
         self.assertIsNone(engine["latest_analysis"])
         self.assertEqual(engine["latest_comparison_analysis"]["mode"], "hybrid")
+
+
+class ModeSwitchTests(TestCase):
+    def setUp(self):
+        LiveTradingState.load()
+        self.client = APIClient()
+        self.client.credentials(HTTP_X_ENGINE_TOKEN="t")
+
+    def _run(self, mode, age_minutes):
+        return AnalysisRun.objects.create(
+            status=AnalysisRun.Status.SUCCEEDED,
+            scope=AnalysisRun.Scope.UNIVERSE,
+            mode=mode,
+            started_at=timezone.now() - timedelta(minutes=age_minutes),
+        )
+
+    def _get(self):
+        with override_settings(ENGINE_API_TOKEN="t"):
+            return self.client.get("/api/live/status/mode/").json()
+
+    def _post(self, body):
+        with override_settings(ENGINE_API_TOKEN="t"):
+            return self.client.post("/api/live/status/mode/", body, format="json")
+
+    def test_stale_when_no_run_for_mode(self):
+        self._run("normal", 5)
+        data = self._get()
+        self.assertEqual(data["mode"], "normal")
+        self.assertFalse(data["analysis_stale"])
+        LiveTradingState.objects.filter(pk=1).update(mode="hybrid")
+        data = self._get()
+        self.assertTrue(data["analysis_stale"])
+        self.assertIsNone(data["latest_analysis"])
+
+    def test_stale_when_older_than_other_mode(self):
+        self._run("hybrid", 60)
+        newer = self._run("normal", 5)
+        LiveTradingState.objects.filter(pk=1).update(mode="hybrid")
+        data = self._get()
+        self.assertTrue(data["analysis_stale"])
+        self.assertEqual(data["latest_analysis"]["mode"], "hybrid")
+        self.assertNotEqual(data["latest_analysis"]["id"], str(newer.id))
+
+    def test_fresh_when_newer(self):
+        self._run("normal", 60)
+        hybrid = self._run("hybrid", 5)
+        LiveTradingState.objects.filter(pk=1).update(mode="hybrid")
+        data = self._get()
+        self.assertFalse(data["analysis_stale"])
+        self.assertEqual(data["latest_analysis"]["id"], str(hybrid.id))
+
+    @patch("apps.trading.views.enqueue_job")
+    def test_rerun_enqueues_when_stale(self, enqueue):
+        enqueue.return_value = JobRun.objects.create(job_type="daily_analysis")
+        self._run("normal", 5)
+        response = self._post({"mode": "hybrid", "confirm": True, "rerun_analysis": True})
+        self.assertEqual(response.status_code, 200, response.content)
+        enqueue.assert_called_once()
+        self.assertEqual(enqueue.call_args.kwargs["params"], {})
+        self.assertIn("job", response.json())
+
+    @patch("apps.trading.views.enqueue_job")
+    def test_rerun_skipped_when_fresh(self, enqueue):
+        self._run("normal", 60)
+        self._run("hybrid", 5)
+        response = self._post({"mode": "hybrid", "confirm": True, "rerun_analysis": True})
+        self.assertEqual(response.status_code, 200, response.content)
+        enqueue.assert_not_called()
+        self.assertNotIn("job", response.json())
+
+    def test_rerun_conflict_reported(self):
+        self._run("normal", 5)
+        JobRun.objects.create(job_type="daily_analysis", status=JobRun.Status.QUEUED)
+        response = self._post({"mode": "hybrid", "confirm": True, "rerun_analysis": True})
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertIn("job_conflict", response.json())
+        self.assertEqual(LiveTradingState.load().mode, "hybrid")
+
+    @patch("apps.trading.views.enqueue_job")
+    def test_confirmation_409_never_enqueues(self, enqueue):
+        self._run("normal", 5)
+        response = self._post({"mode": "hybrid", "rerun_analysis": True})
+        self.assertEqual(response.status_code, 409)
+        enqueue.assert_not_called()

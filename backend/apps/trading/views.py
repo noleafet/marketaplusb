@@ -5,7 +5,7 @@ from rest_framework.response import Response
 
 from apps.engine.timescale import load_equity_points
 from apps.jobs.models import JobRun
-from apps.jobs.runner import enqueue_job
+from apps.jobs.runner import JobAlreadyActive, enqueue_job
 from apps.jobs.serializers import JobRunSerializer
 from apps.trading.execution import live_status, set_kill_switch
 from apps.trading.modes import (
@@ -305,14 +305,20 @@ class LiveStatusView(viewsets.ViewSet):
                 {"detail": str(exc), "requires_confirmation": True},
                 status=status.HTTP_409_CONFLICT,
             )
-        return Response(
-            {
-                **mode_payload(state),
-                "state": LiveTradingStateSerializer(state).data,
-                "purge": purge,
-                "live": live_status(),
-            }
-        )
+        payload = {
+            **mode_payload(state),
+            "state": LiveTradingStateSerializer(state).data,
+            "purge": purge,
+            "live": live_status(),
+        }
+        if data.get("rerun_analysis") and payload["analysis_stale"]:
+            try:
+                job = enqueue_job("daily_analysis", trigger=JobRun.Trigger.MANUAL, params={})
+                payload["job"] = JobRunSerializer(job).data
+            except JobAlreadyActive as exc:
+                # The mode is already switched; only the re-run is refused.
+                payload["job_conflict"] = exc.message
+        return Response(payload)
 
 
 class LiveAuditViewSet(viewsets.ReadOnlyModelViewSet):

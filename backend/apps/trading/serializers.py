@@ -169,3 +169,4 @@ class TradingModeSerializer(serializers.Serializer):
     mode = serializers.ChoiceField(choices=LiveTradingState.Mode.choices)
     adx_enabled = serializers.BooleanField(required=False, allow_null=True, default=None)
     confirm = serializers.BooleanField(default=False)
+    rerun_analysis = serializers.BooleanField(default=False)

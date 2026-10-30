@@ -163,7 +163,12 @@ export const engineApi = {
     post<StrategySettings>('strategy/settings/', body),
   strategyValidation: () => request<StrategyValidation>('strategy/validation/'),
   marketRegime: () => request<MarketRegime>('strategy/regime/'),
-  setTradingMode: (body: { mode: TradingMode; adx_enabled?: boolean; confirm?: boolean }) =>
+  setTradingMode: (body: {
+    mode: TradingMode;
+    adx_enabled?: boolean;
+    confirm?: boolean;
+    rerun_analysis?: boolean;
+  }) =>
     post<TradingModeResponse>('live/status/mode/', body),
   requestApproval: (body: { paper_session: string; notes?: string; risk_acknowledged: boolean }) =>
     post<LiveApproval>('live/approvals/request_approval/', body),

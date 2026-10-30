@@ -62,6 +62,7 @@ const settingsSchema = z.object({
     .min(0.1, 'Must be at least 0.1.')
     .max(1, 'Must be at most 1.'),
   btc_regime_enabled: z.boolean(),
+  run_comparison_analysis: z.boolean(),
   // Percent fields below are edited as percentages and stored as fractions.
   btc_trailing_stop_pct: z
     .number({ error: requiredNumber })
@@ -107,6 +108,7 @@ function toDraft(settings: StrategySettings): SettingsDraft {
     retire_after_failed_runs: settings.retire_after_failed_runs,
     max_strategy_correlation: settings.max_strategy_correlation,
     btc_regime_enabled: settings.btc_regime_enabled,
+    run_comparison_analysis: settings.run_comparison_analysis,
     btc_trailing_stop_pct: asPercent(settings.btc_trailing_stop_pct),
     btc_trailing_window_days: settings.btc_trailing_window_days,
     btc_oi_flush_pct: asPercent(settings.btc_oi_flush_pct),
@@ -275,6 +277,15 @@ function SettingsForm({
                 <field.SwitchField
                   label='Overbought guard'
                   description='RSI/MACD/VWAP/open-interest exit on overbought tops in paper trading. On by default; not simulated by the backtest.'
+                />
+              )}
+            />
+            <form.AppField
+              name='run_comparison_analysis'
+              children={(field) => (
+                <field.SwitchField
+                  label='Run comparison analysis'
+                  description="After the active mode's analysis, also run the other mode for the comparison view."
                 />
               )}
             />

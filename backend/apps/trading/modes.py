@@ -15,7 +15,7 @@ from typing import Any
 from django.db import transaction
 from django.utils import timezone
 
-from apps.engine.models import DecisionLog, log_decision
+from apps.engine.models import AnalysisRun, DecisionLog, log_decision
 from apps.trading.models import LiveTradingState, PaperSession
 
 logger = logging.getLogger("engine")
@@ -25,9 +25,39 @@ class ModeConfirmationRequired(RuntimeError):
     pass
 
 
+def _latest_universe_run(mode: str) -> AnalysisRun | None:
+    return (
+        AnalysisRun.objects.filter(
+            status=AnalysisRun.Status.SUCCEEDED,
+            scope=AnalysisRun.Scope.UNIVERSE,
+            mode=mode,
+        )
+        .order_by("-started_at")
+        .first()
+    )
+
+
+def mode_analysis_status(mode: str) -> dict[str, Any]:
+    """Latest universe ranking for ``mode`` and whether it trails the other mode's."""
+
+    own = _latest_universe_run(mode)
+    other_mode = (
+        AnalysisRun.Mode.NORMAL if mode == AnalysisRun.Mode.HYBRID else AnalysisRun.Mode.HYBRID
+    )
+    other = _latest_universe_run(other_mode)
+    stale = own is None or (other is not None and own.started_at < other.started_at)
+    return {
+        "latest_analysis": (
+            {"id": str(own.id), "started_at": own.started_at, "mode": own.mode} if own else None
+        ),
+        "analysis_stale": stale,
+    }
+
+
 def mode_payload(state: LiveTradingState) -> dict[str, Any]:
     return {
         "mode": state.mode,
+        **mode_analysis_status(state.mode),
         "adx_enabled": bool((state.limits or {}).get("hybrid_adx")),
         "updated_at": state.updated_at,
     }

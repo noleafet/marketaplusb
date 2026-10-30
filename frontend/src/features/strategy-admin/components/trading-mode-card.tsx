@@ -13,6 +13,7 @@ import {
   AlertDialogTitle
 } from '@/components/ui/alert-dialog';
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Switch } from '@/components/ui/switch';
 import { relativeTime } from '@/features/grid/api';
@@ -31,6 +32,11 @@ export default function TradingModeCard() {
   const adxEnabled = Boolean(modeQuery.data?.adx_enabled);
   const busy = mutation.isPending || modeQuery.isLoading;
   const purge = mutation.data?.purge;
+  const analysisStale = Boolean(modeQuery.data?.analysis_stale);
+  const otherMode = hybrid ? 'normal' : 'hybrid';
+  const staleText = modeQuery.data?.latest_analysis
+    ? `The ${mode} ranking is older than the ${otherMode} ranking`
+    : `No ${mode} analysis yet`;
 
   const handleModeToggle = (checked: boolean) => {
     if (checked) {
@@ -137,6 +143,41 @@ export default function TradingModeCard() {
             </div>
           )}
 
+          {analysisStale ? (
+            <ToneNote
+              tone='warn'
+              title='Ranking may be out of date'
+              icon={<Icons.warning className='size-4' />}
+            >
+              <p>{staleText}.</p>
+              <Button
+                size='sm'
+                variant='outline'
+                className='mt-2'
+                disabled={busy}
+                onClick={() => mutation.mutate({ mode, rerun_analysis: true })}
+              >
+                Run analysis now
+              </Button>
+            </ToneNote>
+          ) : null}
+          {mutation.data?.job_conflict ? (
+            <ToneNote
+              tone='warn'
+              title='Analysis not started'
+              icon={<Icons.warning className='size-4' />}
+            >
+              {mutation.data.job_conflict}
+            </ToneNote>
+          ) : mutation.data?.job ? (
+            <ToneNote
+              tone='good'
+              title='Analysis queued'
+              icon={<Icons.shield className='size-4' />}
+            >
+              Analysis queued
+            </ToneNote>
+          ) : null}
           {mutation.isError ? (
             <ToneNote
               tone='bad'

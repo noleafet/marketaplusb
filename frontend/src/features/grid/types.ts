@@ -380,9 +380,14 @@ export interface TradingModeState {
   mode: TradingMode;
   adx_enabled: boolean;
   updated_at: string;
+  latest_analysis: { id: string; started_at: string; mode: TradingMode } | null;
+  analysis_stale: boolean;
 }
 
 export interface TradingModeResponse extends TradingModeState {
+  job?: JobRun;
+  /** Set when a requested analysis re-run was refused because one is active. */
+  job_conflict?: string;
   purge?: { sessions: number; positions: number };
   live?: LiveStatus;
 }
@@ -490,6 +495,7 @@ export interface StrategySettingsValues {
   retire_after_failed_runs: number;
   max_strategy_correlation: number;
   btc_regime_enabled: boolean;
+  run_comparison_analysis: boolean;
   btc_trailing_stop_pct: number;
   btc_trailing_window_days: number;
   btc_oi_flush_pct: number;
