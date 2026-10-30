@@ -242,7 +242,10 @@ object), `strategy_version`, `config_version`, `backfilled`.
 **GridEvent**: `id`, `time`, `type`, `environment`, `symbol`, `session_id`, `reason`, `before`,
 `after`, `strategy_version`, `config_version`, `backfilled`. A `param_change` event's `before` and
 `after` hold the changed settings; `strategy_version` is the version in force after the change.
-`kill_switch` events carry environment `live`.
+`kill_switch` events carry environment `live`. A `regime` event (symbol `BTCUSDT`, no session) is a
+BTC market regime phase change: `before.phase`, and `after.phase`, `after.reasons` and
+`after.metrics`; sessions it flattened or resumed get `pause`/`resume` events with reason
+`btc_regime`.
 
 **Live order audit**: `id`, `created_at`, `symbol`, `side`, `order_type`, `qty`, `price`, `notional`,
 `allowed`, `reason`. It holds gate attempts only (there is no live runner), and the raw exchange
