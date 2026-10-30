@@ -296,8 +296,8 @@ class StrategySettings(models.Model):
     retire_after_failed_runs = models.PositiveSmallIntegerField(default=2)
     max_strategy_correlation = models.FloatField(default=0.7)
 
-    # BTC market regime protection: BTC signals that block buys on (warning)
-    # or flatten and pause (bearish) every paper session.
+    # BTC market regime protection: in warning or bearish, every paper session
+    # stops buying and moves its sells to the nearest grid levels.
     btc_regime_enabled = models.BooleanField(default=True)
     btc_trailing_stop_pct = models.FloatField(default=0.08)
     btc_trailing_window_days = models.PositiveSmallIntegerField(default=7)

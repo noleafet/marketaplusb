@@ -388,7 +388,7 @@ function SettingsForm({
             children={(field) => (
               <field.SwitchField
                 label='BTC regime protection'
-                description='Watch BTC every paper tick: while it is in warning or bearish, every coin stops buying and moves its sells to the 2 nearest levels. Nothing is sold at market. Also applied in the backtest.'
+                description='Watch BTC every paper tick: while it is in warning or bearish, every coin stops buying and moves its sells to the 2 nearest levels. Nothing is sold at market. Also applied in the backtest. Default: on.'
               />
             )}
           />
@@ -398,7 +398,7 @@ function SettingsForm({
               children={(field) => (
                 <field.TextField
                   label='Trailing stop (%)'
-                  description='Bearish when BTC is this far below its recent high.'
+                  description='Bearish when BTC is this far below its recent high. Default: 8.'
                   type='number'
                   step={0.5}
                 />
@@ -409,7 +409,7 @@ function SettingsForm({
               children={(field) => (
                 <field.TextField
                   label='Trailing window (days)'
-                  description='How far back the recent high is measured.'
+                  description='How far back the recent high is measured. Default: 7.'
                   type='number'
                   step={1}
                 />
@@ -420,7 +420,7 @@ function SettingsForm({
               children={(field) => (
                 <field.TextField
                   label='Minimum bearish (hours)'
-                  description='Earliest recovery after turning bearish.'
+                  description='Earliest recovery after turning bearish. Default: 4.'
                   type='number'
                   step={0.5}
                 />
@@ -431,7 +431,7 @@ function SettingsForm({
               children={(field) => (
                 <field.TextField
                   label='Open-interest flush (%)'
-                  description='Bearish when 1h OI drops this much over 6 hours…'
+                  description='Bearish when 1h OI drops this much over 6 hours… Default: 5.'
                   type='number'
                   step={0.5}
                 />
@@ -442,7 +442,7 @@ function SettingsForm({
               children={(field) => (
                 <field.TextField
                   label='Near 24h high (%)'
-                  description='…while BTC is within this distance of its 24h high.'
+                  description='…while BTC is within this distance of its 24h high. Default: 3.'
                   type='number'
                   step={0.5}
                 />
@@ -453,7 +453,7 @@ function SettingsForm({
               children={(field) => (
                 <field.TextField
                   label='Funding crowding (z)'
-                  description='Warning when funding is this extreme and momentum fades.'
+                  description='Warning when funding is this extreme and momentum fades. Default: 2.'
                   type='number'
                   step={0.1}
                 />
