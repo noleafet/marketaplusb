@@ -273,6 +273,43 @@ def _parse(value: Any) -> datetime | None:
     return parsed.astimezone(dt_timezone.utc)
 
 
+def recovery_checks(
+    snapshot: RiskSnapshot,
+    since: datetime | None,
+    config: Mapping[str, Any],
+    now: datetime,
+) -> dict[str, bool]:
+    """Each recovery check for a pause that started at ``since``."""
+
+    cooldown = timedelta(minutes=float(config["RECOVERY_COOLDOWN_MINUTES"]))
+    if snapshot.oi_available and len(snapshot.oi_values) >= 2:
+        oi_ok = snapshot.oi_values[-1] > snapshot.oi_values[-2]
+    else:
+        failsafe = timedelta(minutes=float(config["OI_FAILSAFE_MINUTES"]))
+        oi_ok = since is not None and now - since >= failsafe
+    return {
+        "cooled": since is None or now - since >= cooldown,
+        "rsi": (
+            snapshot.rsi is not None
+            and snapshot.rsi > float(config["RSI_RECOVERY"])
+            and (snapshot.rsi_prev is None or snapshot.rsi > snapshot.rsi_prev)
+        ),
+        "vwap": snapshot.vwap is not None and snapshot.close > snapshot.vwap,
+        "open_interest": oi_ok,
+    }
+
+
+def recovery_ok(
+    snapshot: RiskSnapshot,
+    since: datetime | None,
+    config: Mapping[str, Any],
+    now: datetime,
+) -> bool:
+    """True when a pause that started at ``since`` may end."""
+
+    return all(recovery_checks(snapshot, since, config, now).values())
+
+
 def evaluate(
     state: Mapping[str, Any] | None,
     snapshot: RiskSnapshot,
@@ -299,21 +336,7 @@ def evaluate(
         return RiskDecision(state=current, action=action, reason=reason)
 
     if phase == "paused":
-        paused_at = _parse(current.get("paused_at"))
-        cooldown = timedelta(minutes=float(config["RECOVERY_COOLDOWN_MINUTES"]))
-        cooled = paused_at is None or now - paused_at >= cooldown
-        rsi_ok = (
-            snapshot.rsi is not None
-            and snapshot.rsi > float(config["RSI_RECOVERY"])
-            and (snapshot.rsi_prev is None or snapshot.rsi > snapshot.rsi_prev)
-        )
-        vwap_ok = snapshot.vwap is not None and snapshot.close > snapshot.vwap
-        if snapshot.oi_available and len(snapshot.oi_values) >= 2:
-            oi_ok = snapshot.oi_values[-1] > snapshot.oi_values[-2]
-        else:
-            failsafe = timedelta(minutes=float(config["OI_FAILSAFE_MINUTES"]))
-            oi_ok = paused_at is not None and now - paused_at >= failsafe
-        if cooled and rsi_ok and vwap_ok and oi_ok:
+        if recovery_ok(snapshot, _parse(current.get("paused_at")), config, now):
             return finish(
                 "resume",
                 "recovery_confirmed",
