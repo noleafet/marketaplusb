@@ -247,6 +247,72 @@ def _analysis_lock():
             cursor.execute("SELECT pg_advisory_unlock(%s)", [ANALYSIS_LOCK_KEY])
 
 
+def _bootstrap_paper_sessions(
+    analysis: AnalysisRun,
+    ranked: list[dict[str, Any]],
+    strategy_settings,
+    job_run_id=None,
+) -> None:
+    """Retire stale paper sessions and open the selected candidates."""
+
+    from apps.trading.models import MarketRegimeState
+    from apps.trading.paper import ensure_paper_sessions, retire_stale_sessions
+    from apps.trading.portfolio import open_symbols
+
+    candidates = [
+        item
+        for item in ranked
+        if item.get("eligible") and item.get("suitability") in {"prime", "viable"}
+    ]
+    if analysis.scope == AnalysisRun.Scope.UNIVERSE:
+        analysis.summary["paper_retired"] = retire_stale_sessions(
+            analysis, candidates, strategy_settings
+        )
+    # A bearish BTC regime would flatten a new session on the next tick, so
+    # none is opened; ranking and reports are unaffected. In warning, sessions
+    # open normally and the tick keeps their buys blocked.
+    regime = MarketRegimeState.load()
+    if strategy_settings.btc_regime_enabled and regime.phase == MarketRegimeState.Phase.BEARISH:
+        analysis.summary["paper_blocked_by_regime"] = True
+        analysis.summary["paper_sessions_created"] = 0
+        analysis.summary["paper_symbols"] = []
+        log_decision(
+            "paper",
+            "BTC market regime is bearish; no new paper sessions opened "
+            f"({len(candidates)} candidate(s) ranked).",
+            severity="warning",
+            analysis=analysis,
+            job_run_id=job_run_id,
+            payload={"regime_reasons": list(regime.reasons or []), "candidates": len(candidates)},
+        )
+        return
+    held = open_symbols()
+    slots = max(0, int(strategy_settings.max_sessions) - len(held))
+    selected, skipped = select_diversified(
+        [item for item in candidates if item["coin"].symbol not in held],
+        max_corr=float(strategy_settings.max_strategy_correlation),
+        limit=slots,
+        existing=held,
+    )
+    sessions = ensure_paper_sessions(analysis, selected)
+    analysis.summary["paper_sessions_created"] = len(sessions)
+    analysis.summary["paper_symbols"] = [s.coin.symbol for s in sessions]
+    analysis.summary["paper_skipped_correlation"] = skipped
+    if skipped:
+        log_decision(
+            "paper",
+            "Correlation filter skipped duplicate paper candidates: "
+            + ", ".join(
+                f"{row['symbol']} ({row['correlation']:.2f} with {row['correlated_with']})"
+                for row in skipped
+            ),
+            severity="warning",
+            analysis=analysis,
+            job_run_id=job_run_id,
+            payload={"skipped": skipped},
+        )
+
+
 def run_daily_analysis(
     *,
     trigger: str = "scheduled",
@@ -776,44 +842,7 @@ def _run_daily_analysis(
 
     if not hybrid:
         try:
-            from apps.trading.paper import ensure_paper_sessions, retire_stale_sessions
-            from apps.trading.portfolio import open_symbols
-
-            candidates = [
-                item
-                for item in ranked
-                if item.get("eligible")
-                and item.get("suitability") in {"prime", "viable"}
-            ]
-            if analysis.scope == AnalysisRun.Scope.UNIVERSE:
-                analysis.summary["paper_retired"] = retire_stale_sessions(
-                    analysis, candidates, strategy_settings
-                )
-            held = open_symbols()
-            slots = max(0, int(strategy_settings.max_sessions) - len(held))
-            selected, skipped = select_diversified(
-                [item for item in candidates if item["coin"].symbol not in held],
-                max_corr=float(strategy_settings.max_strategy_correlation),
-                limit=slots,
-                existing=held,
-            )
-            sessions = ensure_paper_sessions(analysis, selected)
-            analysis.summary["paper_sessions_created"] = len(sessions)
-            analysis.summary["paper_symbols"] = [s.coin.symbol for s in sessions]
-            analysis.summary["paper_skipped_correlation"] = skipped
-            if skipped:
-                log_decision(
-                    "paper",
-                    "Correlation filter skipped duplicate paper candidates: "
-                    + ", ".join(
-                        f"{row['symbol']} ({row['correlation']:.2f} with {row['correlated_with']})"
-                        for row in skipped
-                    ),
-                    severity="warning",
-                    analysis=analysis,
-                    job_run_id=job_run_id,
-                    payload={"skipped": skipped},
-                )
+            _bootstrap_paper_sessions(analysis, ranked, strategy_settings, job_run_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Paper session bootstrap failed")
             analysis.summary["paper_session_error"] = str(exc)

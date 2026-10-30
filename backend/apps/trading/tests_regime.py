@@ -3,7 +3,7 @@
 import math
 from datetime import datetime, timedelta, timezone as dt_timezone
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from django.db import IntegrityError, transaction
 from django.test import TestCase, override_settings
@@ -579,3 +579,91 @@ class RegimeControllerTests(TestCase):
         self.assertEqual(
             buy_block_reason({"exposure": 99.0}, row, "bearish"), "book_exposure_cap"
         )
+
+
+class RegimeAnalysisTests(TestCase):
+    """The daily analysis opens no paper sessions while BTC is bearish."""
+
+    def setUp(self):
+        from apps.engine.models import AnalysisRun
+        from apps.trading.tests import make_coin
+
+        self.analysis = AnalysisRun.objects.create(
+            status=AnalysisRun.Status.RUNNING, scope=AnalysisRun.Scope.UNIVERSE, summary={}
+        )
+        self.coin = make_coin("ETH", "ETHUSDT")
+        self.ranked = [
+            {
+                "coin": self.coin,
+                "eligible": True,
+                "suitability": "prime",
+                "params": {"grid_levels": 10, "initial_inventory_pct": 0.5},
+            }
+        ]
+
+    def set_phase(self, phase):
+        state = MarketRegimeState.load()
+        state.phase = phase
+        state.reasons = ["trailing_stop"] if phase == "bearish" else ["guard_armed"]
+        state.save()
+
+    def bootstrap(self):
+        from apps.engine.analysis import _bootstrap_paper_sessions
+
+        _bootstrap_paper_sessions(self.analysis, self.ranked, StrategySettings.load())
+
+    def test_no_new_sessions_while_bearish(self):
+        from apps.engine.models import DecisionLog
+
+        self.set_phase("bearish")
+        self.bootstrap()
+        self.assertFalse(PaperSession.objects.exists())
+        self.assertTrue(self.analysis.summary["paper_blocked_by_regime"])
+        self.assertEqual(self.analysis.summary["paper_sessions_created"], 0)
+        self.assertTrue(
+            DecisionLog.objects.filter(message__contains="BTC market regime is bearish").exists()
+        )
+
+    def test_sessions_open_when_regime_disabled_even_if_stored_bearish(self):
+        self.set_phase("bearish")
+        row = StrategySettings.load()
+        row.btc_regime_enabled = False
+        row.save()
+        self.bootstrap()
+        self.assertEqual(PaperSession.objects.count(), 1)
+        self.assertNotIn("paper_blocked_by_regime", self.analysis.summary)
+
+    def test_session_created_in_warning_cannot_buy(self):
+        from apps.trading.paper import _tick_session
+
+        self.set_phase("warning")
+        self.bootstrap()
+        session = PaperSession.objects.select_related("coin").get()
+        self.assertGreater(session.params["initial_inventory_pct"], 0)
+
+        now = datetime.now(dt_timezone.utc)
+        hist = [
+            {
+                "time": now - timedelta(hours=200 - i),
+                "open": 100.0,
+                "high": 100.5,
+                "low": 99.5,
+                "close": 100.0,
+            }
+            for i in range(200)
+        ]
+        client = MagicMock()
+        client.funding_rates.return_value = []
+        with patch("apps.trading.paper._fetch_hist", return_value=hist), patch(
+            "apps.trading.paper._fetch_price", return_value=100.0
+        ), patch("apps.trading.paper.insert_equity_points", return_value=1), patch(
+            "apps.trading.paper._apply_overbought_guard", return_value=None
+        ):
+            result = _tick_session(
+                session, client, now, StrategySettings.load(), "btc_regime_warning"
+            )
+        self.assertTrue(result["ok"], result)
+        session.refresh_from_db()
+        self.assertAlmostEqual(session.position_qty, 0.0)
+        self.assertFalse(session.fills.filter(side="buy").exists())
+        self.assertFalse(session.grid_state.get("allow_buys", True))

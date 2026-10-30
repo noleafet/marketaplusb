@@ -556,6 +556,7 @@ class IncrementalGridStrategy:
             self.params.initial_inventory_pct <= 0
             or self.adapter.position_qty > 0
             or self.trend_blocked
+            or self.portfolio_blocked
             or price <= 0
         ):
             return
