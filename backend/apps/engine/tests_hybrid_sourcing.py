@@ -54,7 +54,7 @@ class FieldTests(TestCase):
 
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from django.utils import timezone
 
@@ -152,6 +152,31 @@ class StoredGateTests(TestCase):
         analysis._sync_window(coin, object(), "1h", lookback_days=520, warmup_days=45)
         return sync.call_args
 
+    def _gate_with_15m_from(self, start_15m, *, lookback_days, rows_start=None):
+        now = timezone.now()
+        h = timedelta(hours=1)
+        m = timedelta(minutes=15)
+        end_h = _floor(now, h) - h
+        end_m = _floor(now, m) - m
+        h_count = (lookback_days + analysis.HYBRID_WARMUP_DAYS + 2) * 24
+        upsert_candles("AAAUSDT", "1h", _bars(end_h - h * h_count, h_count + 1, h))
+        m_count = int((end_m - start_15m) / m)
+        upsert_candles("AAAUSDT", "15m", _bars(end_m - m * m_count, m_count + 1, m))
+        four = timedelta(hours=4)
+        rows_start = rows_start or (end_h - four * 299)
+        rows = _bars(rows_start, int((end_h - rows_start) / four) + 1, four)
+        return analysis._build_hybrid_gate(
+            "AAAUSDT", rows, lookback_days=lookback_days, adx_enabled=False)
+
+    def test_15m_covering_only_recent_half_returns_none(self):
+        start = timezone.now() - timedelta(days=20)
+        self.assertIsNone(self._gate_with_15m_from(start, lookback_days=30))
+
+    def test_young_coin_covered_from_its_first_base_bar(self):
+        listed = _floor(timezone.now() - timedelta(days=15), timedelta(hours=1))
+        gate = self._gate_with_15m_from(listed, lookback_days=30, rows_start=listed)
+        self.assertIsNotNone(gate)
+
     @patch("apps.engine.analysis.sync_coin_market_data")
     def test_sync_window_forces_backfill_when_history_short(self, sync):
         call = self._window(sync, 30)
@@ -167,6 +192,41 @@ class StoredGateTests(TestCase):
     @patch("apps.engine.analysis.sync_coin_market_data")
     def test_sync_window_forces_when_nothing_stored(self, sync):
         self.assertIs(self._window(sync, None).kwargs["force"], True)
+
+    @patch("apps.engine.analysis.sync_coin_market_data")
+    def test_sync_window_young_coin_is_incremental(self, sync):
+        # Listed 30 days ago: base and 1h history both start at the listing.
+        listed = _floor(timezone.now(), timedelta(hours=1)) - timedelta(days=30)
+        upsert_candles("BBBUSDT", "1h", _bars(listed, 24, timedelta(hours=1)))
+        analysis._sync_window(
+            SimpleNamespace(binance_symbol="BBBUSDT"), object(), "1h",
+            lookback_days=520, warmup_days=45, floor=listed,
+        )
+        self.assertIs(sync.call_args.kwargs["force"], False)
+
+    @patch("apps.engine.analysis.sync_coin_market_data")
+    def test_sync_window_passes_funding_flag(self, sync):
+        self.assertIs(self._window(sync, 700).kwargs["funding"], True)
+        analysis._sync_window(
+            SimpleNamespace(binance_symbol="BBBUSDT"), object(), "1h",
+            lookback_days=520, warmup_days=45, funding=False,
+        )
+        self.assertIs(sync.call_args.kwargs["funding"], False)
+
+    def test_sync_without_funding_skips_funding_fetch(self):
+        from apps.engine.binance_sync import sync_coin_market_data
+
+        client = MagicMock()
+        client.klines_range.return_value = []
+        coin = SimpleNamespace(binance_symbol="CCCUSDT")
+        result = sync_coin_market_data(
+            coin, client, lookback_days=10, interval="1h", warmup_days=1, funding=False)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["funding_added"], 0)
+        client.funding_rates.assert_not_called()
+        client.funding_rates.return_value = []
+        sync_coin_market_data(coin, client, lookback_days=10, interval="1h", warmup_days=1)
+        client.funding_rates.assert_called_once()
 
 
 from contextlib import ExitStack
@@ -205,6 +265,7 @@ class RunBehaviourTests(TestCase):
         self.rows = _bars(end - timedelta(hours=4 * 299), 300, timedelta(hours=4))
         self.gate = Gate(allow={r["time"]: True for r in self.rows}, exit={})
         self.gates = {"AAAUSDT": self.gate, "BBBUSDT": self.gate}
+        self.candles = {}
 
     def _run(self, *, extra=(), **kwargs):
         with ExitStack() as stack:
@@ -214,7 +275,12 @@ class RunBehaviourTests(TestCase):
             p("BinanceFuturesClient")
             self.sync = p("sync_coin_market_data", return_value={"ok": True})
             self.sync_window = p("_sync_window", return_value={"ok": True})
-            p("load_candles", side_effect=lambda *a, **k: list(self.rows))
+            p(
+                "load_candles",
+                side_effect=lambda symbol, interval, *a, **k: list(
+                    self.candles.get(interval, self.rows)
+                ),
+            )
             p("load_funding", return_value=[])
             p("compute_features", return_value={})
             p("analysis_workers", return_value=1)
@@ -317,6 +383,61 @@ class RunBehaviourTests(TestCase):
         for call in self.sync.call_args_list:
             self.assertEqual(call.kwargs["interval"], run.params["interval"])
             self.assertEqual(call.kwargs["lookback_days"], lookback)
+
+    def test_gate_syncs_skip_funding_and_floor_at_base_history(self):
+        floor = self.rows[0]["time"]
+        earliest = MagicMock(return_value=floor)
+        run = self._run(
+            trend_mode=AnalysisRun.Mode.HYBRID,
+            extra=[("earliest_candle_time", {"new": earliest})],
+        )
+        self.assertEqual(len(self.sync_window.call_args_list), 4)
+        for call in self.sync_window.call_args_list:
+            self.assertIs(call.kwargs["funding"], False)
+            self.assertEqual(call.kwargs["floor"], floor)
+        self.assertEqual(
+            sorted(c.args for c in earliest.call_args_list),
+            [("AAAUSDT", run.params["interval"]), ("BBBUSDT", run.params["interval"])],
+        )
+        # The base-interval sync still brings funding.
+        for call in self.sync.call_args_list:
+            self.assertNotIn("funding", call.kwargs)
+
+    def test_regime_sync_keeps_funding(self):
+        row = StrategySettings.load()
+        row.btc_regime_enabled = True
+        row.save()
+        sync_window = MagicMock(return_value={"ok": True})
+        with patch.object(analysis, "_sync_window", sync_window), patch.object(
+            analysis, "latest_candle_time", return_value=None
+        ):
+            analysis._regime_timeline(
+                object(), row, lookback_days=10, warmup_days=5, sync=True)
+        self.assertEqual(sync_window.call_count, 2)
+        for call in sync_window.call_args_list:
+            self.assertNotIn("funding", call.kwargs)
+            self.assertNotIn("floor", call.kwargs)
+
+    def test_partial_15m_history_excludes_coin(self):
+        real_gate = analysis._build_hybrid_gate
+        now = timezone.now()
+        h, m = timedelta(hours=1), timedelta(minutes=15)
+        end_h = _floor(now, h) - h
+        end_m = _floor(now, m) - m
+        start_h = self.rows[0]["time"] - timedelta(days=2)
+        self.candles = {
+            "1h": _bars(start_h, int((end_h - start_h) / h) + 1, h),
+            # Only the most recent 20 days of 15m bars are stored.
+            "15m": _bars(end_m - m * 96 * 20, 96 * 20 + 1, m),
+        }
+        run = self._run(
+            trend_mode=AnalysisRun.Mode.HYBRID,
+            extra=[("_build_hybrid_gate", {"side_effect": real_gate})],
+        )
+        self.assertEqual(run.summary["hybrid_coverage"], {"coins": 2, "covered": 0})
+        for row in CoinAnalysis.objects.filter(analysis=run):
+            self.assertFalse(row.eligible)
+            self.assertTrue(row.exclusion_reason.startswith("hybrid trend data unavailable"))
 
     def test_normal_run_syncs_base_interval_only(self):
         self._run(trend_mode=AnalysisRun.Mode.NORMAL)
@@ -672,3 +793,90 @@ class ModeSwitchTests(TestCase):
         response = self._post({"mode": "hybrid", "rerun_analysis": True})
         self.assertEqual(response.status_code, 409)
         enqueue.assert_not_called()
+
+
+def _score_stub(results, **kwargs):
+    """Rank every gated coin as prime with marked params."""
+
+    rank = 0
+    for item in results:
+        gated = not item["exclusion_reason"].startswith("hybrid trend")
+        item["eligible"] = gated
+        item["suitability"] = "prime" if gated else "ineligible"
+        if gated:
+            rank += 1
+            item["rank"] = rank
+            item["score"] = 1.0
+            item["exclusion_reason"] = ""
+            item["params"] = {"grid_levels": 9, "source": f"hybrid-{item['coin'].symbol}"}
+    return results
+
+
+class HybridBootstrapTests(TestCase):
+    """A universe hybrid run driving sessions through the real bootstrap."""
+
+    setUp = RunBehaviourTests.setUp
+    _run = RunBehaviourTests._run
+
+    def _drive(self):
+        real = analysis._bootstrap_paper_sessions
+        with patch("apps.trading.paper.retire_stale_sessions", return_value=[]) as retire, patch(
+            "apps.trading.paper.ensure_paper_sessions", return_value=[]
+        ) as ensure:
+            run = self._run(
+                trend_mode=AnalysisRun.Mode.HYBRID,
+                drives_sessions=True,
+                extra=[
+                    ("_bootstrap_paper_sessions", {"side_effect": real}),
+                    ("score_results", {"side_effect": _score_stub}),
+                ],
+            )
+        self.assertNotIn("paper_session_error", run.summary)
+        return run, retire, ensure
+
+    @staticmethod
+    def _symbols(items):
+        return [item["coin"].symbol for item in items]
+
+    def test_universe_hybrid_run_feeds_its_candidates_to_sessions(self):
+        run, retire, ensure = self._drive()
+        self.assertEqual(run.scope, AnalysisRun.Scope.UNIVERSE)
+        self.assertTrue(run.drives_sessions)
+        retire.assert_called_once()
+        self.assertEqual(retire.call_args.args[0].id, run.id)
+        self.assertEqual(self._symbols(retire.call_args.args[1]), ["AAA", "BBB"])
+        for item in retire.call_args.args[1]:
+            self.assertEqual(item["params"]["source"], f"hybrid-{item['coin'].symbol}")
+        ensure.assert_called_once()
+        self.assertEqual(ensure.call_args.args[0].id, run.id)
+        selected = ensure.call_args.args[1]
+        self.assertEqual(self._symbols(selected), ["AAA", "BBB"])
+        for item in selected:
+            self.assertEqual(item["params"]["source"], f"hybrid-{item['coin'].symbol}")
+            self.assertEqual(item["suitability"], "prime")
+
+    def test_half_coverage_still_retires(self):
+        self.gates = {"AAAUSDT": self.gate}
+        run, retire, ensure = self._drive()
+        self.assertEqual(run.summary["hybrid_coverage"], {"coins": 2, "covered": 1})
+        retire.assert_called_once()
+        self.assertEqual(self._symbols(retire.call_args.args[1]), ["AAA"])
+        self.assertFalse(
+            DecisionLog.objects.filter(message__contains="retirement skipped").exists()
+        )
+
+    def test_low_coverage_skips_retirement_but_opens_covered(self):
+        Coin.objects.create(
+            coingecko_id="ccc", symbol="CCC", name="CCC", rank=3,
+            binance_symbol="CCCUSDT", analysis_eligible=True, in_top100=True,
+        )
+        self.gates = {"AAAUSDT": self.gate}
+        run, retire, ensure = self._drive()
+        self.assertEqual(run.summary["hybrid_coverage"], {"coins": 3, "covered": 1})
+        retire.assert_not_called()
+        self.assertEqual(self._symbols(ensure.call_args.args[1]), ["AAA"])
+        log = DecisionLog.objects.get(message__contains="retirement skipped")
+        self.assertEqual(log.category, "analysis")
+        self.assertEqual(log.severity, "warning")
+        self.assertEqual(log.payload["covered"], 1)
+        self.assertEqual(log.payload["coins"], 3)

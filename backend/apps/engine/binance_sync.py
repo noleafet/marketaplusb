@@ -26,6 +26,7 @@ def sync_coin_market_data(
     interval: str,
     warmup_days: int = 45,
     force: bool = False,
+    funding: bool = True,
 ) -> dict[str, Any]:
     symbol = coin.binance_symbol
     if not symbol:
@@ -46,13 +47,16 @@ def sync_coin_market_data(
         candles_added = upsert_candles(symbol, interval, rows)
 
     funding_added = 0
-    funding_latest = latest_funding_time(symbol)
-    funding_start = max(start, funding_latest + timedelta(seconds=1)) if funding_latest else start
-    if force:
-        funding_start = start
-    if funding_start <= now:
-        funding = client.funding_rates(symbol, funding_start, now)
-        funding_added = upsert_funding(symbol, funding)
+    if funding:
+        funding_latest = latest_funding_time(symbol)
+        funding_start = (
+            max(start, funding_latest + timedelta(seconds=1)) if funding_latest else start
+        )
+        if force:
+            funding_start = start
+        if funding_start <= now:
+            funding_rows = client.funding_rates(symbol, funding_start, now)
+            funding_added = upsert_funding(symbol, funding_rows)
 
     return {
         "ok": True,

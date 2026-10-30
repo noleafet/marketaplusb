@@ -200,14 +200,21 @@ def _sync_window(
     *,
     lookback_days: int,
     warmup_days: int,
+    floor: datetime | None = None,
+    funding: bool = True,
 ) -> dict[str, Any]:
     """Sync ``coin``'s ``interval`` candles over lookback + warm-up days.
 
     The sync is incremental from the newest stored candle, so history stored
-    for a shorter window is back-filled once with a full fetch.
+    for a shorter window is back-filled once with a full fetch. ``floor`` is
+    the earliest history the coin can have (its first base-interval candle),
+    so a coin listed inside the window is not refetched on every run.
+    ``funding`` is passed through to the sync.
     """
 
     start = timezone.now() - timedelta(days=lookback_days + warmup_days)
+    if floor is not None:
+        start = max(start, floor)
     earliest = earliest_candle_time(coin.binance_symbol, interval)
     return sync_coin_market_data(
         coin,
@@ -216,6 +223,7 @@ def _sync_window(
         interval=interval,
         warmup_days=warmup_days,
         force=earliest is None or earliest > start + timedelta(days=1),
+        funding=funding,
     )
 
 
@@ -226,7 +234,11 @@ def _build_hybrid_gate(
     lookback_days: int,
     adx_enabled: bool,
 ) -> Gate | None:
-    """Hybrid 1h/15m trend gate covering the simulation window."""
+    """Hybrid 1h/15m trend gate covering the simulation window.
+
+    None when either interval's stored history starts more than a day after
+    the window (or the coin's first base bar, for a younger coin).
+    """
 
     if not symbol:
         return None
@@ -234,6 +246,10 @@ def _build_hybrid_gate(
     start = end - timedelta(days=lookback_days + HYBRID_WARMUP_DAYS)
     klines_1h = _closed(load_candles(symbol, "1h", start, end), "1h", end)
     klines_15m = _closed(load_candles(symbol, "15m", start, end), "15m", end)
+    required = max(start, rows[0]["time"]) if rows else start
+    latest_first = required + timedelta(days=1)
+    if any(not bars or bars[0]["time"] > latest_first for bars in (klines_1h, klines_15m)):
+        return None
     gate = build_gate(rows, klines_1h, klines_15m, adx_enabled=adx_enabled)
     return gate if gate.allow else None
 
@@ -359,7 +375,27 @@ def _bootstrap_paper_sessions(
         for item in ranked
         if item.get("eligible") and item.get("suitability") in {"prime", "viable"}
     ]
-    if analysis.scope == AnalysisRun.Scope.UNIVERSE:
+    coverage = (
+        (analysis.summary or {}).get("hybrid_coverage") or {}
+        if analysis.mode == AnalysisRun.Mode.HYBRID
+        else {}
+    )
+    coins = int(coverage.get("coins") or 0)
+    covered = int(coverage.get("covered") or 0)
+    low_coverage = coins > 0 and covered / coins < 0.5
+    if analysis.scope == AnalysisRun.Scope.UNIVERSE and low_coverage:
+        # A 1h/15m data outage must not count as a failed run for open
+        # sessions; candidates that were covered still open below.
+        log_decision(
+            "analysis",
+            "Paper session retirement skipped: hybrid trend data covered only "
+            f"{covered} of {coins} coin(s).",
+            severity="warning",
+            analysis=analysis,
+            job_run_id=job_run_id,
+            payload={"covered": covered, "coins": coins},
+        )
+    elif analysis.scope == AnalysisRun.Scope.UNIVERSE:
         analysis.summary["paper_retired"] = retire_stale_sessions(
             analysis, candidates, strategy_settings
         )
@@ -659,6 +695,9 @@ def _run_daily_analysis(
             if hybrid:
                 # The trend gate reads stored 1h/15m candles over the window
                 # _build_hybrid_gate uses.
+                # The base sync above already brought funding; a coin listed
+                # inside the window is floored at its first base candle.
+                base_floor = earliest_candle_time(coin.binance_symbol, interval)
                 for gate_interval in ("1h", "15m"):
                     try:
                         gate_sync = _sync_window(
@@ -667,6 +706,8 @@ def _run_daily_analysis(
                             gate_interval,
                             lookback_days=lookback_days,
                             warmup_days=HYBRID_WARMUP_DAYS,
+                            floor=base_floor,
+                            funding=False,
                         )
                         if not gate_sync.get("ok"):
                             data_errors.append(
