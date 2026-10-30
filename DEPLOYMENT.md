@@ -332,6 +332,9 @@ minutes, paper evaluation every 6 hours.
 - **Storage:** 1 GB is enough for the default 40-symbol, 520-day history. Raising
   `ENGINE_SYMBOL_LIMIT` and `ENGINE_LOOKBACK_DAYS` together multiplies the candle volume; watch
   the add-on's storage usage.
+- **First hybrid run.** The first hybrid analysis back-fills 1h and 15m candles over the full
+  lookback for every eligible coin (about 2,300+ Binance requests, several minutes); later runs
+  sync incrementally. `market/candles` ETL extracts grow by the same volume.
 
 If you would rather use Neon for the database, set `DATABASE_URL` to the Neon direct connection
 string with `?sslmode=require` and `DB_CONN_MAX_AGE=0`. The always-on worker keeps Neon awake, so

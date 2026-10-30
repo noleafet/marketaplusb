@@ -191,8 +191,6 @@ class DashboardSummaryView(viewsets.ViewSet):
             .order_by("-started_at")
             .first()
         )
-        if comparison_run is not None and run is not None and comparison_run.id == run.id:
-            comparison_run = None
         results = (
             run.coin_results.select_related("coin").order_by("rank", "-score")[:10]
             if run

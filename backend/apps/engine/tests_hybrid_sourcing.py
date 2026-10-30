@@ -47,7 +47,8 @@ class FieldTests(TestCase):
         for run in (drove, solo, hyb, old):
             run.refresh_from_db()
         self.assertTrue(drove.drives_sessions)
-        self.assertFalse(solo.drives_sessions)
+        # Normal solo job runs bootstrapped sessions too.
+        self.assertTrue(solo.drives_sessions)
         self.assertFalse(hyb.drives_sessions)
         self.assertFalse(old.drives_sessions)
 
@@ -642,7 +643,7 @@ class CurrentRunTests(TestCase):
             self.assertEqual(body["analysis"]["id"], str(run.id))
             self.assertEqual([row["analysis"] for row in body["ic_history"]], [str(run.id)])
 
-    def test_dashboard_never_repeats_primary_as_comparison(self):
+    def test_dashboard_comparison_when_only_other_mode_ran(self):
         AnalysisRun.objects.all().delete()
         AnalysisRun.objects.create(
             status=AnalysisRun.Status.SUCCEEDED,
@@ -655,7 +656,7 @@ class CurrentRunTests(TestCase):
         with override_settings(ENGINE_API_TOKEN="t"):
             engine = client.get("/api/engine/dashboard/").json()["engine"]
         # latest_analysis never falls back across modes, so the primary is empty
-        # and the other mode's run is shown only as the comparison, never twice.
+        # and the other mode's run is shown as the comparison.
         self.assertIsNone(engine["latest_analysis"])
         self.assertEqual(engine["latest_comparison_analysis"]["mode"], "hybrid")
 

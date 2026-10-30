@@ -205,7 +205,7 @@ data and finish much later, so page and watermark on `finished_at`, never `as_of
 `timeframe`, `trigger`, `mode`, `scope`, `drives_sessions`, `strategy_version`,
 `config_version`, `data_start`, `data_end`, `data_cutoff`, `holdout_start`, `in_sample`,
 `out_of_sample` (MetricsBlocks), `score`, `rank`, `suitability`, `eligible`,
-`exclusion_reason`, `component_scores`, `trade_sample`, `created_at`. `drives_sessions` (boolean) is true on the run that opened and retired paper
+`exclusion_reason`, `component_scores`, `trade_sample`, `created_at`. `drives_sessions` (boolean) is true on the run that opened (and, for universe runs, retired) paper
 sessions. `trade_sample` is a sample, not the full trade list. Completeness: detail
 `{"is_partial", "run_status", "trade_sample_is_complete": false}`; list
 `{"partial_run_ids", "trade_sample_is_complete": false}`, where `partial_run_ids` covers only the

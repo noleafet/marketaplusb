@@ -6,7 +6,7 @@ from django.db import migrations, models
 def backfill_drives_sessions(apps, schema_editor):
     AnalysisRun = apps.get_model("engine", "AnalysisRun")
     AnalysisRun.objects.filter(
-        mode="normal", scope="universe", summary__has_key="paper_sessions_created"
+        mode="normal", summary__has_key="paper_sessions_created"
     ).update(drives_sessions=True)
 
 

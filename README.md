@@ -467,6 +467,7 @@ browser.
 | POST | `/api/live/approvals/request_approval/` | Request approval for a promotion-ready session |
 | POST | `/api/live/approvals/{id}/approve/` · `/revoke/` | Review approval |
 | POST | `/api/live/status/kill-switch/` | Engage/release the kill switch |
+| GET · POST | `/api/live/status/mode/` | Trading mode: POST `mode` (`normal`/`hybrid`), optional `adx_enabled`, `confirm` (required to switch to hybrid), `rerun_analysis`; returns `latest_analysis`, `analysis_stale`, and `job` or `job_conflict` when a rerun was requested |
 | GET | `/api/jobs/summary/` · `/runs/` · `/schedules/` | Queue and schedule state |
 | POST | `/api/jobs/runs/run/` | Queue a job: `{"job_type": "...", "params": {}}` |
 | POST | `/api/jobs/runs/{id}/cancel/` | Cancel a queued job |
