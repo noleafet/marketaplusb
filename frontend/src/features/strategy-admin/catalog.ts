@@ -649,24 +649,24 @@ export const STRATEGY_SECTIONS: CatalogSection[] = [
         rows: [
           {
             name: 'Warning',
-            value: 'buys blocked',
+            value: 'block + near sells',
             tone: 'warn',
             detail:
-              'BTC 15m RSI above 75 (guard armed), or funding z ≥ 2 over 90 prints while 10-day momentum is negative or the trend is not up. Open positions are kept.'
+              'BTC 15m RSI above 75 (guard armed), or funding z ≥ 2 over 90 prints while 10-day momentum is negative or the trend is not up. New buys stop and inventory is offered on the 2 nearest sell levels.'
           },
           {
             name: 'Bearish',
-            value: 'flatten + pause',
+            value: 'block + near sells',
             tone: 'bad',
             detail:
-              'Guard trailing or OI-flush exit (its momentum-decay exit only ends the warning), BTC 8% below its 7-day high, 1h open interest down 5% over 6 hours within 3% of the 24h high, or a 1h close below 30-day support minus 0.25 ATR. Every active session is sold to USDT and paused.'
+              'Guard trailing or OI-flush exit (its momentum-decay exit only ends the warning), BTC 8% below its 7-day high, 1h open interest down 5% over 6 hours within 3% of the 24h high, or a 1h close below 30-day support minus 0.25 ATR. Same effect as warning: nothing is sold at market and no session is paused.'
           },
           {
             name: 'Recovery',
             value: '≥ 4h',
             tone: 'good',
             detail:
-              'Guard recovery checks, back above support, inside the trailing stop, no OI flush, and at least 4 hours bearish. Only sessions the regime paused resume.'
+              'Guard recovery checks, back above support, inside the trailing stop, no OI flush, and at least 4 hours bearish. The full sell ladder and buying return in normal.'
           },
           {
             name: 'Backtest',

@@ -324,7 +324,7 @@ equity point before the cutoff, guarding against look-ahead bias.
 | Fill model | trade-through 2 bps | Used by backtest and paper; the other model is always reported |
 | Holdout | 90 days | Untouched final window (0 = off) |
 | Overbought guard | on | RSI/MACD/VWAP/open-interest exit on overbought tops; not simulated by the backtest. When switched off, sessions it paused are resumed |
-| BTC regime protection | on | Global BTC check (see below); modelled in the backtest. When switched off, sessions it paused are resumed |
+| BTC regime protection | on | Global BTC check (see below): blocks buys and moves sells to the nearest levels on every coin; modelled in the backtest |
 | BTC trailing stop / window | 8% / 7 days | Bearish when BTC is this far below its high over the window (2–30%, 1–30 days) |
 | BTC OI flush / near high | 5% / 3% | Bearish when 1h OI falls this much over 6 readings while BTC is within this of its 24h high (1–30%, 0.5–10%) |
 | BTC funding crowding | z 2.0 | Warning when funding z-score over 90 prints reaches this while momentum < 0 or the trend is not up (0.5–5.0) |
@@ -361,29 +361,45 @@ of every paper tick (before any session ticks), and each closed bar is evaluated
 | Phase | Entered on | Effect on every coin |
 | --- | --- | --- |
 | `normal` | no warning or bearish signal | none |
-| `warning` | BTC 15m RSI > 75 (BTC overbought guard armed), or funding crowding | New buys blocked; positions kept. New sessions still open but cannot buy |
-| `bearish` | BTC guard trailing or OI-flush exit (not its momentum-decay exit), trailing stop, open-interest flush near the 24h high, or a 1h close below 30-day support − 0.25 ATR | Every active session is sold to USDT, paused and tagged `btc_regime`; the daily analysis opens no new sessions |
+| `warning` | BTC 15m RSI > 75 (BTC overbought guard armed), or funding crowding | New buys blocked; sells moved to the 2 nearest levels |
+| `bearish` | BTC guard trailing or OI-flush exit (not its momentum-decay exit), trailing stop, open-interest flush near the 24h high, or a 1h close below 30-day support âˆ’ 0.25 ATR | Same as `warning`; the daily analysis also opens no new sessions |
+
+While the phase is not `normal`, every grid stops buying and offers its whole inventory on the two
+grid levels just above the price, so it sheds inventory on the first bounce instead of waiting for
+the top of the range. Nothing is sold at market and no session is paused; stops, take-profits and
+each coin's own overbought guard keep running. When BTC returns to `normal` the full ladder is
+rebuilt.
 
 `bearish` is left only when **all** recovery checks pass: the guard's recovery (RSI above 35 and
 rising, 15m close above VWAP, OI turning up or 60 minutes without OI data), back above the support
 line, inside the trailing stop, no OI flush, and the minimum bearish duration. The new phase is
-`warning` if a warning signal still holds, else `normal`. The guard's momentum-decay exit (MACD
-shrinking with a close below VWAP) only ends its armed state: on 520 days of BTC it followed almost
-every overbought spike and flattened the book 163 times, costing more than it saved. Only sessions the regime paused resume;
-manual pauses, coin-guard pauses and bearish-locked sessions are never touched. If BTC data cannot
-be fetched, the phase does not change and the error is shown. It applies identically in normal and
-hybrid mode (no EMA100 gate on BTC).
+`warning` if a warning signal still holds, else `normal`. If BTC data cannot be fetched, the phase
+does not change and the error is shown. It applies identically in normal and hybrid mode (no
+EMA100 gate on BTC).
+
+**Why this design.** It was chosen by measuring alternatives on the full universe (58 coins, 520
+days), comparing each coin's walk-forward with and without the regime:
+
+| Bearish behaviour | Mean return effect | Mean drawdown effect | Coins with lower drawdown |
+| --- | --- | --- | --- |
+| Sell everything and pause | âˆ’7.0 pts | 0.0 | 41% |
+| Block buys only | âˆ’0.8 pts | 0.4 pts lower | 48% |
+| Block buys, and keep blocking while BTC cools after a fading rally | âˆ’3.5 pts | 0.7 pts higher | 35% |
+| **Block buys and sell at the nearest levels (current)** | âˆ’0.9 pts | 1.1 pts lower | 62% |
+
+The guard's momentum-decay exit (MACD shrinking with a close below VWAP) does not turn the regime
+bearish: on BTC it followed almost every overbought spike (163 of 229 bearish entries) and only
+churned the book.
 
 **Backtest.** The daily analysis syncs BTC 15m and 1h candles, replays the same evaluator over the
 window once per run (reused by the hybrid pass) and gates every coin's simulations with it: buys
-disarmed while not `normal`, inventory flattened on the first coin bar after BTC turns bearish.
-Test folds and the holdout also run without the regime, reported per coin as `regime_off_return`,
-`regime_effect_return` and `regime_effect_drawdown`; validation turns the averages into a strength
-or weakness finding. A parity test drives the live controller tick by tick on the exact data
-windows it fetches and checks it produces the same phase changes as the backtest timeline.
+disarmed and sells moved to the nearest levels while not `normal`. Test folds and the holdout also
+run without the regime, reported per coin as `regime_off_return`, `regime_effect_return` and
+`regime_effect_drawdown`; validation turns the averages into a strength or weakness finding.
+Parity tests check that the live controller produces the same phase changes as the backtest
+timeline, and that the paper strategy fills exactly like the simulator through a de-risk window.
 
-Every phase change is a `regime` grid event (symbol `BTCUSDT`) plus a decision-log entry;
-flattens and resumes are `pause`/`resume` events with reason `btc_regime`.
+Every phase change is a `regime` grid event (symbol `BTCUSDT`) plus a decision-log entry.
 `GET /api/strategy/regime/` returns the phase, readings, thresholds, recovery checklist and recent
 transitions, shown on Admin > Strategies with banners on Overview and Paper sessions.
 
@@ -395,7 +411,8 @@ transitions, shown on Admin > Strategies with banners on Overview and Paper sess
    tracking. The tick job runs every 5 minutes but signals only on completed candles at
    `PAPER_SIGNAL_INTERVAL` (default `1h`), so a forming bar can never trigger a fill. Every
    initialize/rebalance persists a per-level plan (price, side, qty, and why a rung was skipped:
-   `risk_gate`, `no_capacity`, `no_inventory`, or `at_price`) into `PaperSession.grid_state` and
+   `risk_gate`, `no_capacity`, `no_inventory`, `derisk` (BTC regime: sells kept to the nearest
+   levels), or `at_price`) into `PaperSession.grid_state` and
    the decision log, and state survives worker restarts.
 3. **Evaluation** — promotion requires at least 7 days, +1% net return, max 12% drawdown, and
    20 fills (configurable). A 20% hard drawdown stop stops the session independently.
@@ -546,9 +563,9 @@ success/failure handling.
   Binance publishes an hourly OI row late, the backtest can use a row live trading could not yet
   see at that moment.
 - The regime reacts on closed 15m candles, so paper trading responds within one 15m close plus up
-  to one tick. The backtest can only act on coin bars: it applies the phase at each bar's open and
-  flattens at the next bar open, so on 1h/4h signals it trades up to one bar longer than paper in
-  a sell-off.
+  to one tick, and applies the phase at tick time to the candles that tick replays. The backtest
+  applies the phase at each coin bar's open, so on 1h/4h signals the two can differ by up to one
+  bar around a phase change.
 - Paper fills are simulated from live public data, not from an exchange matching engine.
 - Live trading is intentionally not wired to schedulers or the API. Enabling it requires code
   changes, exchange-side risk controls, and explicit operational sign-off.

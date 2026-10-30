@@ -414,24 +414,24 @@ class RegimeControllerTests(TestCase):
         self.assertEqual(state.phase, "warning")
         self.assertTrue(state.last_error)
 
-    def _tick_blocks(self):
+    def _tick(self, fields):
         from apps.trading.paper import tick_paper_sessions
 
         captured = {}
 
-        def fake_tick(session, client, now, settings_row=None, portfolio_block=""):
-            captured[session.coin.symbol] = portfolio_block
+        def fake_tick(
+            session, client, now, settings_row=None, portfolio_block="", derisk=False
+        ):
+            captured[session.coin.symbol] = (portfolio_block, derisk)
             return {"ok": True, "fills": 0}
 
         with patch("apps.trading.paper._tick_session", side_effect=fake_tick), patch(
             "apps.trading.regime.fetch_live_inputs", return_value=([], [], [], [])
-        ), patch(
-            "apps.trading.regime.reading_series", return_value=[reading(**WARNING_FIELDS)]
-        ):
+        ), patch("apps.trading.regime.reading_series", return_value=[reading(**fields)]):
             summary = tick_paper_sessions()
         return captured, summary
 
-    def test_warning_blocks_buys_without_selling(self):
+    def test_warning_blocks_buys_and_derisks_without_selling(self):
         first = self.holding(self.eth)
         second = self.holding(self.sol)
         for mode in ("normal", "hybrid"):
@@ -439,10 +439,10 @@ class RegimeControllerTests(TestCase):
                 trading = LiveTradingState.load()
                 trading.mode = mode
                 trading.save()
-                captured, summary = self._tick_blocks()
-                self.assertEqual(
-                    captured, {"ETH": "btc_regime_warning", "SOL": "btc_regime_warning"}
-                )
+                MarketRegimeState.objects.all().delete()
+                captured, summary = self._tick(WARNING_FIELDS)
+                expected = ("btc_regime_warning", True)
+                self.assertEqual(captured, {"ETH": expected, "SOL": expected})
                 self.assertEqual(summary["regime"]["phase"], "warning")
                 self.assertEqual(summary["buy_block"], "btc_regime_warning")
                 for session in (first, second):
@@ -450,88 +450,76 @@ class RegimeControllerTests(TestCase):
                     self.assertEqual(session.status, PaperSession.Status.ACTIVE)
                     self.assertAlmostEqual(session.position_qty, 2.0)
 
-    def test_bearish_flattens_and_tags_active_sessions(self):
+    def test_bearish_blocks_buys_and_derisks_without_selling_or_pausing(self):
         sessions = [self.holding(self.eth), self.holding(self.sol)]
-        state = self.refresh(**BEARISH_FIELDS)
-        self.assertEqual(state.phase, "bearish")
-        self.assertEqual(state.reasons, ["support_breakdown"])
+        captured, summary = self._tick(BEARISH_FIELDS)
+        self.assertEqual(
+            summary["regime"], {"phase": "bearish", "reasons": ["support_breakdown"]}
+        )
+        self.assertEqual(
+            captured,
+            {"ETH": ("btc_regime_bearish", True), "SOL": ("btc_regime_bearish", True)},
+        )
         for session in sessions:
             session.refresh_from_db()
-            self.assertEqual(session.status, PaperSession.Status.PAUSED)
-            self.assertAlmostEqual(session.position_qty, 0.0)
-            self.assertEqual(session.risk_state["pause_source"], "btc_regime")
-            self.assertTrue(session.fills.filter(side="sell", reason="btc_regime").exists())
-        self.assertEqual(
-            GridEvent.objects.filter(type=GridEvent.Type.PAUSE, reason="btc_regime").count(), 2
-        )
+            self.assertEqual(session.status, PaperSession.Status.ACTIVE)
+            self.assertAlmostEqual(session.position_qty, 2.0)
+            self.assertFalse(session.fills.exists())
+            self.assertNotIn("pause_source", session.risk_state)
+        self.assertFalse(GridEvent.objects.filter(type=GridEvent.Type.PAUSE).exists())
         regime_event = GridEvent.objects.get(type=GridEvent.Type.REGIME)
         self.assertEqual(regime_event.symbol, "BTCUSDT")
         self.assertEqual(regime_event.before, {"phase": "normal"})
         self.assertEqual(regime_event.after["phase"], "bearish")
 
-        # A second tick while still bearish changes nothing and logs no new event.
+        # A second tick inside the same bar records no new transition.
         self.refresh(now=T0 + timedelta(minutes=5), **BEARISH_FIELDS)
         self.assertEqual(GridEvent.objects.filter(type=GridEvent.Type.REGIME).count(), 1)
 
-    def test_bearish_leaves_manual_coin_guard_and_bearish_locked_alone(self):
-        manual = self.holding(self.eth, status=PaperSession.Status.PAUSED)
-        guarded = self.holding(
-            self.sol, status=PaperSession.Status.PAUSED, risk_state={"phase": "paused"}
-        )
+    def test_normal_neither_blocks_nor_derisks(self):
+        self.holding(self.eth)
+        captured, summary = self._tick({})
+        self.assertEqual(captured, {"ETH": ("", False)})
+        self.assertEqual(summary["regime"]["phase"], "normal")
+
+    def test_recovery_after_long_outage_in_one_call(self):
+        self.set_phase("bearish", T0 - timedelta(hours=10), ["trailing_stop"])
+        state = self.refresh(now=T0 + timedelta(hours=10))
+        self.assertEqual(state.phase, "normal")
+
+    def test_sessions_paused_by_the_former_rule_are_released(self):
         from apps.trading.tests import make_coin
 
-        locked = self.holding(make_coin("ADA", "ADAUSDT"), bias=PaperSession.Bias.BEARISH)
-        self.refresh(**BEARISH_FIELDS)
-        for session, status in (
-            (manual, PaperSession.Status.PAUSED),
-            (guarded, PaperSession.Status.PAUSED),
-            (locked, PaperSession.Status.ACTIVE),
-        ):
-            session.refresh_from_db()
-            self.assertEqual(session.status, status)
-            self.assertAlmostEqual(session.position_qty, 2.0)
-            self.assertNotIn("pause_source", session.risk_state)
-
-    def test_recovery_resumes_only_regime_paused_sessions(self):
-        tagged = self.holding(self.eth)
-        self.refresh(**BEARISH_FIELDS)
-        manual = self.holding(self.sol, status=PaperSession.Status.PAUSED)
-        early = T0 + timedelta(hours=3)
-        state = self.refresh(now=early, time=early)
-        self.assertEqual(state.phase, "bearish")
-        self.assertEqual(state.reasons, ["recovery_pending"])
-        tagged.refresh_from_db()
-        self.assertEqual(tagged.status, PaperSession.Status.PAUSED)
-        later = T0 + timedelta(hours=4)
-        state = self.refresh(now=later, time=later)
-        self.assertEqual(state.phase, "normal")
-        tagged.refresh_from_db()
-        manual.refresh_from_db()
-        self.assertEqual(tagged.status, PaperSession.Status.ACTIVE)
-        self.assertNotIn("pause_source", tagged.risk_state)
-        self.assertEqual(tagged.grid_state, {})
-        self.assertEqual(manual.status, PaperSession.Status.PAUSED)
-        self.assertTrue(
-            GridEvent.objects.filter(
-                type=GridEvent.Type.RESUME, reason="btc_regime", session=tagged
-            ).exists()
-        )
-
-    def test_recovery_after_long_outage_resumes_in_one_call(self):
+        # The regime used to flatten and pause; any session still tagged from
+        # then is resumed whatever the phase, so none stays paused forever.
         tagged = self.holding(
             self.eth,
             status=PaperSession.Status.PAUSED,
             position_qty=0.0,
             risk_state={"pause_source": "btc_regime"},
         )
-        self.set_phase("bearish", T0 - timedelta(hours=10), ["trailing_stop"])
-        state = self.refresh(now=T0 + timedelta(hours=10))
-        self.assertEqual(state.phase, "normal")
-        tagged.refresh_from_db()
+        manual = self.holding(self.sol, status=PaperSession.Status.PAUSED)
+        guarded = self.holding(
+            make_coin("ADA", "ADAUSDT"),
+            status=PaperSession.Status.PAUSED,
+            risk_state={"phase": "paused", "pause_source": "btc_regime"},
+        )
+        self.refresh(**BEARISH_FIELDS)
+        for session in (tagged, manual, guarded):
+            session.refresh_from_db()
         self.assertEqual(tagged.status, PaperSession.Status.ACTIVE)
+        self.assertNotIn("pause_source", tagged.risk_state)
+        self.assertTrue(
+            GridEvent.objects.filter(
+                type=GridEvent.Type.RESUME, reason="btc_regime", session=tagged
+            ).exists()
+        )
+        self.assertEqual(manual.status, PaperSession.Status.PAUSED)
+        # Paused by its own coin guard too: that guard's recovery decides.
+        self.assertEqual(guarded.status, PaperSession.Status.PAUSED)
+        self.assertNotIn("pause_source", guarded.risk_state)
 
-    def test_disabling_releases_pauses(self):
-        tagged = self.holding(self.eth)
+    def test_disabling_sets_normal(self):
         self.refresh(**BEARISH_FIELDS)
         row = StrategySettings.load()
         row.btc_regime_enabled = False
@@ -542,39 +530,10 @@ class RegimeControllerTests(TestCase):
             state = refresh_regime(T0 + timedelta(minutes=5), client=object())
         fetch.assert_not_called()
         self.assertEqual(state.phase, "normal")
-        tagged.refresh_from_db()
-        self.assertEqual(tagged.status, PaperSession.Status.ACTIVE)
         self.assertEqual(
             GridEvent.objects.filter(type=GridEvent.Type.REGIME).latest("time").after["phase"],
             "normal",
         )
-
-    def test_flatten_failure_is_retried_next_tick(self):
-        from apps.trading import paper
-
-        failing = self.holding(self.eth)
-        other = self.holding(self.sol)
-        real = paper.flatten_session
-
-        def flaky(session, *args, **kwargs):
-            if session.id == failing.id:
-                raise RuntimeError("boom")
-            return real(session, *args, **kwargs)
-
-        with patch("apps.trading.paper.flatten_session", side_effect=flaky):
-            self.refresh(**BEARISH_FIELDS)
-        failing.refresh_from_db()
-        other.refresh_from_db()
-        self.assertEqual(failing.status, PaperSession.Status.ACTIVE)
-        self.assertNotIn("pause_source", failing.risk_state)
-        self.assertAlmostEqual(failing.position_qty, 2.0)
-        self.assertEqual(other.status, PaperSession.Status.PAUSED)
-
-        self.refresh(now=T0 + timedelta(minutes=5), **BEARISH_FIELDS)
-        failing.refresh_from_db()
-        self.assertEqual(failing.status, PaperSession.Status.PAUSED)
-        self.assertEqual(failing.risk_state["pause_source"], "btc_regime")
-        self.assertAlmostEqual(failing.position_qty, 0.0)
 
     def test_risk_guard_skips_regime_paused_sessions(self):
         from apps.trading.paper import run_risk_guard
@@ -589,21 +548,17 @@ class RegimeControllerTests(TestCase):
         fetch.assert_not_called()
         self.assertEqual(summary["sessions"], 0)
 
-    def test_manual_resume_clears_tag_so_a_later_manual_pause_stays(self):
-        from apps.trading.paper import pause_session, resume_session
+    def test_manual_resume_clears_tag(self):
+        from apps.trading.paper import resume_session
 
-        session = self.holding(self.eth)
-        self.refresh(**BEARISH_FIELDS)
-        session.refresh_from_db()
+        session = self.holding(
+            self.eth,
+            status=PaperSession.Status.PAUSED,
+            risk_state={"pause_source": "btc_regime", "last_metrics": {"rsi_15m": 50.0}},
+        )
         resume_session(session)
         session.refresh_from_db()
-        self.assertNotIn("pause_source", session.risk_state)
-        pause_session(session)
-        later = T0 + timedelta(hours=5)
-        state = self.refresh(now=later, time=later)
-        self.assertEqual(state.phase, "normal")
-        session.refresh_from_db()
-        self.assertEqual(session.status, PaperSession.Status.PAUSED)
+        self.assertEqual(session.risk_state, {"last_metrics": {"rsi_15m": 50.0}})
 
     def test_older_reading_is_never_applied(self):
         self.refresh(**BEARISH_FIELDS)
@@ -613,23 +568,6 @@ class RegimeControllerTests(TestCase):
         self.assertEqual(state.phase, "bearish")
         self.assertEqual(state.metrics["time"], T0.isoformat())
         self.assertEqual(GridEvent.objects.filter(type=GridEvent.Type.REGIME).count(), 1)
-
-    def test_regime_pause_resets_an_armed_coin_guard(self):
-        session = self.holding(
-            self.eth,
-            risk_state={
-                "phase": "armed",
-                "peak_high": 120.0,
-                "armed_at": T0.isoformat(),
-                "last_metrics": {"rsi_15m": 80.0},
-            },
-        )
-        self.refresh(**BEARISH_FIELDS)
-        session.refresh_from_db()
-        self.assertEqual(
-            session.risk_state,
-            {"phase": "idle", "pause_source": "btc_regime", "last_metrics": {"rsi_15m": 80.0}},
-        )
 
     def test_release_skips_sessions_no_longer_paused(self):
         stopped = self.holding(

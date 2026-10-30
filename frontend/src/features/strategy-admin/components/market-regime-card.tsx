@@ -193,8 +193,8 @@ function RegimeBody({ regime }: { regime: MarketRegime }) {
                 ))}
               </ul>
               <p className='text-muted-foreground text-[11px]'>
-                Resumes once every check passes and {regime.thresholds.min_bearish_hours}h have
-                passed. Only sessions the regime paused resume.
+                Buying and the full sell ladder return once every check passes and{' '}
+                {regime.thresholds.min_bearish_hours}h have passed.
               </p>
             </div>
           ) : null}
@@ -258,9 +258,9 @@ export default function MarketRegimeCard() {
               BTC market regime
             </CardTitle>
             <CardDescription>
-              BTC is checked every paper tick. A warning blocks new buys on every coin; a bearish
-              regime sells every active session to USDT and pauses it until BTC recovers. Applies in
-              normal and hybrid mode, and the backtest models the same rules.
+              BTC is checked every paper tick. While it is in warning or bearish, every coin stops
+              buying and offers its inventory on the 2 nearest sell levels; nothing is sold at
+              market. Applies in normal and hybrid mode, and the backtest models the same rules.
             </CardDescription>
           </div>
           {regime ? (

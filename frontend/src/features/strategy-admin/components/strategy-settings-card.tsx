@@ -377,7 +377,7 @@ function SettingsForm({
             children={(field) => (
               <field.SwitchField
                 label='BTC regime protection'
-                description='Watch BTC every paper tick: a warning blocks new buys on every coin, a bearish regime sells every active session to USDT and pauses it until BTC recovers. Also applied in the backtest.'
+                description='Watch BTC every paper tick: while it is in warning or bearish, every coin stops buying and moves its sells to the 2 nearest levels. Nothing is sold at market. Also applied in the backtest.'
               />
             )}
           />

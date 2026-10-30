@@ -427,60 +427,13 @@ def _persist_fills(session: PaperSession, adapter: PaperExecutionAdapter) -> lis
     return fills
 
 
-def flatten_session(
-    session: PaperSession,
-    now: datetime,
-    reason: str,
-    client: BinanceFuturesClient | None = None,
-) -> float:
-    """Sell a session's inventory to USDT at the live price; returns the price.
-
-    The caller holds the session row lock and decides the new status. Raises
-    when inventory is held but no usable price exists, so the caller can leave
-    the session untouched and retry on the next tick.
-    """
-
-    price = 0.0
-    symbol = session.coin.binance_symbol
-    if client is not None and symbol:
-        try:
-            price = _fetch_price(client, symbol)
-        except BinanceError as exc:
-            logger.warning("Price fetch failed for %s: %s", symbol, exc)
-    price = price or float(session.mark_price or 0.0)
-    if session.position_qty > 0 and price <= 0:
-        raise BinanceError(f"No price to flatten {session.coin.symbol}")
-    settings_row = StrategySettings.load()
-    params = GridParams.from_dict(session.params or {})
-    config = _sim_config(session, settings_row)
-    adapter = PaperExecutionAdapter(session, config=config, params=params)
-    strategy = IncrementalGridStrategy(params, config, adapter, session.grid_state or {})
-    if price > 0:
-        strategy.flatten(price, now, reason)
-    adapter.flush()
-    _persist_fills(session, adapter)
-    session.grid_state = strategy.to_state()
-    insert_equity_points(
-        [
-            {
-                "time": now,
-                "session_id": str(session.id),
-                "equity": session.equity,
-                "price": session.mark_price,
-                "position_qty": session.position_qty,
-                "drawdown": session.max_drawdown,
-            }
-        ]
-    )
-    return price
-
-
 def _tick_session(
     session: PaperSession,
     client: BinanceFuturesClient,
     now: datetime,
     settings_row: StrategySettings | None = None,
     portfolio_block: str = "",
+    derisk: bool = False,
 ) -> dict[str, Any]:
     settings_row = settings_row or StrategySettings.load()
     params = GridParams.from_dict(session.params or {})
@@ -496,6 +449,10 @@ def _tick_session(
     hybrid = trading_state.mode == LiveTradingState.Mode.HYBRID
     # Book-level limits only ever block new buys.
     strategy.portfolio_blocked = bool(portfolio_block)
+    # BTC regime warning or bearish: offer inventory on the nearest sell levels.
+    strategy.derisk = derisk
+    if not strategy.initialized:
+        strategy.derisking = derisk
 
     # A bearish tag keeps the session live for marking/funding but locks the
     # grid: no orders are armed and no fills are simulated.
@@ -833,6 +790,7 @@ def tick_paper_sessions(
     settings_row = StrategySettings.load()
     book = portfolio.refresh_book_state(settings_row, now)
     block = portfolio.buy_block_reason(book, settings_row, regime.phase)
+    regime_derisk = regime.phase != MarketRegimeState.Phase.NORMAL
     results: list[dict[str, Any]] = []
     errors = 0
     total_fills = 0
@@ -849,7 +807,9 @@ def tick_paper_sessions(
                 if locked_session.status != PaperSession.Status.ACTIVE:
                     continue
                 session = locked_session
-                result = _tick_session(session, client, now, settings_row, block)
+                result = _tick_session(
+                    session, client, now, settings_row, block, derisk=regime_derisk
+                )
         except Exception as exc:  # noqa: BLE001 - one session must not stop the tick
             logger.exception("Paper tick failed for %s", session.coin.symbol)
             errors += 1

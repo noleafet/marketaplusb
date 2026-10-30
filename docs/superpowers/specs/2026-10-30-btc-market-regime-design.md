@@ -96,6 +96,14 @@ Transitions:
 BTC turned bearish 229 times in 520 days (163 of them from that exit) and the regime cost more
 return than it saved in drawdown on ETH and SOL. It now only ends the guard's armed state.
 
+**Amendment 2 (2026-10-30): bearish no longer flattens or pauses.** Measured on 58 coins over 520
+days against the same runs without the regime: selling everything and pausing cost 7.0 points of
+return with no drawdown benefit; blocking buys only cost 0.8 points; blocking buys and moving
+sells to the two nearest grid levels cost 0.9 points and cut max drawdown by 1.1 points on average
+(lower on 62% of coins). Both `warning` and `bearish` now block new buys and offer inventory on the
+nearest sell levels; nothing is sold at market and no session is paused. Sections 4.2 and 5.2 are
+superseded where they describe flattening, pausing, tagging and the bearish exit.
+
 ## 4. Components
 
 ### 4.1 Pure evaluator — `apps/trading/regime.py`

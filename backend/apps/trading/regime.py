@@ -4,10 +4,14 @@ BTC is read once per closed 15m bar and classified into one global phase:
 
     normal   no warning or bearish signal
     warning  guard armed (RSI overbought) or funding crowding
-             -> new buys are blocked on every coin
-    bearish  guard exit, trailing stop below the window high, open-interest
-             flush near the 24h high, or a 1h close below support
-             -> every active session is flattened and paused
+    bearish  guard trailing or OI-flush exit, trailing stop below the window
+             high, open-interest flush near the 24h high, or a 1h close
+             below support
+
+In warning and bearish every coin stops buying and offers its inventory on
+the nearest sell levels, so it sheds inventory on the first bounce without
+selling at market. Flattening and pausing every session was measured on 58
+coins and cost about 7 points of return without reducing drawdown.
 
 ``bearish`` is left only when every recovery check passes and the minimum
 duration has elapsed. The live controller and the backtest timeline both build
@@ -36,7 +40,7 @@ from apps.engine.grid import (
 )
 from apps.engine.models import log_decision
 from apps.trading import risk
-from apps.trading.events import record_event, snapshot_session
+from apps.trading.events import record_event
 from apps.trading.models import (
     GridEvent,
     MarketRegimeState,
@@ -485,8 +489,8 @@ def record_open_interest(client: Any = None, symbol: str = SYMBOL) -> int:
 
 EFFECTS = {
     NORMAL: "grid trading unrestricted",
-    WARNING: "new buys blocked on every coin",
-    BEARISH: "every active session flattened to USDT and paused",
+    WARNING: "buys blocked and sells moved to the nearest levels on every coin",
+    BEARISH: "buys blocked and sells moved to the nearest levels on every coin",
 }
 
 
@@ -510,73 +514,12 @@ def _record_transition(
     )
 
 
-def apply_bearish(now: datetime, client: BinanceFuturesClient | None = None) -> list[str]:
-    """Flatten and pause every active, unlocked session; returns symbols.
-
-    Idempotent: runs every tick while bearish and only touches sessions that
-    are still active. A session that fails is left untouched for the next tick.
-    """
-
-    from apps.trading import paper
-
-    flattened: list[str] = []
-    candidates = (
-        PaperSession.objects.filter(status=PaperSession.Status.ACTIVE)
-        .exclude(bias=PaperSession.Bias.BEARISH)
-        .values_list("id", flat=True)
-    )
-    for session_id in list(candidates):
-        try:
-            with transaction.atomic():
-                session = (
-                    PaperSession.objects.select_for_update()
-                    .select_related("coin")
-                    .get(id=session_id)
-                )
-                if (
-                    session.status != PaperSession.Status.ACTIVE
-                    or session.bias == PaperSession.Bias.BEARISH
-                ):
-                    continue
-                position_qty = session.position_qty
-                price = paper.flatten_session(session, now, REGIME_PAUSE_SOURCE, client)
-                session.status = PaperSession.Status.PAUSED
-                # Inventory is gone, so the coin guard's armed peak is stale;
-                # keep only its last readings for display.
-                kept = {
-                    key: value
-                    for key, value in (session.risk_state or {}).items()
-                    if key in ("last_metrics", "last_eval_at")
-                }
-                session.risk_state = {
-                    **kept,
-                    "phase": "idle",
-                    "pause_source": REGIME_PAUSE_SOURCE,
-                }
-                session.save()
-            record_event(GridEvent.Type.PAUSE, session=session, reason=REGIME_PAUSE_SOURCE)
-            snapshot_session(session, "pause")
-            log_decision(
-                "risk",
-                f"{session.coin.symbol} paused by the BTC market regime; "
-                "inventory sold to USDT until BTC recovers.",
-                severity="warning",
-                coin=session.coin,
-                payload={
-                    "session_id": str(session.id),
-                    "price": round(price, 10),
-                    "position_qty": round(position_qty, 10),
-                    "equity": round(session.equity, 4),
-                },
-            )
-            flattened.append(session.coin.symbol)
-        except Exception:  # noqa: BLE001 - one session must not block the rest
-            logger.exception("BTC regime flatten failed for session %s", session_id)
-    return flattened
-
-
 def release_regime_pauses(now: datetime) -> list[str]:
-    """Resume every session the regime paused; returns symbols."""
+    """Resume sessions paused by the regime's former flatten-and-pause rule.
+
+    The regime no longer pauses sessions; this only releases any still tagged
+    from before, so none stays paused forever.
+    """
 
     from apps.trading import paper
 
@@ -642,13 +585,6 @@ def thresholds(row: StrategySettings) -> dict[str, Any]:
     }
 
 
-def _apply_effects(state: MarketRegimeState, now: datetime, client: Any) -> None:
-    if state.phase == BEARISH:
-        apply_bearish(now, client)
-    else:
-        release_regime_pauses(now)
-
-
 def refresh_regime(now: datetime, client: Any = None) -> MarketRegimeState:
     """Evaluate BTC on its latest closed 15m bar and apply the phase."""
 
@@ -686,7 +622,7 @@ def refresh_regime(now: datetime, client: Any = None) -> MarketRegimeState:
             severity="warning",
             payload={"phase": state.phase, "error": state.last_error},
         )
-        _apply_effects(state, now, client)
+        release_regime_pauses(now)
         return state
 
     reading = readings[-1]
@@ -711,5 +647,5 @@ def refresh_regime(now: datetime, client: Any = None) -> MarketRegimeState:
             if decision.changed:
                 _record_transition(old, decision.phase, decision.reasons, decision.metrics, now)
         state.save()
-    _apply_effects(state, now, client)
+    release_regime_pauses(now)
     return state

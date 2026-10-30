@@ -56,6 +56,8 @@ TP_COOLDOWN_DAYS = 1.0
 # length (measured 4h/1h ratio across the top-100 universe: 2.05), so ATR is
 # expressed in 4h-equivalent units on every interval.
 REFERENCE_BARS_PER_DAY = 6
+# Sell levels used while a gate asks to de-risk (inventory sold on the first bounce).
+DERISK_SELL_LEVELS = 2
 
 
 @dataclass(frozen=True)
@@ -990,6 +992,8 @@ def simulate_grid(
         ) * buy_scale
         buy_indices = list(range(0, lower_idx)) if allow_buys else []
         sell_indices = list(range(upper_idx, len(levels)))
+        if derisking:
+            sell_indices = sell_indices[:DERISK_SELL_LEVELS]
         if buy_indices and buy_budget > 0:
             slot_notional = buy_budget / len(buy_indices)
             for i in buy_indices:
@@ -1077,6 +1081,7 @@ def simulate_grid(
 
     stop_equity = config.capital * (1.0 - params.stop_loss_pct)
     hybrid_blocked = False
+    derisking = False
 
     for i in range(start_idx, count):
         if state.stopped:
@@ -1151,6 +1156,13 @@ def simulate_grid(
             )
             state.hybrid_exits += 1
             orders.clear()
+            rebuild_orders(timestamp, bar_open)
+
+        # De-risk: offer open inventory on the nearest sell levels while the
+        # gate asks for it, and restore the full ladder when it stops.
+        wants_derisk = bool(gate is not None and gate.derisk.get(timestamp))
+        if wants_derisk != derisking:
+            derisking = wants_derisk
             rebuild_orders(timestamp, bar_open)
 
         if gate_allow is not None:

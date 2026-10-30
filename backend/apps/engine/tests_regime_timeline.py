@@ -50,39 +50,30 @@ class GateMappingTests(TestCase):
         gate = gate_from_timeline(hourly_rows(9, 3), timeline)
         # The 10:00 bar opened before BTC's 10:15 close; the 11:00 bar after it.
         self.assertTrue(gate.allow[at(10)])
-        self.assertNotIn(at(10), gate.exit)
+        self.assertNotIn(at(10), gate.derisk)
         self.assertFalse(gate.allow[at(11)])
-        self.assertEqual(gate.exit[at(11)], "btc_regime")
+        self.assertTrue(gate.derisk[at(11)])
+        self.assertEqual(gate.exit, {})
 
-    def test_exit_only_on_first_bearish_bar(self):
+    def test_bearish_blocks_and_derisks_without_exit(self):
         timeline = RegimeTimeline(
             changes=[(at(9), "normal"), (at(10, 15), "bearish"), (at(14, 15), "normal")]
         )
         gate = gate_from_timeline(hourly_rows(9, 8), timeline)
-        self.assertEqual(list(gate.exit), [at(11)])
+        self.assertEqual(gate.exit, {})
+        self.assertEqual(sorted(gate.derisk), [at(h) for h in range(11, 15)])
         self.assertEqual([gate.allow[at(h)] for h in range(9, 17)], [
             True, True, False, False, False, False, True, True,
         ])
-        self.assertEqual(gate.exits, 1)
+        self.assertEqual(gate.exits, 0)
         self.assertEqual(gate.blocked_bars, 4)
 
     def test_warning_blocks_without_exit(self):
         timeline = RegimeTimeline(changes=[(at(9), "normal"), (at(10, 15), "warning")])
         gate = gate_from_timeline(hourly_rows(9, 4), timeline)
         self.assertFalse(gate.allow[at(11)])
+        self.assertTrue(gate.derisk[at(11)])
         self.assertEqual(gate.exit, {})
-
-    def test_bearish_again_after_recovery_exits_again(self):
-        timeline = RegimeTimeline(
-            changes=[
-                (at(9), "normal"),
-                (at(10, 15), "bearish"),
-                (at(12, 15), "warning"),
-                (at(13, 15), "bearish"),
-            ]
-        )
-        gate = gate_from_timeline(hourly_rows(9, 6), timeline)
-        self.assertEqual(sorted(gate.exit), [at(11), at(14)])
 
     def test_bars_before_coverage_are_ungated(self):
         timeline = RegimeTimeline(changes=[(at(10, 15), "bearish")])
@@ -90,7 +81,7 @@ class GateMappingTests(TestCase):
         for hour in (8, 9, 10):
             self.assertNotIn(at(hour), gate.allow)
         self.assertFalse(gate.allow[at(11)])
-        self.assertEqual(list(gate.exit), [at(11)])
+        self.assertTrue(gate.derisk[at(11)])
 
     def test_empty_timeline_gives_no_gate(self):
         self.assertIsNone(gate_from_timeline(hourly_rows(8, 5), RegimeTimeline()))
@@ -351,3 +342,121 @@ class RegimeFindingTests(TestCase):
         absent = self.codes({})
         self.assertNotIn("regime_effective", absent)
         self.assertNotIn("regime_costly", absent)
+
+
+class DeriskParityTests(TestCase):
+    """Nearest-level sells: the paper strategy reproduces the backtest fill for fill."""
+
+    def replay(self, hours, params, trade_through, *, seed, window, test_days=30):
+        from apps.engine.grid import funding_zscore, simulate_grid
+        from apps.engine.tests_parity import (
+            comparable,
+            make_session,
+            synthetic_funding,
+            synthetic_rows,
+        )
+        from apps.trading.execution import PaperExecutionAdapter
+        from apps.trading.strategy import IncrementalGridStrategy
+
+        bars_per_day = 24 // hours
+        rows = synthetic_rows((60 + test_days) * bars_per_day, hours, seed=seed)
+        funding = synthetic_funding(rows)
+        config = SimulationConfig(
+            interval={1: "1h", 4: "4h"}[hours], trade_through_bps=trade_through
+        )
+        start_idx = 60 * bars_per_day
+        first, last = window
+        derisk = {
+            rows[i]["time"]: True
+            for i in range(start_idx + first * bars_per_day, start_idx + last * bars_per_day)
+        }
+        gate = Gate(allow={}, exit={}, derisk=derisk)
+        start = rows[start_idx]["time"]
+        backtest = simulate_grid(rows, funding, start, params, config, gate=gate)
+        ungated = simulate_grid(rows, funding, start, params, config)
+
+        adapter = PaperExecutionAdapter(
+            make_session(config.capital), config=config, params=params
+        )
+        strategy = IncrementalGridStrategy(params, config, adapter, {})
+        charge_from = start
+        for index in range(start_idx, len(rows)):
+            bar = rows[index]
+            for event in funding:
+                if charge_from < event["time"] <= bar["time"]:
+                    adapter.apply_funding(float(event["rate"]), float(bar["open"]), event["time"])
+            charge_from = bar["time"]
+            # The paper runner sets the request before each tick's bars.
+            strategy.derisk = bar["time"] in derisk
+            upto = [event for event in funding if event["time"] <= bar["time"]]
+            result = strategy.step(
+                bar, rows[:index], funding_z=funding_zscore(upto, params.funding_z_lookback)
+            )
+            if result.get("stopped"):
+                break
+        paper = comparable(
+            [
+                {"side": f.side, "reason": f.reason, "price": f.price, "qty": f.qty}
+                for f in adapter.fills
+            ]
+        )
+        return comparable(backtest.trades), paper, comparable(ungated.trades)
+
+    def assert_parity(self, *args, **kwargs):
+        expected, actual, ungated = self.replay(*args, **kwargs)
+        self.assertGreater(len(expected), 5)
+        self.assertLess(len(expected), 199, "trade list is truncated at 200")
+        # The de-risk window must actually change the trades.
+        self.assertNotEqual(expected, ungated)
+        self.assertEqual(len(expected), len(actual))
+        for index, (left, right) in enumerate(zip(expected, actual)):
+            self.assertEqual(left[:2], right[:2], f"fill {index}")
+            self.assertTrue(math.isclose(left[2], right[2], rel_tol=1e-7), f"price {index}")
+            self.assertTrue(math.isclose(left[3], right[3], rel_tol=1e-7), f"qty {index}")
+
+    def test_1h_derisk_parity(self):
+        params = GridParams(grid_levels=12, range_lookback_days=7)
+        self.assert_parity(1, params, 2.0, seed=11, window=(4, 10), test_days=15)
+
+    def test_4h_derisk_parity_with_adaptive_rebalancing(self):
+        params = GridParams(grid_levels=16, rebalance_mode="adaptive", rebalance_days=3)
+        self.assert_parity(4, params, 0.0, seed=23, window=(8, 20))
+
+
+class DeriskLadderTests(TestCase):
+    def test_sells_move_to_the_nearest_levels_and_back(self):
+        from apps.engine.grid import DERISK_SELL_LEVELS
+        from apps.engine.tests_parity import make_session, synthetic_rows
+        from apps.trading.execution import PaperExecutionAdapter
+        from apps.trading.strategy import IncrementalGridStrategy
+
+        rows = synthetic_rows(60 * 24, 1)
+        params = GridParams(grid_levels=12, range_lookback_days=7)
+        config = SimulationConfig(interval="1h")
+        session = make_session(config.capital)
+        session.position_qty = 3.0
+        session.avg_entry = 99.0
+        adapter = PaperExecutionAdapter(session, config=config, params=params)
+        strategy = IncrementalGridStrategy(params, config, adapter, {})
+        price = float(rows[-1]["close"])
+        strategy.initialize(rows, price, rows[-1]["time"])
+        full = sorted(idx for idx, order in strategy.orders.items() if order["side"] == "sell")
+        self.assertGreater(len(full), DERISK_SELL_LEVELS)
+
+        strategy.derisk = True
+        strategy.apply_derisk(price)
+        sells = {
+            idx: order["qty"] for idx, order in strategy.orders.items() if order["side"] == "sell"
+        }
+        self.assertEqual(sorted(sells), full[:DERISK_SELL_LEVELS])
+        self.assertAlmostEqual(sum(sells.values()), 3.0)
+        plan = {
+            item["level"]: item["reason"] for item in strategy.level_plan if item["side"] == "sell"
+        }
+        self.assertEqual(plan[full[-1]], "derisk")
+        self.assertTrue(strategy.to_state()["derisking"])
+
+        strategy.derisk = False
+        strategy.apply_derisk(price)
+        restored = sorted(idx for idx, order in strategy.orders.items() if order["side"] == "sell")
+        self.assertEqual(restored, full)

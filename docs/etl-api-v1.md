@@ -244,8 +244,9 @@ object), `strategy_version`, `config_version`, `backfilled`.
 `after` hold the changed settings; `strategy_version` is the version in force after the change.
 `kill_switch` events carry environment `live`. A `regime` event (symbol `BTCUSDT`, no session) is a
 BTC market regime phase change: `before.phase`, and `after.phase`, `after.reasons` and
-`after.metrics`; sessions it flattened or resumed get `pause`/`resume` events with reason
-`btc_regime`.
+`after.metrics`. The regime blocks buys and moves sells to the nearest levels but never pauses
+sessions; `resume` events with reason `btc_regime` only come from releasing sessions paused by its
+earlier flatten-and-pause rule.
 
 **Live order audit**: `id`, `created_at`, `symbol`, `side`, `order_type`, `qty`, `price`, `notional`,
 `allowed`, `reason`. It holds gate attempts only (there is no live runner), and the raw exchange

@@ -21,9 +21,10 @@ export const RECOVERY_CHECK_LABELS: Record<string, string> = {
 
 export const REGIME_EFFECTS: Record<RegimePhase, string> = {
   normal: 'Grid trading is unrestricted.',
-  warning: 'New buys are blocked on every coin; open positions are kept.',
+  warning:
+    'New buys are blocked on every coin and sells moved to the 2 nearest levels, so inventory is shed on the first bounce.',
   bearish:
-    'Every active paper session was sold to USDT and paused; trading resumes once BTC passes every recovery check.'
+    'New buys are blocked on every coin and sells moved to the 2 nearest levels; nothing is sold at market. The full ladder returns once BTC passes every recovery check.'
 };
 
 export function regimeReasonLabel(reason: string): string {

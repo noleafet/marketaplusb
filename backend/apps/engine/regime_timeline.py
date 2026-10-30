@@ -6,7 +6,8 @@ idle BTC guard. Only the phase changes are kept; ``gate_from_timeline`` maps
 them onto a coin's bars as a simulator ``Gate``:
 
 * ``allow`` is False while the phase is ``warning`` or ``bearish``;
-* ``exit`` flattens on the first coin bar whose phase is ``bearish``.
+* ``derisk`` is set on the same bars, so inventory is offered on the nearest
+  sell levels instead of the full ladder. Nothing is sold at market.
 
 A coin bar sees only BTC bars closed at or before its open, and bars before
 the first reading get no entry, so they trade ungated.
@@ -28,9 +29,6 @@ from apps.trading.regime import (
     evaluate_regime,
     reading_series,
 )
-
-REGIME_EXIT_REASON = "btc_regime"
-
 
 @dataclass
 class RegimeTimeline:
@@ -93,9 +91,8 @@ def gate_from_timeline(rows: list[dict[str, Any]], timeline: RegimeTimeline | No
         return None
     times = [moment for moment, _ in timeline.changes]
     allow: dict[datetime, bool] = {}
-    exits: dict[datetime, Any] = {}
+    derisk: dict[datetime, bool] = {}
     allowed = blocked = 0
-    was_bearish = False
     for row in rows:
         opened = row["time"]
         index = bisect_right(times, opened) - 1
@@ -103,16 +100,14 @@ def gate_from_timeline(rows: list[dict[str, Any]], timeline: RegimeTimeline | No
             continue
         phase = timeline.changes[index][1]
         allow[opened] = phase == NORMAL
+        if phase != NORMAL:
+            derisk[opened] = True
         if phase == NORMAL:
             allowed += 1
         else:
             blocked += 1
-        bearish = phase == BEARISH
-        if bearish and not was_bearish:
-            exits[opened] = REGIME_EXIT_REASON
-        was_bearish = bearish
     if not allow:
         return None
     return Gate(
-        allow=allow, exit=exits, allowed_bars=allowed, blocked_bars=blocked, exits=len(exits)
+        allow=allow, exit={}, allowed_bars=allowed, blocked_bars=blocked, derisk=derisk
     )

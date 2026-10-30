@@ -15,7 +15,7 @@ simulation bar after they are confirmed.
 from __future__ import annotations
 
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -45,6 +45,8 @@ class Gate:
     allowed_bars: int = 0
     blocked_bars: int = 0
     exits: int = 0
+    # Bars on which open inventory is offered on the nearest sell levels only.
+    derisk: dict[datetime, bool] = field(default_factory=dict)
 
     def stats(self) -> dict[str, Any]:
         total = self.allowed_bars + self.blocked_bars
@@ -75,12 +77,16 @@ def combine_gates(a: Gate | None, b: Gate | None) -> Gate | None:
         if value:
             exits[key] = value
     allowed = sum(1 for value in allow.values() if value)
+    derisk = {
+        key: True for key in a.derisk.keys() | b.derisk.keys() if a.derisk.get(key) or b.derisk.get(key)
+    }
     return Gate(
         allow=allow,
         exit=exits,
         allowed_bars=allowed,
         blocked_bars=len(allow) - allowed,
         exits=len(exits),
+        derisk=derisk,
     )
 
 

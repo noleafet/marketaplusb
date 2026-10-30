@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 
 from apps.engine.grid import (
+    DERISK_SELL_LEVELS,
     TP_COOLDOWN_DAYS,
     GridParams,
     SimulationConfig,
@@ -116,6 +117,11 @@ class IncrementalGridStrategy:
         # Book-level risk (exposure cap or daily loss halt), set by the paper
         # runner on every tick. It only ever blocks new buys.
         self.portfolio_blocked = bool(state.get("portfolio_blocked"))
+        # BTC market regime de-risk: while set, inventory is offered on the
+        # nearest sell levels only. ``derisk`` is the runner's request for the
+        # coming bars; ``derisking`` is what the ladder currently reflects.
+        self.derisking = bool(state.get("derisking"))
+        self.derisk = self.derisking
 
     @property
     def initialized(self) -> bool:
@@ -174,6 +180,7 @@ class IncrementalGridStrategy:
             "ema_100": self.ema_100,
             "adx_14": self.adx_14,
             "portfolio_blocked": self.portfolio_blocked,
+            "derisking": self.derisking,
         }
 
     # ------------------------------------------------------- adaptive inputs
@@ -419,6 +426,8 @@ class IncrementalGridStrategy:
         ) * self.buy_scale
         buy_indices = list(range(0, lower_idx)) if self.allow_buys else []
         sell_indices = list(range(upper_idx, len(self.levels)))
+        if self.derisking:
+            sell_indices = sell_indices[:DERISK_SELL_LEVELS]
         buy_slot = buy_budget / len(buy_indices) if buy_indices and buy_budget > 0 else 0.0
         sell_qty = (
             self.adapter.position_qty / len(sell_indices)
@@ -439,7 +448,9 @@ class IncrementalGridStrategy:
                     qty = buy_slot / max(level_price, 1e-12)
                     reason = "active"
             elif side == "sell":
-                if sell_qty <= 0:
+                if idx not in sell_indices:
+                    reason = "derisk"
+                elif sell_qty <= 0:
                     reason = "no_inventory"
                 else:
                     qty = sell_qty
@@ -590,6 +601,13 @@ class IncrementalGridStrategy:
                     item["qty"] = 0.0
         return previous_allowed
 
+    def apply_derisk(self, price: float) -> None:
+        """Rebuild the ladder when the de-risk request changes, as the backtest does."""
+
+        if self.derisk != self.derisking:
+            self.derisking = self.derisk
+            self._rebuild_orders(price)
+
     def step(
         self,
         bar: dict[str, Any],
@@ -615,6 +633,7 @@ class IncrementalGridStrategy:
         if not self.initialized:
             self.open_initial_inventory(bar_open, bar["time"])
         previous_allowed = self.begin_bar(bar)
+        self.apply_derisk(bar_open)
         prev_close = self.prev_close
         self.maybe_rebalance(bar["time"], bar_open, hist_before)
         self.prev_close = prev_close
@@ -628,6 +647,7 @@ class IncrementalGridStrategy:
         if not self.initialized:
             return {"stopped": False, "reason": ""}
         previous_allowed = self.begin_bar(bar)
+        self.apply_derisk(float(bar["open"]))
         return self.finish_bar(bar, previous_allowed)
 
     def finish_bar(self, bar: dict[str, Any], previous_allowed: bool) -> dict[str, Any]:
