@@ -110,6 +110,7 @@ def backtest_out(ca) -> dict:
         "trigger": run.trigger,
         "mode": run.mode,
         "scope": run.scope,
+        "drives_sessions": run.drives_sessions,
         "strategy_version": run.strategy_version_id,
         "config_version": ca.config_version_id,
         "data_start": iso(ca.data_start),
@@ -287,7 +288,8 @@ RESOURCES: dict[str, tuple[str, ...]] = {
     "metrics": METRIC_FIELDS,
     "backtest": (
         "id", "run_id", "environment", "symbol", "timeframe", "trigger", "mode", "scope",
-        "strategy_version", "config_version", "data_start", "data_end", "data_cutoff",
+        "drives_sessions", "strategy_version", "config_version", "data_start", "data_end",
+        "data_cutoff",
         "holdout_start", "in_sample", "out_of_sample", "score", "rank", "suitability",
         "eligible", "exclusion_reason", "component_scores", "trade_sample", "created_at",
     ),

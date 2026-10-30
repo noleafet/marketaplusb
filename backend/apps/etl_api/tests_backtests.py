@@ -48,8 +48,9 @@ class BacktestBase(TestCase):
             coingecko_id="b", symbol="BTC", name="B", binance_symbol="BTCUSDT"
         )
 
-    def make(self, sv=None, status="succeeded", params=None, **kw):
+    def make(self, sv=None, status="succeeded", params=None, drives_sessions=False, **kw):
         run = AnalysisRun.objects.create(
+            drives_sessions=drives_sessions,
             status=status,
             strategy_version=sv or self.sv,
             data_cutoff=self.past,
@@ -86,6 +87,11 @@ class MetricsTests(TestCase):
 
 
 class BacktestTests(BacktestBase):
+    def test_drives_sessions_serializes_true(self):
+        self.make(drives_sessions=True)
+        d = self.api.get(LIST).json()["data"][0]
+        self.assertIs(d["drives_sessions"], True)
+
     def test_backtest_fields_and_holdout_start(self):
         ca = self.make()
         r = self.api.get(LIST)
@@ -95,13 +101,14 @@ class BacktestTests(BacktestBase):
             list(d),
             [
                 "id", "run_id", "environment", "symbol", "timeframe", "trigger", "mode",
-                "scope", "strategy_version", "config_version", "data_start", "data_end",
+                "scope", "drives_sessions", "strategy_version", "config_version", "data_start", "data_end",
                 "data_cutoff", "holdout_start", "in_sample", "out_of_sample", "score", "rank",
                 "suitability", "eligible", "exclusion_reason", "component_scores",
                 "trade_sample", "created_at",
             ],
         )
         self.assertEqual(d["id"], ca.pk)
+        self.assertIs(d["drives_sessions"], False)
         self.assertEqual(d["run_id"], str(ca.analysis_id))
         self.assertEqual(d["environment"], "backtest")
         self.assertEqual(d["symbol"], "BTCUSDT")

@@ -113,7 +113,10 @@ FIELD_TYPES: dict[str, str] = {
         )
     },
     **{f: "array" for f in ("trade_sample", "failures")},
-    **{f: "boolean" for f in ("backfilled", "eligible", "passed", "allowed")},
+    **{
+        f: "boolean"
+        for f in ("backfilled", "eligible", "passed", "allowed", "drives_sessions")
+    },
     **{
         f: "integer"
         for f in ("trades", "rank", "fold", "level", "fill_count", "closed_lots", "wins", "losses")
@@ -184,7 +187,8 @@ _NON_NULL = {
     "created_at", "first_seen_at", "evaluated_at", "started_at", "updated_at", "as_of",
     "finished_at",
     "type", "trigger", "status", "side", "order_type", "backfilled", "passed", "allowed",
-    "eligible", "open", "high", "low", "close", "volume", "quote_volume", "rate",
+    "eligible", "drives_sessions", "open", "high", "low", "close", "volume", "quote_volume",
+    "rate",
     "equity", "analysis_id", "run_id", "code_sha", "state", "snapshot", "diff", "grid",
     "market_candles", "funding_rates", "analysis_run", "paper_session_tick", "before",
     "after", "metrics", "in_sample", "out_of_sample", "train_metrics", "test_metrics",

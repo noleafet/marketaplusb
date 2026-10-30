@@ -51,7 +51,7 @@ FROZEN_FIELDS = {
     "metrics": METRICS,
     "backtest": (
         "id", "run_id", "environment", "symbol", "timeframe", "trigger", "mode", "scope",
-        "strategy_version", "config_version", "data_start", "data_end", "data_cutoff",
+        "drives_sessions", "strategy_version", "config_version", "data_start", "data_end", "data_cutoff",
         "holdout_start", "in_sample", "out_of_sample", "score", "rank", "suitability",
         "eligible", "exclusion_reason", "component_scores", "trade_sample", "created_at",
     ),

@@ -108,7 +108,7 @@ with row locks, and stale running jobs are reaped after 60 minutes.
 | Slug | Cadence | Purpose |
 | --- | --- | --- |
 | `coins-refresh` | Monthly, day 1 at 00:00 UTC | Fetch top 100 by market cap, update in place, remap Binance contracts |
-| `daily-analysis` | Daily at 00:10 UTC | Sync candles/funding, run walk-forward, score, report, create paper sessions; then repeat the universe with the hybrid trend gate |
+| `daily-analysis` | Daily at 00:10 UTC | Sync candles/funding, then run the active trading mode's analysis first (walk-forward, score, report; it creates and retires paper sessions), then the other mode as a comparison when enabled |
 | `paper-tick` | Every `PAPER_TICK_MINUTES` (default 5) | Advance active paper sessions from live public data |
 | `paper-evaluate` | Every `PAPER_EVAL_INTERVAL_HOURS` (default 6) | Check promotion thresholds and hard stops |
 | `paper-risk` | Every `RISK_INTERVAL_SECONDS` (default 5 min) | Run the overbought guard and resume sessions whose recovery confirmed |
@@ -206,17 +206,19 @@ selection: a cost-stress run doubles maker/taker fees and slippage, and a sensit
 grid levels (±25%), range lookback, and spacing. These produce `cost_stress_*`,
 `parameter_sensitivity`, and `regimes_covered` metrics, all persisted with the analysis.
 
-**Hybrid trend-gated backtest.** After the normal run, the daily job starts a second analysis
-with `mode="hybrid"`. It reuses the freshly synced 4h candles, fetches closed 1h and 15m klines
-for each coin over `ENGINE_HYBRID_LOOKBACK_DAYS` (default 180, clamped to the run lookback), and
-replays the same rule paper/live hybrid mode executes: new buys need the last closed 1h close
-above EMA(100), two consecutive closed 15m closes below that EMA confirm an exit and flatten the
-book at the next bar open, and the ladder re-arms after two closed 15m closes back above when the
-1h trend still holds (ADX ≥ 25 with +DI > −DI when the ADX preference is enabled). The simulator
-records `hybrid_blocked_bars` and `hybrid_exits` per fold, and the gate statistics
-(`blocked_pct`, `confirmed_exits`) persist on each coin result plus the run summary. Hybrid runs
-are diagnostics: they skip reports and paper-session creation, so normal-mode bookkeeping is
-unchanged.
+**Hybrid trend-gated backtest.** The daily job runs the active trading mode's analysis first and
+the other mode second as a comparison (`run_comparison_analysis`, default on; a failed comparison
+does not fail the job). A `mode="hybrid"` run uses the full lookback (`ENGINE_LOOKBACK_DAYS`) and
+the holdout like a normal run. Its 1h and 15m trend-gate inputs come from stored `market_candles`,
+synced per coin with back-fill, and it replays the same rule paper/live hybrid mode executes: new
+buys need the last closed 1h close above EMA(100), two consecutive closed 15m closes below that
+EMA confirm an exit and flatten the book at the next bar open, and the ladder re-arms after two
+closed 15m closes back above when the 1h trend still holds (ADX ≥ 25 with +DI > −DI when the ADX
+preference is enabled). The simulator records `hybrid_blocked_bars` and `hybrid_exits` per fold,
+and the gate statistics (`blocked_pct`, `confirmed_exits`) persist on each coin result plus the run
+summary. Only the run for the active mode drives sessions (`drives_sessions`): it builds reports
+and opens and retires paper sessions, so with hybrid mode on, sessions come from the hybrid
+analysis. The other run is a comparison and leaves sessions and reports alone.
 
 **Risk and execution metrics.** Open inventory is marked to market on every equity record, so
 unrealized PnL is inside equity and drawdown. Each fold reports peak and average exposure,
@@ -334,6 +336,7 @@ equity point before the cutoff, guarding against look-ahead bias.
 | Daily loss limit | 3% of book | Halts new buys until the next UTC day |
 | Retire after | 2 runs | Close a session whose coin fails to qualify this many analyses in a row |
 | Max strategy correlation | 0.70 | Correlation penalty and paper selection |
+| Run comparison analysis | on (`run_comparison_analysis`) | Also run the inactive trading mode's analysis after the active one, for the dashboard comparison |
 
 Book limits only block new buys; stops and exits always run. `GET /api/strategy/validation/`
 returns the score ICs, strategy/paper correlation, BTC beta, paper-vs-holdout drift, and findings.
@@ -349,8 +352,7 @@ across the 96 candidates, so a 1h run takes roughly 20 seconds of CPU per coin.
 ATR% gate) was calibrated on 4h bars. Per-bar true range grows with about the square root of the
 bar length (measured 4h/1h ratio across the top-100 universe: 2.05), so ATR is converted to
 4h-equivalent units (`× √(bars_per_day / 6)`). Without this, switching to 1h halved every stop
-distance and 54 of 60 coins stopped out in all three folds. The hybrid diagnostic run skips the
-holdout because its 180-day window cannot hold both a holdout and a walk-forward fold.
+distance and 54 of 60 coins stopped out in all three folds.
 
 ## BTC market regime protection
 
@@ -392,7 +394,7 @@ bearish: on BTC it followed almost every overbought spike (163 of 229 bearish en
 churned the book.
 
 **Backtest.** The daily analysis syncs BTC 15m and 1h candles, replays the same evaluator over the
-window once per run (reused by the hybrid pass) and gates every coin's simulations with it: buys
+window once per run and gates every coin's simulations with it: buys
 disarmed and sells moved to the nearest levels while not `normal`. Test folds and the holdout also
 run without the regime, reported per coin as `regime_off_return`, `regime_effect_return` and
 `regime_effect_drawdown`; validation turns the averages into a strength or weakness finding.
@@ -451,7 +453,7 @@ browser.
 | GET | `/api/engine/dashboard/` | Dashboard aggregate |
 | GET | `/api/engine/analysis/` · `/latest/` | Analysis runs (`?mode=normal|hybrid`) |
 | GET | `/api/engine/analysis/{id}/results/` | Full result payloads |
-| GET | `/api/engine/results/` | Coin results for the latest normal run (`?mode=hybrid` for the gated run) |
+| GET | `/api/engine/results/` | Coin results for the latest run of the active trading mode (`?mode=` selects normal or hybrid) |
 | POST | `/api/engine/analysis/trigger/` | Queue a daily analysis |
 | GET | `/api/engine/results/` | Latest rankings (`compact`, `suitability`, `eligible`, `search`) |
 | GET | `/api/engine/results/by_coin/?symbol=BTC` | Analysis history for one coin |
@@ -502,7 +504,6 @@ Copy `.env.example` to `.env`. Key settings:
 | `ENGINE_API_TOKEN` | dev token | Required for all mutations |
 | `ENGINE_ALLOW_PUBLIC_READS` | `true` | Set `false` in production |
 | `ENGINE_LOOKBACK_DAYS` | `520` | Backtest history |
-| `ENGINE_HYBRID_LOOKBACK_DAYS` | `180` | Window replayed for the hybrid 1h/15m trend-gated run |
 | `ENGINE_INTERVAL` | `4h` | Candle interval |
 | `ENGINE_MIN_ADV_USD` | `5,000,000` | Liquidity gate |
 | `ENGINE_MIN_OOS_TRADES` | `12` | Minimum out-of-sample fills |
