@@ -118,6 +118,7 @@ class GridEvent(models.Model):
         RETIRE = "retire", "Retire"
         STOP = "stop", "Stop"
         KILL_SWITCH = "kill_switch", "Kill switch"
+        REGIME = "regime", "BTC regime"
 
     time = models.DateTimeField(db_index=True)
     type = models.CharField(max_length=16, choices=Type.choices)
@@ -294,6 +295,16 @@ class StrategySettings(models.Model):
     retire_after_failed_runs = models.PositiveSmallIntegerField(default=2)
     max_strategy_correlation = models.FloatField(default=0.7)
 
+    # BTC market regime protection: BTC signals that block buys on (warning)
+    # or flatten and pause (bearish) every paper session.
+    btc_regime_enabled = models.BooleanField(default=True)
+    btc_trailing_stop_pct = models.FloatField(default=0.08)
+    btc_trailing_window_days = models.PositiveSmallIntegerField(default=7)
+    btc_oi_flush_pct = models.FloatField(default=0.05)
+    btc_oi_near_high_pct = models.FloatField(default=0.03)
+    btc_funding_z = models.FloatField(default=2.0)
+    btc_min_bearish_hours = models.FloatField(default=4.0)
+
     book_state = models.JSONField(default=dict, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -317,3 +328,51 @@ class StrategySettings(models.Model):
         if self.fill_model == self.FillModel.TOUCH:
             return 0.0
         return max(0.0, self.trade_through_bps)
+
+
+class MarketRegimeState(models.Model):
+    """Global BTC market regime (singleton), evaluated every paper tick."""
+
+    class Phase(models.TextChoices):
+        NORMAL = "normal", "Normal"
+        WARNING = "warning", "Warning"
+        BEARISH = "bearish", "Bearish"
+
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
+    phase = models.CharField(max_length=8, choices=Phase.choices, default=Phase.NORMAL)
+    entered_at = models.DateTimeField(null=True, blank=True)
+    reasons = models.JSONField(default=list, blank=True)
+    # BTC's own overbought-guard state machine, separate from any coin's.
+    guard_state = models.JSONField(default=dict, blank=True)
+    metrics = models.JSONField(default=dict, blank=True)
+    last_evaluated_at = models.DateTimeField(null=True, blank=True)
+    last_error = models.CharField(max_length=255, blank=True, default="")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Market regime state"
+
+    def __str__(self) -> str:
+        return f"BTC regime {self.phase}"
+
+    @classmethod
+    def load(cls) -> "MarketRegimeState":
+        row, _ = cls.objects.get_or_create(id=1)
+        return row
+
+
+class OpenInterestPoint(models.Model):
+    """Hourly open interest, stored so OI signals can be backtested."""
+
+    symbol = models.CharField(max_length=40)
+    time = models.DateTimeField()
+    open_interest = models.FloatField()
+
+    class Meta:
+        ordering = ["time"]
+        constraints = [
+            models.UniqueConstraint(fields=["symbol", "time"], name="unique_open_interest_point")
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.symbol} OI {self.time:%Y-%m-%d %H:%M}"

@@ -24,6 +24,13 @@ SNAPSHOT_FIELDS = (
     "daily_loss_limit_pct",
     "retire_after_failed_runs",
     "max_strategy_correlation",
+    "btc_regime_enabled",
+    "btc_trailing_stop_pct",
+    "btc_trailing_window_days",
+    "btc_oi_flush_pct",
+    "btc_oi_near_high_pct",
+    "btc_funding_z",
+    "btc_min_bearish_hours",
 )
 
 # Deployment knobs that never change strategy results, so they stay out of the snapshot.

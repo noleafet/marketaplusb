@@ -43,6 +43,13 @@ class StrategySettingsSerializer(serializers.ModelSerializer):
             "daily_loss_limit_pct",
             "retire_after_failed_runs",
             "max_strategy_correlation",
+            "btc_regime_enabled",
+            "btc_trailing_stop_pct",
+            "btc_trailing_window_days",
+            "btc_oi_flush_pct",
+            "btc_oi_near_high_pct",
+            "btc_funding_z",
+            "btc_min_bearish_hours",
             "session_capital",
             "effective_trade_through_bps",
             "book_state",
@@ -83,6 +90,24 @@ class StrategySettingsSerializer(serializers.ModelSerializer):
 
     def validate_max_strategy_correlation(self, value: float) -> float:
         return self._bounded(value, 0.1, 1.0, "Strategy correlation limit")
+
+    def validate_btc_trailing_stop_pct(self, value: float) -> float:
+        return self._bounded(value, 0.02, 0.30, "BTC trailing stop")
+
+    def validate_btc_trailing_window_days(self, value: int) -> int:
+        return int(self._bounded(value, 1, 30, "BTC trailing window"))
+
+    def validate_btc_oi_flush_pct(self, value: float) -> float:
+        return self._bounded(value, 0.01, 0.30, "BTC open-interest flush")
+
+    def validate_btc_oi_near_high_pct(self, value: float) -> float:
+        return self._bounded(value, 0.005, 0.10, "BTC near-high band")
+
+    def validate_btc_funding_z(self, value: float) -> float:
+        return self._bounded(value, 0.5, 5.0, "BTC funding z-score")
+
+    def validate_btc_min_bearish_hours(self, value: float) -> float:
+        return self._bounded(value, 0, 72, "Minimum bearish duration")
 
 
 def _analysis_interval(run: AnalysisRun | None) -> str | None:
