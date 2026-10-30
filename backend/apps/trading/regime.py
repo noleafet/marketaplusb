@@ -145,8 +145,8 @@ def _rsi_series(closes: np.ndarray, period: int) -> list[float | None]:
     avg_loss = float(np.mean(losses[:period]))
     for k in range(period, closes.size):
         if k > period:
-            avg_gain = (avg_gain * (period - 1) + gains[k - 1]) / period
-            avg_loss = (avg_loss * (period - 1) + losses[k - 1]) / period
+            avg_gain = (avg_gain * (period - 1) + float(gains[k - 1])) / period
+            avg_loss = (avg_loss * (period - 1) + float(losses[k - 1])) / period
         if avg_loss <= 1e-12:
             out[k] = 100.0 if avg_gain > 0 else 50.0
         else:
@@ -353,7 +353,7 @@ def evaluate_regime(
         "support_line": round(support_line, 10),
         "atr": round(reading.atr, 10),
         "momentum": round(reading.momentum, 6),
-        "trend_up": reading.trend_up,
+        "trend_up": bool(reading.trend_up),
         "funding_z": _round(reading.funding_z, 4),
         "oi_change_pct": _round(oi_change),
         "oi_available": bool(oi),
@@ -365,11 +365,14 @@ def evaluate_regime(
             hours=config.min_bearish_hours
         )
         checks = {
-            **risk.recovery_checks(snapshot, entered_at, config.risk, reading.time),
-            "above_support": not breakdown,
-            "below_trailing_stop": not trailing,
-            "no_oi_flush": not oi_flush,
-            "min_duration": elapsed_ok,
+            name: bool(value)
+            for name, value in {
+                **risk.recovery_checks(snapshot, entered_at, config.risk, reading.time),
+                "above_support": not breakdown,
+                "below_trailing_stop": not trailing,
+                "no_oi_flush": not oi_flush,
+                "min_duration": elapsed_ok,
+            }.items()
         }
         metrics["recovery"] = checks
         if not (all(checks.values()) and not bearish):

@@ -33,8 +33,9 @@ FIFTEEN_MINUTES = timedelta(minutes=15)
 class Gate:
     """Per-bar switches keyed by the bar's open time.
 
-    ``allow`` is False while new buys must stay disarmed; ``exit`` is True on
-    the first bar after a confirmed exit so the simulator flattens inventory.
+    ``allow`` is False while new buys must stay disarmed; ``exit`` is truthy on
+    the first bar after a confirmed exit so the simulator flattens inventory
+    (a string value names the exit reason; ``True`` means ``hybrid_exit``).
     Bars without an entry are outside the fetched kline coverage and trade
     ungated.
     """
@@ -54,6 +55,33 @@ class Gate:
             "blocked_pct": round(self.blocked_bars / total, 4) if total else 0.0,
             "confirmed_exits": self.exits,
         }
+
+
+def combine_gates(a: Gate | None, b: Gate | None) -> Gate | None:
+    """Buys allowed only where both allow; exit where either exits.
+
+    A bar missing from one gate counts as allowed by it, and a bar missing
+    from both stays missing, so it still trades ungated.
+    """
+
+    if a is None or b is None:
+        return a if b is None else b
+    allow: dict[datetime, bool] = {}
+    for key in a.allow.keys() | b.allow.keys():
+        allow[key] = a.allow.get(key, True) and b.allow.get(key, True)
+    exits: dict[datetime, Any] = {}
+    for key in a.exit.keys() | b.exit.keys():
+        value = a.exit.get(key) or b.exit.get(key)
+        if value:
+            exits[key] = value
+    allowed = sum(1 for value in allow.values() if value)
+    return Gate(
+        allow=allow,
+        exit=exits,
+        allowed_bars=allowed,
+        blocked_bars=len(allow) - allowed,
+        exits=len(exits),
+    )
 
 
 def ema_series(values: np.ndarray, period: int) -> np.ndarray:

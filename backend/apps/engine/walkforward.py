@@ -18,7 +18,7 @@ from apps.engine.grid import (
     prepare_market,
     simulate_grid,
 )
-from apps.engine.hybrid_gate import Gate
+from apps.engine.hybrid_gate import Gate, combine_gates
 from apps.engine.robustness import classify_regime, regime_summary
 
 MAX_FOLDS = 3
@@ -309,6 +309,26 @@ def _stitch_curves(
     return combined, max_dd
 
 
+def _regime_effect(folds: list[dict[str, Any]], combined_return: float) -> dict[str, Any]:
+    """Regime-on versus regime-off over the test folds (empty without a regime).
+
+    Drawdown compares the worst fold on each side; a positive drawdown effect
+    means the regime reduced it, a negative return effect is its cost.
+    """
+
+    offs = [fold.get("regime_off") for fold in folds]
+    if not offs or any(off is None for off in offs):
+        return {}
+    off_return = float(np.prod([1.0 + off["net_return"] for off in offs]) - 1.0)
+    on_drawdown = max(float(fold["test_metrics"].get("max_drawdown") or 0.0) for fold in folds)
+    off_drawdown = max(float(off["max_drawdown"]) for off in offs)
+    return {
+        "regime_off_return": round(off_return, 6),
+        "regime_effect_return": round(combined_return - off_return, 6),
+        "regime_effect_drawdown": round(off_drawdown - on_drawdown, 6),
+    }
+
+
 def run_walk_forward(
     rows: list[dict[str, Any]],
     funding_rows: list[dict[str, Any]],
@@ -321,6 +341,7 @@ def run_walk_forward(
     sensitivity: bool = True,
     gate: Gate | None = None,
     holdout_days: int = 0,
+    regime_gate: Gate | None = None,
 ) -> WalkForwardResult:
     if len(rows) < 200:
         return WalkForwardResult(
@@ -378,12 +399,16 @@ def run_walk_forward(
 
     params_candidates = parameter_grid(base_params)
     alt_fill_name, alt_fill_config = _alternate_fill_config(config)
+    # Every simulation runs under the BTC regime when one is given; test folds
+    # and the holdout also run without it to measure what it gained or cost.
+    active_gate = combine_gates(gate, regime_gate)
 
     def run(
         sim_rows: list[dict[str, Any]],
         start: datetime,
         candidate: GridParams,
         sim_config: SimulationConfig = config,
+        sim_gate: Gate | None = active_gate,
     ) -> SimulationResult:
         return simulate_grid(
             sim_rows,
@@ -391,7 +416,7 @@ def run_walk_forward(
             start,
             candidate,
             sim_config,
-            gate=gate,
+            gate=sim_gate,
             prepared=prepared,
         )
 
@@ -434,6 +459,16 @@ def run_walk_forward(
             _stressed_config(config, cost_stress_multiplier),
         )
         alt_fill_result = run(test_rows, test_start, best_params, alt_fill_config)
+        regime_off: dict[str, Any] | None = None
+        if regime_gate is not None:
+            off_result = run(test_rows, test_start, best_params, sim_gate=gate)
+            if not off_result.error:
+                regime_off = {
+                    "net_return": round(float(off_result.metrics.get("net_return") or 0.0), 6),
+                    "max_drawdown": round(
+                        float(off_result.metrics.get("max_drawdown") or 0.0), 6
+                    ),
+                }
         stress = (
             {
                 "net_return": stress_result.metrics.get("net_return"),
@@ -499,6 +534,7 @@ def run_walk_forward(
                     ),
                 },
                 "sensitivity": sensitivity_runs,
+                "regime_off": regime_off,
             }
         )
 
@@ -623,6 +659,7 @@ def run_walk_forward(
     alt_combined = (
         float(np.prod([1.0 + value for value in alt_returns]) - 1.0) if alt_returns else None
     )
+    regime_effect = _regime_effect(folds_out, combined_return)
 
     eq = np.array([point["equity"] for point in curve], dtype=float)
     if eq.size > 2:
@@ -785,6 +822,7 @@ def run_walk_forward(
         "recommended_tp_atr_multiple": mode_tp,
         "recommended_rebalance_mode": recommended.get("rebalance_mode", "fixed"),
         "adaptive_stability": round(mode_adaptive_count / len(adaptive_selection), 4),
+        **regime_effect,
     }
     in_sample_metrics = {
         "avg_return": round(float(np.mean(is_returns)), 6) if is_returns else 0.0,
@@ -885,7 +923,7 @@ def run_walk_forward(
             holdout_start,
             deployed,
             config,
-            gate=gate,
+            gate=active_gate,
             prepared=prepared,
         )
         if not holdout_result.error:
@@ -895,7 +933,7 @@ def run_walk_forward(
                 holdout_start,
                 deployed,
                 alt_fill_config,
-                gate=gate,
+                gate=active_gate,
                 prepared=prepared,
             )
             holdout_metrics = {
@@ -911,6 +949,34 @@ def run_walk_forward(
                 ),
                 "params": recommended,
             }
+            if regime_gate is not None:
+                off_holdout = simulate_grid(
+                    all_rows,
+                    funding_rows,
+                    holdout_start,
+                    deployed,
+                    config,
+                    gate=gate,
+                    prepared=prepared,
+                )
+                if not off_holdout.error:
+                    off_return = float(off_holdout.metrics.get("net_return") or 0.0)
+                    off_drawdown = float(off_holdout.metrics.get("max_drawdown") or 0.0)
+                    holdout_metrics.update(
+                        {
+                            "regime_off_return": round(off_return, 6),
+                            "regime_effect_return": round(
+                                float(holdout_result.metrics.get("net_return") or 0.0)
+                                - off_return,
+                                6,
+                            ),
+                            "regime_effect_drawdown": round(
+                                off_drawdown
+                                - float(holdout_result.metrics.get("max_drawdown") or 0.0),
+                                6,
+                            ),
+                        }
+                    )
             strategy_returns.update(
                 daily_strategy_returns(holdout_result.daily_equity, config.capital, full_end)
             )

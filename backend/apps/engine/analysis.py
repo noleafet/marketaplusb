@@ -8,6 +8,7 @@ import time
 from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 from datetime import datetime, timedelta, timezone as dt_timezone
+from types import SimpleNamespace
 from typing import Any
 
 from django.conf import settings
@@ -21,6 +22,7 @@ from apps.engine.features import compute_features
 from apps.engine.grid import GridParams, SimulationConfig
 from apps.engine.hybrid_gate import Gate, build_gate
 from apps.engine.models import AnalysisRun, CoinAnalysis, log_decision
+from apps.engine.regime_timeline import RegimeTimeline, build_regime_timeline, gate_from_timeline
 from apps.engine.reports import build_reports
 from apps.engine.versioning import resolve_config_version, resolve_strategy_version
 from apps.engine.robustness import (
@@ -30,7 +32,7 @@ from apps.engine.robustness import (
     select_diversified,
 )
 from apps.engine.scoring import ranking_summary, score_results
-from apps.engine.timescale import load_candles, load_funding
+from apps.engine.timescale import latest_candle_time, load_candles, load_funding
 from apps.engine.validation import (
     MIN_SCOPE_COINS,
     findings,
@@ -39,6 +41,8 @@ from apps.engine.validation import (
     strategy_validation,
 )
 from apps.engine.walkforward import WalkForwardResult, walk_forward_job as _walk_forward_job
+from apps.trading.models import OpenInterestPoint
+from apps.trading.regime import SYMBOL as REGIME_SYMBOL, WARMUP_1H_DAYS, RegimeConfig
 
 logger = logging.getLogger("engine")
 
@@ -209,6 +213,73 @@ def _build_hybrid_gate(
     klines_15m = _closed_klines(client, symbol, "15m", start, end)
     gate = build_gate(rows, klines_1h, klines_15m, adx_enabled=adx_enabled)
     return gate if gate.allow else None
+
+
+# One BTC regime timeline per (last BTC 15m bar, regime config): the hybrid
+# pass that follows the normal pass in the same job reuses it.
+_REGIME_TIMELINE_CACHE: dict[tuple, RegimeTimeline] = {}
+
+
+def _regime_config_key(config: RegimeConfig) -> tuple:
+    return (
+        config.trailing_stop_pct,
+        config.trailing_window_days,
+        config.oi_flush_pct,
+        config.oi_near_high_pct,
+        config.funding_z,
+        config.min_bearish_hours,
+        tuple(sorted((str(k), str(v)) for k, v in (config.risk or {}).items())),
+    )
+
+
+def _regime_timeline(
+    client: BinanceFuturesClient,
+    strategy_settings,
+    *,
+    lookback_days: int,
+    warmup_days: int,
+    sync: bool,
+) -> RegimeTimeline | None:
+    """BTC regime timeline over the analysis window, or None when disabled."""
+
+    if not strategy_settings.btc_regime_enabled:
+        return None
+    btc = SimpleNamespace(binance_symbol=REGIME_SYMBOL)
+    regime_warmup = warmup_days + WARMUP_1H_DAYS + 2
+    if sync:
+        for interval in ("15m", "1h"):
+            sync_coin_market_data(
+                btc,
+                client,
+                lookback_days=lookback_days,
+                interval=interval,
+                warmup_days=regime_warmup,
+            )
+    config = RegimeConfig.from_settings(strategy_settings)
+    last_bar = latest_candle_time(REGIME_SYMBOL, "15m")
+    if last_bar is None:
+        return None
+    key = (last_bar, _regime_config_key(config))
+    cached = _REGIME_TIMELINE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    end = timezone.now()
+    start = end - timedelta(days=lookback_days + regime_warmup)
+    oi_points = list(
+        OpenInterestPoint.objects.filter(symbol=REGIME_SYMBOL, time__gte=start).values(
+            "time", "open_interest"
+        )
+    )
+    timeline = build_regime_timeline(
+        load_candles(REGIME_SYMBOL, "15m", start, end),
+        load_candles(REGIME_SYMBOL, "1h", start, end),
+        load_funding(REGIME_SYMBOL, start, end),
+        oi_points,
+        config,
+    )
+    _REGIME_TIMELINE_CACHE.clear()
+    _REGIME_TIMELINE_CACHE[key] = timeline
+    return timeline
 
 
 # Arbitrary constant key for the Postgres advisory lock that serialises
@@ -442,6 +513,27 @@ def _run_daily_analysis(
     data_start_floor = timezone.now() - timedelta(days=lookback_days + warmup_days)
     started_monotonic = time.monotonic()
 
+    # The BTC regime timeline is built once and gates every coin. A failure
+    # leaves the run unregimed rather than failing it; the summary says so.
+    regime_timeline: RegimeTimeline | None = None
+    regime_info: dict[str, Any] = {"enabled": bool(strategy_settings.btc_regime_enabled)}
+    try:
+        regime_timeline = _regime_timeline(
+            client,
+            strategy_settings,
+            lookback_days=lookback_days,
+            warmup_days=warmup_days,
+            sync=not hybrid,
+        )
+        if regime_timeline is not None:
+            regime_info.update(regime_timeline.stats())
+        elif strategy_settings.btc_regime_enabled:
+            regime_info["error"] = "no BTC 15m candles stored"
+    except Exception as exc:  # noqa: BLE001 - the regime is an overlay, not a gate on the run
+        logger.warning("BTC regime timeline failed: %s", exc)
+        data_errors.append({"symbol": REGIME_SYMBOL, "error": f"BTC regime: {exc}"})
+        regime_info["error"] = str(exc)
+
     workers = analysis_workers()
     executor = ProcessPoolExecutor(max_workers=workers) if workers > 1 else None
     pending: dict[Future, dict[str, Any]] = {}
@@ -605,6 +697,7 @@ def _run_daily_analysis(
                 "sensitivity": bool(cfg["WALKFORWARD_SENSITIVITY"]),
                 "gate": gate,
                 "holdout_days": holdout_days,
+                "regime_gate": gate_from_timeline(rows, regime_timeline),
             }
             if executor is None:
                 try:
@@ -790,6 +883,7 @@ def _run_daily_analysis(
         max_strategy_correlation=float(strategy_settings.max_strategy_correlation),
     )
     analysis.summary["pooled_ic"] = pooled
+    analysis.summary["btc_regime"] = regime_info
     analysis.save(update_fields=["data_cutoff", "summary"])
 
     analysis.summary["mode"] = trend_mode

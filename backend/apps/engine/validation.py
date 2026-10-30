@@ -183,6 +183,8 @@ def strategy_validation(
     holdout_annual = []
     fill_deltas = []
     stress_pass = []
+    regime_returns = []
+    regime_drawdowns = []
     for item in eligible:
         oos = item.get("oos_metrics") or {}
         test_days = _num(oos.get("test_days")) or 0.0
@@ -197,6 +199,11 @@ def strategy_validation(
             fill_deltas.append(delta)
         if oos.get("cost_stress_profitable") is not None:
             stress_pass.append(bool(oos.get("cost_stress_profitable")))
+        regime_return = _num(oos.get("regime_effect_return"))
+        regime_drawdown = _num(oos.get("regime_effect_drawdown"))
+        if regime_return is not None and regime_drawdown is not None:
+            regime_returns.append(regime_return)
+            regime_drawdowns.append(regime_drawdown)
 
     return {
         "eligible": eligible_count,
@@ -222,6 +229,12 @@ def strategy_validation(
         "fill_model_delta_mean": round(float(np.mean(fill_deltas)), 6) if fill_deltas else None,
         "cost_stress_pass_rate": (
             round(sum(stress_pass) / len(stress_pass), 4) if stress_pass else None
+        ),
+        "regime_effect_return_mean": (
+            round(float(np.mean(regime_returns)), 6) if regime_returns else None
+        ),
+        "regime_effect_drawdown_mean": (
+            round(float(np.mean(regime_drawdowns)), 6) if regime_drawdowns else None
         ),
     }
 
@@ -382,6 +395,28 @@ def findings(
             "Grids diversify better than the coins",
             f"Strategy correlation {avg_pair:.2f} vs price correlation {price_avg:.2f}.",
         )
+
+    regime_return = _num(strategies.get("regime_effect_return_mean"))
+    regime_drawdown = _num(strategies.get("regime_effect_drawdown_mean"))
+    if regime_return is not None and regime_drawdown is not None:
+        dd_text = (
+            f"cut max drawdown by {regime_drawdown * 100:.1f} points"
+            if regime_drawdown >= 0
+            else f"added {-regime_drawdown * 100:.1f} points of max drawdown"
+        )
+        return_text = (
+            f"at a cost of {-regime_return * 100:.1f} points of return"
+            if regime_return < 0
+            else f"and added {regime_return * 100:.1f} points of return"
+        )
+        detail = (
+            f"Against the same runs without it, the BTC regime {dd_text} {return_text} "
+            f"on average{scope_note}."
+        )
+        if regime_drawdown > 0 and -regime_return < regime_drawdown:
+            add("strength", "regime_effective", "BTC regime protection pays for itself", detail)
+        else:
+            add("weakness", "regime_costly", "BTC regime protection costs more than it saves", detail)
 
     beta = _num(strategies.get("btc_beta_mean"))
     btc_corr = _num(strategies.get("btc_correlation_mean"))

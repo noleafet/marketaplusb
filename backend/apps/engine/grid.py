@@ -1142,8 +1142,13 @@ def simulate_grid(
 
         # Hybrid exit: a confirmed 15m close below the 1h EMA flattens at the
         # bar open, and buys stay disarmed until the gate re-arms.
-        if gate is not None and gate.exit.get(timestamp):
-            close_all(bar_open, timestamp, "hybrid_exit")
+        exit_flag = gate.exit.get(timestamp) if gate is not None else None
+        if exit_flag:
+            close_all(
+                bar_open,
+                timestamp,
+                exit_flag if isinstance(exit_flag, str) else "hybrid_exit",
+            )
             state.hybrid_exits += 1
             orders.clear()
             rebuild_orders(timestamp, bar_open)
